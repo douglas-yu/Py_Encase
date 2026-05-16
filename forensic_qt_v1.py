@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QFormLayout, QSpinBox,  QToolButton, QAbstractItemView,
     QScrollBar,
 )
+
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QSize, QRect, QPoint, QMimeData,
     QSortFilterProxyModel, QModelIndex, pyqtSlot, QRunnable, QThreadPool,
@@ -405,11 +406,6 @@ ARTIFACT_CATEGORIES = {
         "Running Processes","Loaded Drivers/Modules","Scheduled Tasks",
         "System Uptime","BIOS/UEFI Info","Hardware Profile",
     ],
-    "Email Artifacts": [
-        "PST/OST Files (Outlook)","MSG Files (Outlook)","Thunderbird MBOX",
-        "Email Accounts Config","Email Attachments","Email Contacts",
-        "Email Calendar Items",
-    ],
     "User & Account Activity": [
         "Local User Accounts","Last Login Times","Recent Files (MRU)",
         "Shellbags","UserAssist Keys","Jump Lists",
@@ -449,175 +445,14 @@ ARTIFACT_CATEGORIES = {
 #  LIVE ARTIFACT COLLECTION (worker thread)
 # ══════════════════════════════════════════════════════════════
 
-
-def _collect_from_image(artifact_name, image_path):
+def collect_artifact(name):
     """
-    Collect non-volatile artifacts from a forensic image using pytsk3.
-    Walks the image filesystem to find files relevant to each artifact type.
-    """
-    results = []
-    try:
-        ifs = ForensicImageFS.get(image_path)
-        if not ifs.fs:
-            return [{"Error": "Cannot open image filesystem: %s" % (ifs.error or "unknown")}]
-
-        import pytsk3
-
-        def walk_fs(folder_inode, path_prefix="/", max_depth=6, _depth=0):
-            """Yield (full_path, entry_dict) for every file in the image."""
-            if _depth > max_depth:
-                return
-            try:
-                entries = ifs.list_dir(inode=folder_inode)
-            except Exception:
-                return
-            for e in entries:
-                full = path_prefix.rstrip("/") + "/" + e["name"]
-                yield full, e
-                if e["is_dir"] and e["inode"]:
-                    yield from walk_fs(e["inode"], full, max_depth, _depth+1)
-
-        # Walk root
-        root_entries = ifs.list_dir()
-
-        def find_files(extensions=None, name_patterns=None, max_results=200):
-            """Find files in the image matching extensions or name patterns."""
-            found = []
-            for full_path, e in walk_fs(None):
-                if e["is_dir"]: continue
-                nm = e["name"].lower()
-                match = False
-                if extensions and any(nm.endswith(x) for x in extensions):
-                    match = True
-                if name_patterns and any(p in nm for p in name_patterns):
-                    match = True
-                if match:
-                    found.append((full_path, e))
-                if len(found) >= max_results:
-                    break
-            return found
-
-        # ── Map artifact names to file searches ───────────────────────
-        IMAGE_ARTIFACT_MAP = {
-            "PST/OST Files (Outlook)":    ([".pst",".ost"], []),
-            "MSG Files (Outlook)":         ([".msg"], []),
-            "Thunderbird MBOX":            ([".mbox"], ["inbox","sent","drafts"]),
-            "Browser History":             ([], ["places.sqlite","history"]),
-            "Browser Cookies":             ([], ["cookies.sqlite","cookies"]),
-            "Browser Saved Passwords":     ([], ["login data","key4.db"]),
-            "Registry Run Keys":           ([".reg"], ["ntuser.dat","software","system","sam","security"]),
-            "Prefetch Files":              ([".pf"], []),
-            "LNK / Shortcut Files":        ([".lnk"], []),
-            "Recycle Bin Contents":        ([], ["$r","$i"]),
-            "Security Event Log":          ([".evtx"], ["security"]),
-            "System Event Log":            ([".evtx"], ["system"]),
-            "Application Event Log":       ([".evtx"], ["application"]),
-            "PowerShell Operational Log":  ([".evtx"], ["powershell"]),
-            "SQLite Database":             ([".db",".sqlite",".sqlite3"], []),
-            "Certificate Store":           ([".cer",".crt",".pfx",".p12"], []),
-            "Email Attachments":           ([".pdf",".docx",".xlsx",".zip",".exe",".jpg",".png"], []),
-            "Email Contacts":              ([".pst",".ost",".vcf"], []),
-            "Email Calendar Items":        ([".pst",".ost",".ics"], []),
-        }
-
-        # Non-volatile file system artifacts that make sense for images
-        NON_VOLATILE = {
-            "Recently Accessed Files", "Prefetch Files", "LNK / Shortcut Files",
-            "Temp Directory Contents", "Recycle Bin Contents", "Alternate Data Streams",
-            "$MFT Entries", "Security Event Log", "System Event Log",
-            "Application Event Log", "PowerShell Operational Log", "RDP Session Log",
-            "Installed Software", "Browser History", "Browser Cookies",
-            "Browser Saved Passwords", "Browser Extensions", "Registry Run Keys",
-            "Startup Folder Items", "Scheduled Tasks", "Certificate Store",
-            "SAM Database Hash Dump", "PST/OST Files (Outlook)", "MSG Files (Outlook)",
-            "Thunderbird MBOX", "Email Accounts Config", "Email Attachments",
-            "Email Contacts", "Email Calendar Items", "LNK / Shortcut Files",
-        }
-
-        if artifact_name not in NON_VOLATILE:
-            return [{
-                "Note":     "Volatile artifact — not available in forensic images.",
-                "Artifact": artifact_name,
-                "Tip":      "This artifact requires a live system. Use 'Local System' target.",
-            }]
-
-        exts, patterns = IMAGE_ARTIFACT_MAP.get(artifact_name, ([], []))
-
-        if exts or patterns:
-            found = find_files(exts, patterns)
-            if not found:
-                return [{"Note": "No matching files found in image.",
-                          "Artifact": artifact_name, "Image": image_path}]
-            for fp, e in found:
-                row = {
-                    "Path":     fp,
-                    "Name":     e["name"],
-                    "Size":     fmt_size(e["size"]) if e["size"] else "0",
-                    "Modified": fmt_ts(e["mtime"]) if e["mtime"] else "",
-                    "Inode":    str(e["inode"]),
-                    "Type":     e.get("type",""),
-                }
-                # For PST files try to parse message count
-                if fp.lower().endswith((".pst",".ost")) and e["inode"]:
-                    try:
-                        import pypff, tempfile
-                        data = ifs.read_file(e["inode"], max_bytes=512*1024*1024)
-                        tmp = tempfile.NamedTemporaryFile(suffix=".pst", delete=False)
-                        tmp.write(data); tmp.close()
-                        pst_obj = pypff.file()
-                        pst_obj.open(tmp.name)
-                        rf = pst_obj.get_root_folder()
-                        row["Folders"]  = str(rf.get_number_of_sub_folders())
-                        row["Messages"] = str(rf.get_number_of_sub_messages())
-                        pst_obj.close()
-                        os.unlink(tmp.name)
-                    except Exception as pe:
-                        row["Parse"] = str(pe)[:60]
-                results.append(row)
-        else:
-            # Generic: list root entries as overview
-            for e in root_entries[:100]:
-                results.append({
-                    "Name":     e["name"],
-                    "Type":     "Directory" if e["is_dir"] else e.get("type",""),
-                    "Size":     fmt_size(e["size"]) if e["size"] else "",
-                    "Modified": fmt_ts(e["mtime"]) if e["mtime"] else "",
-                })
-
-    except Exception as ex:
-        results.append({"Error": str(ex), "Image": image_path})
-
-    return results
-
-
-def collect_artifact(name, target_path=None, target_type="local"):
-    """
-    Collect a named forensic artifact.
-
-    target_path : path to analyse (local dir, image mount point, or specific file)
-                  None = use local system (live collection)
-    target_type : "local"     - live system collection (default)
-                  "directory" - scan a specific directory tree
-                  "image"     - forensic image (path = image file, use pytsk3)
-                  "file"      - single file analysis
+    Collect a named forensic artifact from the local system.
+    Cross-platform: Windows uses winreg + WMI paths; Linux uses /proc, /etc, sysfs.
     """
     import glob, sqlite3, csv as _csv
     results = []
     OS = platform.system()   # 'Windows', 'Linux', 'Darwin'
-
-    # Resolve the effective root path for file-based searches
-    # For live collection target_path is None and we use system defaults.
-    # For directory/image targets we re-root searches to target_path.
-    search_root = Path(target_path) if target_path else Path("/")
-    is_image_target = (target_type == "image")
-
-    # For forensic image targets: walk via ForensicImageFS, not the host FS.
-    if is_image_target and target_path:
-        return _collect_from_image(name, target_path)
-
-    # For directory targets: redirect all home/system searches into that tree.
-    effective_home = (Path(target_path) if target_path and target_type == "directory"
-                      else Path.home())
 
     def _run(cmd, timeout=8):
         """Run a shell command, return stdout lines list."""
@@ -1968,256 +1803,6 @@ def collect_artifact(name, target_path=None, target_type="local"):
                         if k.strip() == "Signature matches Public Key":
                             results.append(dict(cert)); cert = {}
 
-
-        # ── EMAIL ARTIFACTS ──────────────────────────────────────────
-        elif name == "PST/OST Files (Outlook)":
-            # Find PST/OST files on the target path, then parse with pypff
-            search_roots = []
-            if OS == "Windows":
-                search_roots += [
-                    Path.home() / "AppData/Local/Microsoft/Outlook",
-                    Path.home() / "Documents/Outlook Files",
-                    Path("C:/Users"),
-                ]
-            elif OS == "Linux":
-                search_roots += [Path.home(), Path("/home"), Path("/mnt"), Path("/media")]
-            else:
-                search_roots += [Path.home() / "Library/Group Containers"]
-
-            pst_files = []
-            for root in search_roots:
-                if root.exists():
-                    for ext in ("*.pst", "*.ost", "*.PST", "*.OST"):
-                        pst_files.extend(list(root.rglob(ext))[:20])
-
-            if not pst_files:
-                results.append({"Note": "No PST/OST files found.",
-                                 "Searched": ", ".join(str(r) for r in search_roots[:3])})
-            else:
-                for pf in pst_files[:10]:
-                    try:
-                        sz = os.path.getsize(str(pf))
-                        s  = os.stat(str(pf))
-                        row = {
-                            "File":     pf.name,
-                            "Path":     str(pf),
-                            "Size":     fmt_size(sz),
-                            "Modified": fmt_ts(s.st_mtime),
-                            "Type":     "OST" if pf.suffix.lower() == ".ost" else "PST",
-                        }
-                        # Try to get folder/message count via pypff
-                        try:
-                            import pypff
-                            pst_obj = pypff.file()
-                            pst_obj.open(str(pf))
-                            root_folder = pst_obj.get_root_folder()
-                            def count_msgs(folder, depth=0):
-                                total = folder.get_number_of_sub_messages()
-                                if depth < 3:
-                                    for i in range(folder.get_number_of_sub_folders()):
-                                        try:
-                                            total += count_msgs(folder.get_sub_folder(i), depth+1)
-                                        except Exception:
-                                            pass
-                                return total
-                            def count_folders(folder, depth=0):
-                                n = folder.get_number_of_sub_folders()
-                                if depth < 3:
-                                    for i in range(n):
-                                        try:
-                                            n += count_folders(folder.get_sub_folder(i), depth+1)
-                                        except Exception:
-                                            pass
-                                return n
-                            row["Messages"] = str(count_msgs(root_folder))
-                            row["Folders"]  = str(count_folders(root_folder))
-                            pst_obj.close()
-                        except Exception as pe:
-                            row["Parse Note"] = str(pe)[:80]
-                        results.append(row)
-                    except Exception as e:
-                        results.append({"File": str(pf), "Error": str(e)})
-
-        elif name == "MSG Files (Outlook)":
-            search_roots = [Path.home(), Path.home() / "Documents",
-                            Path.home() / "Desktop", Path.home() / "Downloads"]
-            if OS == "Windows":
-                search_roots += [Path.home() / "AppData/Local/Microsoft/Outlook"]
-            msg_files = []
-            for root in search_roots:
-                if root.exists():
-                    msg_files.extend(list(root.rglob("*.msg"))[:50])
-            for mf in msg_files[:30]:
-                try:
-                    import extract_msg
-                    msg = extract_msg.openMsg(str(mf))
-                    results.append({
-                        "File":    mf.name,
-                        "Path":    str(mf.parent),
-                        "Subject": (msg.subject or "")[:100],
-                        "Sender":  str(msg.sender or ""),
-                        "To":      str(msg.to or "")[:80],
-                        "Date":    str(msg.date or ""),
-                        "Size":    fmt_size(os.path.getsize(str(mf))),
-                        "Attachments": str(len(msg.attachments)),
-                    })
-                    msg.close()
-                except Exception as e:
-                    try:
-                        s = os.stat(str(mf))
-                        results.append({"File": mf.name, "Path": str(mf.parent),
-                                        "Size": fmt_size(s.st_size), "Error": str(e)[:60]})
-                    except Exception:
-                        pass
-            if not results:
-                results.append({"Note": "No .msg files found in common locations."})
-
-        elif name == "Thunderbird MBOX":
-            tb_profiles = []
-            if OS == "Linux":
-                tb_profiles = list(Path.home().glob(".thunderbird/*/Mail/**/*.mbox")) +                               list(Path.home().glob(".thunderbird/*/Mail/**/INBOX"))
-            elif OS == "Windows":
-                tb_base = Path.home() / "AppData/Roaming/Thunderbird/Profiles"
-                if tb_base.exists():
-                    tb_profiles = list(tb_base.rglob("*.mbox")) +                                   list(tb_base.rglob("INBOX"))
-            elif OS == "Darwin":
-                tb_profiles = list((Path.home() / "Library/Thunderbird/Profiles").rglob("*.mbox"))
-            for mbox_path in tb_profiles[:20]:
-                try:
-                    sz = os.path.getsize(str(mbox_path))
-                    # Count messages (each starts with "From ")
-                    count = 0
-                    with open(str(mbox_path), "rb") as mf:
-                        for line in mf:
-                            if line.startswith(b"From "):
-                                count += 1
-                            if mf.tell() > 10*1024*1024:  # sample first 10MB
-                                break
-                    results.append({
-                        "File":     mbox_path.name,
-                        "Path":     str(mbox_path.parent),
-                        "Size":     fmt_size(sz),
-                        "Messages": str(count) + ("+" if sz > 10*1024*1024 else ""),
-                    })
-                except Exception as e:
-                    results.append({"File": str(mbox_path), "Error": str(e)})
-            if not results:
-                results.append({"Note": "No Thunderbird MBOX files found."})
-
-        elif name == "Email Accounts Config":
-            configs = []
-            if OS == "Windows":
-                # Outlook profiles in registry
-                try:
-                    import winreg
-                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                        r"Software\Microsoft\Office\16.0\Outlook\Profiles")
-                    i = 0
-                    while True:
-                        try:
-                            profile = winreg.EnumKey(key, i)
-                            configs.append({"Source": "Outlook Registry",
-                                            "Profile": profile, "Type": "Outlook"})
-                            i += 1
-                        except OSError:
-                            break
-                except Exception:
-                    pass
-            # Thunderbird accounts.ini / prefs.js
-            for pdir in [Path.home()/".thunderbird",
-                         Path.home()/"AppData/Roaming/Thunderbird/Profiles"]:
-                for prefs_file in pdir.rglob("prefs.js") if pdir.exists() else []:
-                    try:
-                        content = _read(str(prefs_file))
-                        for line in content.splitlines():
-                            if "mail.account" in line and "server" in line:
-                                configs.append({"Source": str(prefs_file),
-                                                "Config": line.strip()[:120],
-                                                "Type": "Thunderbird"})
-                    except Exception:
-                        pass
-            if not configs:
-                configs.append({"Note": "No email account configs found.",
-                                 "Platform": OS})
-            results.extend(configs)
-
-        elif name == "Email Attachments":
-            results.append({"Note": "Run 'PST/OST Files' or 'MSG Files' first.",
-                             "Tip": "Attachments are extracted per-message in the Email Viewer tab."})
-
-        elif name == "Email Contacts":
-            # Parse contacts from PST files
-            search_roots = [Path.home()]
-            if OS == "Windows":
-                search_roots.append(Path.home() / "AppData/Local/Microsoft/Outlook")
-            for root in search_roots:
-                for pf in list(root.rglob("*.pst"))[:3] if root.exists() else []:
-                    try:
-                        import pypff
-                        pst_obj = pypff.file()
-                        pst_obj.open(str(pf))
-                        def scan_contacts(folder, depth=0):
-                            if depth > 4: return
-                            fname = ""
-                            try: fname = folder.get_name() or ""
-                            except Exception: pass
-                            if "contact" in fname.lower():
-                                for i in range(folder.get_number_of_sub_messages()):
-                                    try:
-                                        msg = folder.get_sub_message(i)
-                                        subj = ""
-                                        try: subj = msg.get_plain_text_body()[:100].decode(errors='replace') if msg.get_plain_text_body() else ""
-                                        except Exception: pass
-                                        results.append({
-                                            "PST": pf.name, "Folder": fname,
-                                            "Contact": msg.get_subject() or subj[:60],
-                                        })
-                                    except Exception: pass
-                            for i in range(folder.get_number_of_sub_folders()):
-                                try: scan_contacts(folder.get_sub_folder(i), depth+1)
-                                except Exception: pass
-                        scan_contacts(pst_obj.get_root_folder())
-                        pst_obj.close()
-                    except Exception as e:
-                        results.append({"PST": str(pf), "Error": str(e)})
-            if not results:
-                results.append({"Note": "No contact records extracted. Ensure PST files are accessible."})
-
-        elif name == "Email Calendar Items":
-            search_roots = [Path.home()]
-            if OS == "Windows":
-                search_roots.append(Path.home() / "AppData/Local/Microsoft/Outlook")
-            for root in search_roots:
-                for pf in list(root.rglob("*.pst"))[:3] if root.exists() else []:
-                    try:
-                        import pypff
-                        pst_obj = pypff.file()
-                        pst_obj.open(str(pf))
-                        def scan_calendar(folder, depth=0):
-                            if depth > 4: return
-                            fname = ""
-                            try: fname = folder.get_name() or ""
-                            except Exception: pass
-                            if "calendar" in fname.lower():
-                                for i in range(folder.get_number_of_sub_messages()):
-                                    try:
-                                        msg = folder.get_sub_message(i)
-                                        results.append({
-                                            "PST":    pf.name,
-                                            "Folder": fname,
-                                            "Subject": msg.get_subject() or "",
-                                        })
-                                    except Exception: pass
-                            for i in range(folder.get_number_of_sub_folders()):
-                                try: scan_calendar(folder.get_sub_folder(i), depth+1)
-                                except Exception: pass
-                        scan_calendar(pst_obj.get_root_folder())
-                        pst_obj.close()
-                    except Exception as e:
-                        results.append({"PST": str(pf), "Error": str(e)})
-            if not results:
-                results.append({"Note": "No calendar items extracted."})
-
         # ── GENERIC FALLBACK for any uncaught names ───────────────────
         else:
             results.append({
@@ -2245,19 +1830,15 @@ class ArtifactWorker(QThread):
     result     = pyqtSignal(str, list)        # name, rows
     finished   = pyqtSignal()
 
-    def __init__(self, names, target_path=None, target_type="local"):
+    def __init__(self, names):
         super().__init__()
-        self.names       = names
-        self.target_path = target_path   # path to scan (dir/image/file)
-        self.target_type = target_type   # "local", "image", "directory", "file"
+        self.names = names
 
     def run(self):
         total = len(self.names)
         for i, name in enumerate(self.names):
             self.progress.emit(i+1, total, name)
-            rows = collect_artifact(name,
-                                    target_path=self.target_path,
-                                    target_type=self.target_type)
+            rows = collect_artifact(name)
             self.result.emit(name, rows)
         self.finished.emit()
 
@@ -3683,91 +3264,21 @@ class EvidenceBrowser(QWidget):
         if row < 0: return
         name_item = self.file_table.item(row, 0)
         if not name_item: return
-        item_data = name_item.data(Qt.ItemDataRole.UserRole)
-        is_img_entry = isinstance(item_data, dict) and item_data.get("is_img")
+        name = name_item.data(Qt.ItemDataRole.UserRole) or name_item.text()
+        path = self.current_dir / name
         menu = QMenu(self)
-
-        if is_img_entry:
-            d = item_data
-            if d["is_dir"]:
-                menu.addAction("Open Directory",
-                    lambda: self._load_image_dir(d["image_path"], d["inode"], d["name"]))
-            else:
-                menu.addAction("Preview File",
-                    lambda: self._load_image_file(d["image_path"], d["inode"], d["name"]))
-                menu.addAction("View in Hex", lambda: (
-                    self._load_image_file(d["image_path"], d["inode"], d["name"]),
-                    self.content._switch_mode("Hex")))
-                menu.addSeparator()
-                menu.addAction("💾 Save As…",
-                    lambda: self._save_image_file_as(d["image_path"], d["inode"], d["name"]))
-                menu.addAction("📧 Open in Email Viewer",
-                    lambda: self._open_in_email_viewer(d["image_path"], d["inode"], d["name"]))
-        else:
-            name = item_data if isinstance(item_data, str) else name_item.text()
-            path = self.current_dir / name
-            menu.addAction("Open / Navigate",
-                lambda: self._load_dir(path) if path.is_dir() else self.content.load_path(str(path)))
-            menu.addAction("View in Hex", lambda: (
-                self.content._switch_mode("Hex"),
-                self.content.load_path(str(path)) if path.is_file() else None))
-            menu.addAction("View Metadata", lambda: (
-                self.content._switch_mode("Metadata"),
-                self.content.load_path(str(path)) if path.is_file() else None))
-            menu.addSeparator()
-            if path.is_file():
-                menu.addAction("💾 Save As…", lambda: self._save_host_file_as(path))
-                if path.suffix.lower() in (".pst",".ost",".msg",".mbox"):
-                    menu.addAction("📧 Open in Email Viewer",
-                        lambda: self.main.email_tab.open_file(str(path)))
-            menu.addSeparator()
-            menu.addAction("Compute Hashes…", lambda: self._hash_file(path))
-            menu.addAction("Add to Evidence",
-                lambda: self.main._add_evidence_from_path(str(path)))
-
+        menu.addAction("Open / Navigate",
+            lambda: self._load_dir(path) if path.is_dir() else self.content.load_path(str(path)))
+        menu.addAction("View in Hex", lambda: (
+            self.content._switch_mode("Hex"),
+            self.content.load_path(str(path)) if path.is_file() else None))
+        menu.addAction("View Metadata", lambda: (
+            self.content._switch_mode("Metadata"),
+            self.content.load_path(str(path)) if path.is_file() else None))
+        menu.addSeparator()
+        menu.addAction("Compute Hashes…", lambda: self._hash_file(path))
+        menu.addAction("Add to Evidence", lambda: self.main._add_evidence_from_path(str(path)))
         menu.exec(self.file_table.mapToGlobal(pos))
-
-    def _save_host_file_as(self, src_path):
-        """Save a host-filesystem file to a user-chosen location."""
-        dst, _ = QFileDialog.getSaveFileName(self, "Save File As",
-                                              src_path.name)
-        if dst:
-            try:
-                shutil.copy2(str(src_path), dst)
-                self.main.set_status(f"  Saved: {dst}")
-                QMessageBox.information(self, "Saved", f"File saved to:\n{dst}")
-            except Exception as e:
-                QMessageBox.critical(self, "Save Error", str(e))
-
-    def _save_image_file_as(self, image_path, inode, name):
-        """Extract a file from a forensic image and save it locally."""
-        dst, _ = QFileDialog.getSaveFileName(self, "Save File As", name)
-        if not dst:
-            return
-        try:
-            ifs  = ForensicImageFS.get(image_path)
-            data = ifs.read_file(inode, max_bytes=512*1024*1024)
-            with open(dst, "wb") as f:
-                f.write(data)
-            self.main.set_status(f"  Extracted: {name}  →  {dst}")
-            QMessageBox.information(self, "Saved",
-                f"Extracted {name}\n({fmt_size(len(data))})\nto:\n{dst}")
-        except Exception as e:
-            QMessageBox.critical(self, "Extract Error", str(e))
-
-    def _open_in_email_viewer(self, image_path, inode, name):
-        """Extract file from image and open in Email Viewer tab."""
-        try:
-            ifs  = ForensicImageFS.get(image_path)
-            data = ifs.read_file(inode, max_bytes=512*1024*1024)
-            import tempfile
-            tmp  = tempfile.NamedTemporaryFile(suffix=os.path.splitext(name)[1],
-                                               delete=False)
-            tmp.write(data); tmp.close()
-            self.main.email_tab.open_file(tmp.name, display_name=name)
-            self.main.tabs.setCurrentIndex(5)
-        except Exception as e:
-            QMessageBox.critical(self, "Email Viewer Error", str(e))
 
     def _hash_file(self, path):
         if not path.is_file():
@@ -3790,56 +3301,28 @@ class EvidenceBrowser(QWidget):
 # ══════════════════════════════════════════════════════════════
 
 class ArtifactTab(QWidget):
-    # Emits (artifact_names, target_path, target_type)
-    process_requested = pyqtSignal(list, str, str)
+    process_requested = pyqtSignal(list)
 
     def __init__(self):
         super().__init__()
-        self._checks      = {}
-        self._evidence    = []   # list of (label, type, path) populated by MainWindow
+        self._checks = {}
         self._setup()
 
     def _setup(self):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(12,8,12,8)
 
-        # ── Evidence target selector ─────────────────────────────────
-        tgt_grp = QGroupBox("Evidence Target")
-        tgt_grp.setStyleSheet(f"QGroupBox{{color:{C['accent']};font-weight:bold;}}")
-        tgl = QVBoxLayout(tgt_grp)
-        tgl.setSpacing(4)
-
-        tgt_hdr = QHBoxLayout()
-        tgt_hdr.addWidget(QLabel("Collect from:"))
-        self.target_combo = QComboBox()
-        self.target_combo.addItem("🖥  Local System (live collection)", ("local", None))
-        self.target_combo.setMinimumWidth(400)
-        self.target_combo.currentIndexChanged.connect(self._on_target_changed)
-        tgt_hdr.addWidget(self.target_combo, 1)
-        refresh_btn = QPushButton("↻ Refresh")
-        refresh_btn.setFixedWidth(80)
-        refresh_btn.clicked.connect(self.refresh_evidence_list)
-        tgt_hdr.addWidget(refresh_btn)
-        tgl.addLayout(tgt_hdr)
-
-        self.target_info = QLabel("  Live collection from the local system")
-        self.target_info.setStyleSheet(f"color:{C['fg2']};font-size:8pt;padding:2px 4px;")
-        tgl.addWidget(self.target_info)
-        lay.addWidget(tgt_grp)
-
-        # ── Header + preset buttons ──────────────────────────────────
+        # Header + buttons
         hdr = QHBoxLayout()
         title = QLabel("SELECT ARTIFACTS TO COLLECT")
-        title.setStyleSheet(f"color:{C['accent']};font-size:10pt;font-weight:bold;")
+        title.setStyleSheet(f"color:{C['accent']};font-size:11pt;font-weight:bold;")
         hdr.addWidget(title)
         hdr.addStretch()
 
-        for label, slot in [("✓ All",           self._sel_all),
-                             ("✗ None",          self._sel_none),
-                             ("⚡ IR Preset",     self._preset_ir),
-                             ("🦠 Malware",       self._preset_malware),
-                             ("📁 Image Preset",  self._preset_image),
-                             ("📧 Email Preset",  self._preset_email)]:
+        for label, slot in [("✓ All", self._sel_all),
+                             ("✗ None", self._sel_none),
+                             ("⚡ IR Preset", self._preset_ir),
+                             ("🦠 Malware Preset", self._preset_malware)]:
             btn = QPushButton(label)
             btn.setFixedHeight(28)
             hdr.addWidget(btn)
@@ -3857,7 +3340,7 @@ class ArtifactTab(QWidget):
         sep.setFrameShape(QFrame.Shape.HLine)
         lay.addWidget(sep)
 
-        # ── Scrollable checkbox grid ─────────────────────────────────
+        # Scrollable grid of checkboxes
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet(f"QScrollArea{{border:none;background:{C['bg']}}}")
@@ -3867,80 +3350,36 @@ class ArtifactTab(QWidget):
         grid.setSpacing(2)
 
         for cat, arts in ARTIFACT_CATEGORIES.items():
+            # Category header
             cat_label = QLabel(f"  {cat}")
             cat_label.setStyleSheet(
                 f"background:{C['bg3']};color:{C['accent']};"
                 f"font-weight:bold;font-size:9pt;padding:5px 8px;"
-                f"border-left:3px solid {C['accent']};margin-top:8px;")
+                f"border-left:3px solid {C['accent']};"
+                f"margin-top:8px;"
+            )
             grid.addWidget(cat_label)
+
+            # Checkboxes in 3-column grid
             row_widget = QWidget()
             row_widget.setStyleSheet(f"background:{C['bg']};")
             row_lay = QGridLayout(row_widget)
             row_lay.setContentsMargins(20,2,4,2)
             row_lay.setHorizontalSpacing(8)
             row_lay.setVerticalSpacing(1)
+
             for idx, art in enumerate(arts):
                 cb = QCheckBox(art)
                 cb.setChecked(True)
                 row_lay.addWidget(cb, idx // 3, idx % 3)
                 self._checks[art] = cb
+
             grid.addWidget(row_widget)
 
         grid.addStretch()
         scroll.setWidget(inner)
         lay.addWidget(scroll)
 
-    # ── Evidence target management ───────────────────────────────────
-    def refresh_evidence_list(self, evidence_items=None):
-        """Repopulate target combo from evidence items list."""
-        current = self.target_combo.currentData()
-        self.target_combo.blockSignals(True)
-        self.target_combo.clear()
-        self.target_combo.addItem("🖥  Local System (live collection)", ("local", None))
-        if evidence_items:
-            self._evidence = evidence_items
-        for ev in self._evidence:
-            label = ev.get("label","")
-            etype = ev.get("type","")
-            path  = ev.get("path","")
-            if etype in ("image","disk"):
-                self.target_combo.addItem(f"🖴  {label}", ("image", path))
-            elif etype == "dir" or (path and os.path.isdir(path)):
-                self.target_combo.addItem(f"📁  {label}", ("directory", path))
-            elif etype == "file" or (path and os.path.isfile(path)):
-                self.target_combo.addItem(f"📄  {label}", ("file", path))
-            elif etype == "remote":
-                self.target_combo.addItem(f"🌐  {label}", ("remote", path))
-        self.target_combo.blockSignals(False)
-        # Restore selection if possible
-        if current:
-            for i in range(self.target_combo.count()):
-                if self.target_combo.itemData(i) == current:
-                    self.target_combo.setCurrentIndex(i)
-                    break
-
-    def _on_target_changed(self, idx):
-        data = self.target_combo.itemData(idx)
-        if not data:
-            return
-        ttype, tpath = data
-        if ttype == "local":
-            self.target_info.setText("  Live collection from the local system")
-            # Enable all artifacts
-            for cb in self._checks.values(): cb.setEnabled(True)
-        elif ttype == "image":
-            self.target_info.setText(f"  Forensic image: {tpath}  (non-volatile artifacts only)")
-            # Automatically apply image preset
-            self._preset_image()
-        elif ttype == "directory":
-            self.target_info.setText(f"  Directory: {tpath}")
-            for cb in self._checks.values(): cb.setEnabled(True)
-        elif ttype == "file":
-            self.target_info.setText(f"  File: {tpath}")
-        elif ttype == "remote":
-            self.target_info.setText(f"  Remote target: {tpath}  (deploy agent for collection)")
-
-    # ── Preset selections ────────────────────────────────────────────
     def _sel_all(self):
         for cb in self._checks.values(): cb.setChecked(True)
 
@@ -3962,37 +3401,12 @@ class ArtifactTab(QWidget):
                   "WMI Subscriptions","AppInit DLLs"]:
             if a in self._checks: self._checks[a].setChecked(True)
 
-    def _preset_image(self):
-        """Non-volatile artifacts suitable for forensic image analysis."""
-        self._sel_none()
-        for a in ["PST/OST Files (Outlook)","MSG Files (Outlook)","Thunderbird MBOX",
-                  "Email Attachments","Email Contacts","Email Calendar Items",
-                  "Browser History","Browser Cookies","Browser Saved Passwords",
-                  "Browser Extensions","Prefetch Files","LNK / Shortcut Files",
-                  "Recycle Bin Contents","Registry Run Keys","Startup Folder Items",
-                  "Scheduled Tasks","Security Event Log","System Event Log",
-                  "Application Event Log","PowerShell Operational Log",
-                  "Recently Accessed Files","Certificate Store","SAM Database Hash Dump",
-                  "Installed Software"]:
-            if a in self._checks: self._checks[a].setChecked(True)
-
-    def _preset_email(self):
-        """Email-focused artifact collection."""
-        self._sel_none()
-        for a in ["PST/OST Files (Outlook)","MSG Files (Outlook)","Thunderbird MBOX",
-                  "Email Accounts Config","Email Attachments",
-                  "Email Contacts","Email Calendar Items","Browser History","Browser Cookies"]:
-            if a in self._checks: self._checks[a].setChecked(True)
-
     def _emit_process(self):
         selected = [n for n,cb in self._checks.items() if cb.isChecked()]
         if not selected:
             QMessageBox.warning(self,"Nothing selected","Select at least one artifact.")
             return
-        data  = self.target_combo.currentData() or ("local", None)
-        ttype = data[0]
-        tpath = data[1] or ""
-        self.process_requested.emit(selected, tpath, ttype)
+        self.process_requested.emit(selected)
 
     def get_selected(self):
         return [n for n,cb in self._checks.items() if cb.isChecked()]
@@ -4703,672 +4117,6 @@ class CaseDialog(QDialog):
                 "examiner":self.f_examiner.text(),"notes":self.f_notes.text()}
 
 
-
-# ══════════════════════════════════════════════════════════════
-#  EMAIL VIEWER TAB  (PST/OST via pypff, MSG via extract_msg,
-#                     MBOX via mailbox stdlib)
-# ══════════════════════════════════════════════════════════════
-
-class EmailViewerTab(QWidget):
-    """
-    Outlook-style three-pane email viewer:
-      Left   : Folder tree
-      Middle : Message list (From / Subject / Date / Size)
-      Right  : Message content (headers + body)
-    Supports PST/OST (pypff), MSG (extract_msg), MBOX (mailbox).
-    """
-    def __init__(self):
-        super().__init__()
-        self._pst      = None   # open pypff.file handle
-        self._tmp_path = None   # temp file path for extracted images
-        self._setup()
-
-    def _setup(self):
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0,0,0,0)
-        lay.setSpacing(0)
-
-        # ── Top toolbar ──────────────────────────────────────────────
-        tb = QWidget()
-        tb.setStyleSheet(f"background:{C['bg3']};border-bottom:1px solid {C['border']};")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(8,4,8,4)
-        tbl.setSpacing(6)
-
-        open_btn = QPushButton("📂 Open Email File…")
-        open_btn.clicked.connect(self._open_dialog)
-        tbl.addWidget(open_btn)
-
-        self.file_label = QLabel("No file loaded")
-        self.file_label.setStyleSheet(f"color:{C['fg2']};font-size:9pt;")
-        tbl.addWidget(self.file_label, 1)
-
-        self.msg_count_label = QLabel("")
-        self.msg_count_label.setStyleSheet(f"color:{C['accent']};font-size:9pt;")
-        tbl.addWidget(self.msg_count_label)
-
-        export_btn = QPushButton("💾 Export Selected")
-        export_btn.clicked.connect(self._export_selected)
-        tbl.addWidget(export_btn)
-
-        search_edit = QLineEdit()
-        search_edit.setPlaceholderText("Search messages…")
-        search_edit.setFixedWidth(200)
-        search_edit.textChanged.connect(self._filter_messages)
-        self._search_edit = search_edit
-        tbl.addWidget(search_edit)
-
-        lay.addWidget(tb)
-
-        # ── Three-pane splitter ───────────────────────────────────────
-        h_split = QSplitter(Qt.Orientation.Horizontal)
-        h_split.setHandleWidth(2)
-
-        # Left: folder tree
-        folder_w = QWidget()
-        folder_w.setMinimumWidth(160)
-        folder_w.setMaximumWidth(280)
-        fl = QVBoxLayout(folder_w)
-        fl.setContentsMargins(0,0,0,0)
-        fl.setSpacing(0)
-        fh = QLabel("  FOLDERS")
-        fh.setObjectName("section_header")
-        fl.addWidget(fh)
-        self.folder_tree = QTreeWidget()
-        self.folder_tree.setHeaderHidden(True)
-        self.folder_tree.setStyleSheet(
-            f"QTreeWidget{{background:{C['sidebar']};border:none;}}")
-        self.folder_tree.currentItemChanged.connect(self._on_folder_select)
-        fl.addWidget(self.folder_tree)
-        h_split.addWidget(folder_w)
-
-        # Middle: message list
-        mid_w = QWidget()
-        mid_w.setMinimumWidth(300)
-        ml = QVBoxLayout(mid_w)
-        ml.setContentsMargins(0,0,0,0)
-        ml.setSpacing(0)
-        mh = QLabel("  MESSAGES")
-        mh.setObjectName("section_header")
-        ml.addWidget(mh)
-        self.msg_table = QTableWidget(0, 5)
-        self.msg_table.setHorizontalHeaderLabels(
-            ["From","Subject","Date","Size","Attachments"])
-        self.msg_table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch)
-        for c in (0,2,3,4):
-            self.msg_table.horizontalHeader().setSectionResizeMode(
-                c, QHeaderView.ResizeMode.ResizeToContents)
-        self.msg_table.verticalHeader().setVisible(False)
-        self.msg_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.msg_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.msg_table.setAlternatingRowColors(True)
-        self.msg_table.currentCellChanged.connect(self._on_message_select)
-        self.msg_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.msg_table.customContextMenuRequested.connect(self._msg_ctx)
-        ml.addWidget(self.msg_table)
-        h_split.addWidget(mid_w)
-
-        # Right: message content
-        right_w = QWidget()
-        rl = QVBoxLayout(right_w)
-        rl.setContentsMargins(0,0,0,0)
-        rl.setSpacing(0)
-
-        rh = QLabel("  MESSAGE")
-        rh.setObjectName("section_header")
-        rl.addWidget(rh)
-
-        # Header area
-        self.header_box = QTextEdit()
-        self.header_box.setReadOnly(True)
-        self.header_box.setMaximumHeight(120)
-        self.header_box.setStyleSheet(
-            f"background:{C['bg2']};color:{C['fg']};font-size:9pt;"
-            f"border:none;border-bottom:1px solid {C['border']};padding:6px;")
-        rl.addWidget(self.header_box)
-
-        # Body
-        self.body_view = QTextEdit()
-        self.body_view.setReadOnly(True)
-        self.body_view.setStyleSheet(
-            f"background:{C['bg']};color:{C['fg']};"
-            f"font-size:9pt;border:none;padding:8px;")
-        rl.addWidget(self.body_view, 1)
-
-        # Attachments bar
-        self.attach_bar = QWidget()
-        self.attach_bar.setStyleSheet(
-            f"background:{C['bg2']};border-top:1px solid {C['border']};")
-        self.attach_bar.setVisible(False)
-        abl = QHBoxLayout(self.attach_bar)
-        abl.setContentsMargins(8,4,8,4)
-        abl.setSpacing(6)
-        self.attach_label = QLabel("Attachments:")
-        self.attach_label.setStyleSheet(f"color:{C['fg2']};font-size:8pt;")
-        abl.addWidget(self.attach_label)
-        self.attach_scroll = QScrollArea()
-        self.attach_scroll.setWidgetResizable(True)
-        self.attach_scroll.setFixedHeight(40)
-        self.attach_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-        self.attach_scroll.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.attach_scroll.setStyleSheet("border:none;background:transparent;")
-        self._attach_inner = QWidget()
-        self._attach_lay   = QHBoxLayout(self._attach_inner)
-        self._attach_lay.setContentsMargins(0,0,0,0)
-        self.attach_scroll.setWidget(self._attach_inner)
-        abl.addWidget(self.attach_scroll, 1)
-        rl.addWidget(self.attach_bar)
-
-        h_split.addWidget(right_w)
-        h_split.setSizes([200, 380, 600])
-        lay.addWidget(h_split)
-
-        # Internal state
-        self._messages      = []   # list of message dicts for current folder
-        self._all_messages  = []   # unfiltered
-        self._current_msg   = None
-        self._folder_map    = {}   # tree item -> folder object
-
-    # ── Open file ────────────────────────────────────────────────────
-    def _open_dialog(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Email File", "",
-            "Email Files (*.pst *.ost *.msg *.mbox *.eml);;"
-            "PST/OST (*.pst *.ost);;MSG (*.msg);;MBOX (*.mbox);;EML (*.eml);;All (*)")
-        if path:
-            self.open_file(path)
-
-    def open_file(self, path, display_name=None):
-        """Load an email file. Called externally too (e.g. from context menu)."""
-        self._close_current()
-        name = display_name or os.path.basename(path)
-        self.file_label.setText(f"  {name}")
-        ext  = os.path.splitext(path)[1].lower()
-        try:
-            if ext in (".pst", ".ost"):
-                self._load_pst(path)
-            elif ext == ".msg":
-                self._load_single_msg(path)
-            elif ext == ".mbox":
-                self._load_mbox(path)
-            elif ext == ".eml":
-                self._load_eml(path)
-            else:
-                QMessageBox.warning(self, "Unsupported",
-                    f"Unsupported format: {ext}\nSupported: PST, OST, MSG, MBOX, EML")
-        except Exception as e:
-            QMessageBox.critical(self, "Open Error", str(e))
-
-    def load_results(self, artifact_name, rows):
-        """Called from results tab to open PST files found by artifact collection."""
-        for row in rows:
-            path = row.get("Path","")
-            if path and os.path.isfile(path):
-                ext = os.path.splitext(path)[1].lower()
-                if ext in (".pst",".ost",".msg",".mbox"):
-                    self.open_file(path)
-                    return
-
-    # ── PST / OST loading (pypff) ────────────────────────────────────
-    def _load_pst(self, path):
-        try:
-            import pypff
-        except ImportError:
-            QMessageBox.critical(self, "Missing Library",
-                "pypff not installed.\nRun: pip install libpff-python")
-            return
-        pst = pypff.file()
-        pst.open(path)
-        self._pst = pst
-        self.folder_tree.clear()
-        self._folder_map = {}
-        root = pst.get_root_folder()
-        self._build_folder_tree(root, None)
-        # Select first real folder
-        if self.folder_tree.topLevelItemCount() > 0:
-            first = self.folder_tree.topLevelItem(0)
-            self.folder_tree.setCurrentItem(first)
-
-    def _build_folder_tree(self, folder, parent_item):
-        try:
-            name = folder.get_name() or "(unnamed)"
-        except Exception:
-            name = "(unnamed)"
-        try:
-            n_msg = folder.get_number_of_sub_messages()
-        except Exception:
-            n_msg = 0
-        try:
-            n_sub = folder.get_number_of_sub_folders()
-        except Exception:
-            n_sub = 0
-
-        label = f"📁  {name}  ({n_msg})"
-        if parent_item is None:
-            item = QTreeWidgetItem(self.folder_tree, [label])
-        else:
-            item = QTreeWidgetItem(parent_item, [label])
-        item.setForeground(0, QBrush(QColor(C['orange'])))
-        self._folder_map[id(item)] = folder
-
-        for i in range(n_sub):
-            try:
-                sub = folder.get_sub_folder(i)
-                self._build_folder_tree(sub, item)
-            except Exception:
-                pass
-
-        if parent_item is None:
-            item.setExpanded(True)
-
-    def _on_folder_select(self, item, _prev):
-        if not item: return
-        folder = self._folder_map.get(id(item))
-        if not folder: return
-        self._load_folder_messages(folder)
-
-    def _load_folder_messages(self, folder):
-        self.msg_table.setRowCount(0)
-        self._all_messages = []
-        try:
-            n = folder.get_number_of_sub_messages()
-        except Exception:
-            n = 0
-        for i in range(n):
-            try:
-                msg   = folder.get_sub_message(i)
-                subj  = self._safe_str(msg.get_subject()) or "(no subject)"
-                sendr = self._safe_str(msg.get_sender_name()) or ""
-                date  = ""
-                try:
-                    dt = msg.get_delivery_time()
-                    if dt: date = str(dt)
-                except Exception: pass
-                size  = 0
-                try: size = msg.get_size()
-                except Exception: pass
-                n_att = 0
-                try: n_att = msg.get_number_of_attachments()
-                except Exception: pass
-                self._all_messages.append({
-                    "index":   i,
-                    "msg_obj": msg,
-                    "subject": subj,
-                    "sender":  sendr,
-                    "date":    date,
-                    "size":    size,
-                    "n_att":   n_att,
-                })
-            except Exception:
-                pass
-        self.msg_count_label.setText(f"{len(self._all_messages)} messages")
-        self._render_msg_table(self._all_messages)
-
-    def _render_msg_table(self, messages):
-        self.msg_table.setSortingEnabled(False)
-        self.msg_table.setRowCount(len(messages))
-        for r, m in enumerate(messages):
-            def _item(text, color=C['fg']):
-                it = QTableWidgetItem(str(text))
-                it.setForeground(QBrush(QColor(color)))
-                return it
-            self.msg_table.setItem(r, 0, _item(m["sender"], C['accent']))
-            self.msg_table.setItem(r, 1, _item(m["subject"]))
-            self.msg_table.setItem(r, 2, _item(m["date"][:19] if m["date"] else "", C['fg2']))
-            self.msg_table.setItem(r, 3, _item(fmt_size(m["size"]) if m["size"] else "", C['fg2']))
-            att_text = str(m["n_att"]) if m["n_att"] else ""
-            att_item = _item(att_text, C['orange'] if m["n_att"] else C['fg2'])
-            self.msg_table.setItem(r, 4, att_item)
-            # Store index for lookup
-            self.msg_table.item(r, 0).setData(Qt.ItemDataRole.UserRole, m["index"])
-        self.msg_table.setSortingEnabled(True)
-        self._messages = messages
-
-    def _display_message(self, m):
-        self._current_msg = m
-        msg = m.get("msg_obj")
-        if not msg: return
-
-        # Headers
-        hdr_lines = [
-            f"<b>From:</b>    {self._safe_str(msg.get_sender_name())} "
-            f"&lt;{self._safe_str(msg.get_sender_email_address())}&gt;",
-        ]
-        try:
-            to_list = []
-            for i in range(msg.get_number_of_recipients()):
-                r = msg.get_recipient(i)
-                try: to_list.append(self._safe_str(r.get_display_name()) or
-                                    self._safe_str(r.get_email_address()))
-                except Exception: pass
-            if to_list:
-                hdr_lines.append(f"<b>To:</b>       {'; '.join(to_list[:5])}")
-        except Exception: pass
-        hdr_lines.append(f"<b>Subject:</b>  {m['subject']}")
-        hdr_lines.append(f"<b>Date:</b>     {m['date'][:24] if m['date'] else ''}")
-        self.header_box.setHtml(
-            f"<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"
-            + "<br>".join(hdr_lines) + "</div>")
-
-        # Body
-        body = ""
-        try:
-            html_body = msg.get_html_body()
-            if html_body:
-                body = html_body.decode(errors='replace') if isinstance(html_body, bytes) else html_body
-                self.body_view.setHtml(body)
-            else:
-                raise ValueError("no html")
-        except Exception:
-            try:
-                plain = msg.get_plain_text_body()
-                if plain:
-                    body = plain.decode(errors='replace') if isinstance(plain, bytes) else str(plain)
-                self.body_view.setPlainText(body or "(empty body)")
-            except Exception:
-                self.body_view.setPlainText("(could not decode body)")
-
-        # Attachments
-        n_att = m.get("n_att", 0)
-        self.attach_bar.setVisible(n_att > 0)
-        # Clear old attachment buttons
-        while self._attach_lay.count():
-            item = self._attach_lay.takeAt(0)
-            if item.widget(): item.widget().deleteLater()
-        if n_att > 0:
-            self.attach_label.setText(f"Attachments ({n_att}):")
-            for i in range(n_att):
-                try:
-                    att  = msg.get_attachment(i)
-                    aname = self._safe_str(att.get_name()) or f"attachment_{i}"
-                    asize = 0
-                    try: asize = att.get_size()
-                    except Exception: pass
-                    btn = QPushButton(f"📎 {aname} ({fmt_size(asize)})")
-                    btn.setFixedHeight(26)
-                    btn.setStyleSheet(
-                        f"QPushButton{{background:{C['bg3']};color:{C['fg']};"
-                        f"border:1px solid {C['border']};border-radius:3px;"
-                        f"padding:2px 8px;font-size:8pt;}}"
-                        f"QPushButton:hover{{background:{C['btn_hover']};color:{C['accent']};}}")
-                    btn.clicked.connect(
-                        lambda _, a=att, n=aname: self._save_attachment(a, n))
-                    self._attach_lay.addWidget(btn)
-                except Exception:
-                    pass
-            self._attach_lay.addStretch()
-
-    def _save_attachment(self, att, name):
-        dst, _ = QFileDialog.getSaveFileName(self, "Save Attachment", name)
-        if not dst: return
-        try:
-            data = att.read_buffer(att.get_size())
-            with open(dst, "wb") as f: f.write(data)
-            QMessageBox.information(self, "Saved", f"Attachment saved:\n{dst}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
-
-    # ── MSG file loading ─────────────────────────────────────────────
-    def _load_single_msg(self, path):
-        try:
-            import extract_msg
-        except ImportError:
-            QMessageBox.critical(self,"Missing","pip install extract-msg")
-            return
-        msg = extract_msg.openMsg(path)
-        self.folder_tree.clear()
-        root_item = QTreeWidgetItem(self.folder_tree, ["📧  Message"])
-        root_item.setForeground(0, QBrush(QColor(C['orange'])))
-        self.folder_tree.addTopLevelItem(root_item)
-        self._all_messages = [{
-            "index":   0,
-            "msg_obj": None,
-            "subject": str(msg.subject or "(no subject)"),
-            "sender":  str(msg.sender or ""),
-            "date":    str(msg.date or ""),
-            "size":    os.path.getsize(path),
-            "n_att":   len(msg.attachments),
-            "_msg_raw": msg,
-            "_path":   path,
-        }]
-        self._render_msg_table(self._all_messages)
-        # Display immediately
-        self._display_msg_raw(msg)
-        msg.close()
-
-    def _display_msg_raw(self, msg):
-        """Display an extract_msg message object."""
-        self.header_box.setHtml(
-            f"<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"
-            f"<b>From:</b>    {msg.sender or ''}<br>"
-            f"<b>To:</b>      {msg.to or ''}<br>"
-            f"<b>Subject:</b> {msg.subject or ''}<br>"
-            f"<b>Date:</b>    {msg.date or ''}"
-            "</div>")
-        body = msg.htmlBody or msg.body or "(empty)"
-        if isinstance(body, bytes): body = body.decode(errors='replace')
-        if msg.htmlBody:
-            self.body_view.setHtml(body)
-        else:
-            self.body_view.setPlainText(body)
-        self.attach_bar.setVisible(len(msg.attachments) > 0)
-        while self._attach_lay.count():
-            item = self._attach_lay.takeAt(0)
-            if item.widget(): item.widget().deleteLater()
-        for att in msg.attachments:
-            aname = att.longFilename or att.shortFilename or "attachment"
-            btn = QPushButton(f"📎 {aname}")
-            btn.setFixedHeight(26)
-            btn.clicked.connect(lambda _, a=att, n=aname: self._save_att_raw(a, n))
-            self._attach_lay.addWidget(btn)
-        if msg.attachments: self._attach_lay.addStretch()
-
-    def _save_att_raw(self, att, name):
-        dst, _ = QFileDialog.getSaveFileName(self, "Save Attachment", name)
-        if not dst: return
-        try:
-            with open(dst,"wb") as f: f.write(att.data)
-            QMessageBox.information(self,"Saved",f"Saved to:\n{dst}")
-        except Exception as e:
-            QMessageBox.critical(self,"Error",str(e))
-
-    # ── MBOX loading ─────────────────────────────────────────────────
-    def _load_mbox(self, path):
-        import mailbox
-        try:
-            mbox = mailbox.mbox(path)
-        except Exception as e:
-            QMessageBox.critical(self,"MBOX Error",str(e)); return
-        self.folder_tree.clear()
-        root_item = QTreeWidgetItem(self.folder_tree, [f"📬  {os.path.basename(path)}"])
-        root_item.setForeground(0, QBrush(QColor(C['orange'])))
-        self.folder_tree.addTopLevelItem(root_item)
-        self._all_messages = []
-        for i, msg in enumerate(mbox):
-            try:
-                n_att = sum(1 for part in msg.walk()
-                            if part.get_content_disposition() == 'attachment')
-                self._all_messages.append({
-                    "index":   i,
-                    "msg_obj": None,
-                    "_mbox_msg": msg,
-                    "subject": str(msg.get("Subject","(no subject)"))[:100],
-                    "sender":  str(msg.get("From",""))[:60],
-                    "date":    str(msg.get("Date",""))[:30],
-                    "size":    len(msg.as_bytes()),
-                    "n_att":   n_att,
-                })
-            except Exception: pass
-            if i >= 5000: break
-        self.msg_count_label.setText(f"{len(self._all_messages)} messages")
-        self._render_msg_table(self._all_messages)
-
-    def _on_message_select(self, row, _col, _pr, _pc):
-        if row < 0 or row >= len(self._messages): return
-        m = self._messages[row]
-        self._current_msg = m
-        if "_mbox_msg" in m:
-            self._display_mbox_msg(m["_mbox_msg"])
-        elif "_msg_raw" in m:
-            self._display_msg_raw(m["_msg_raw"])
-        elif m.get("msg_obj"):
-            self._display_message(m)
-
-    def _display_mbox_msg(self, msg):
-        self.header_box.setHtml(
-            f"<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"
-            f"<b>From:</b>    {msg.get('From','')}<br>"
-            f"<b>To:</b>      {msg.get('To','')}<br>"
-            f"<b>Subject:</b> {msg.get('Subject','')}<br>"
-            f"<b>Date:</b>    {msg.get('Date','')}"
-            "</div>")
-        # Find body parts
-        body = ""
-        html_body = ""
-        attachments = []
-        for part in msg.walk():
-            ct  = part.get_content_type()
-            disp = part.get_content_disposition() or ""
-            if "attachment" in disp:
-                attachments.append(part)
-                continue
-            if ct == "text/html" and not html_body:
-                try: html_body = part.get_payload(decode=True).decode(errors='replace')
-                except Exception: pass
-            elif ct == "text/plain" and not body:
-                try: body = part.get_payload(decode=True).decode(errors='replace')
-                except Exception: pass
-        if html_body:
-            self.body_view.setHtml(html_body)
-        else:
-            self.body_view.setPlainText(body or "(empty)")
-        self.attach_bar.setVisible(bool(attachments))
-        while self._attach_lay.count():
-            item = self._attach_lay.takeAt(0)
-            if item.widget(): item.widget().deleteLater()
-        for att in attachments:
-            aname = att.get_filename() or "attachment"
-            btn = QPushButton(f"📎 {aname}")
-            btn.setFixedHeight(26)
-            btn.clicked.connect(
-                lambda _, a=att, n=aname: self._save_mbox_att(a, n))
-            self._attach_lay.addWidget(btn)
-        if attachments: self._attach_lay.addStretch()
-
-    def _save_mbox_att(self, part, name):
-        dst, _ = QFileDialog.getSaveFileName(self,"Save Attachment",name)
-        if not dst: return
-        try:
-            with open(dst,"wb") as f:
-                f.write(part.get_payload(decode=True))
-            QMessageBox.information(self,"Saved",f"Saved to:\n{dst}")
-        except Exception as e:
-            QMessageBox.critical(self,"Error",str(e))
-
-    # ── EML loading ──────────────────────────────────────────────────
-    def _load_eml(self, path):
-        import email
-        with open(path,"rb") as f:
-            msg = email.message_from_bytes(f.read())
-        self.folder_tree.clear()
-        root_item = QTreeWidgetItem(self.folder_tree,[f"📧  {os.path.basename(path)}"])
-        root_item.setForeground(0, QBrush(QColor(C['orange'])))
-        self.folder_tree.addTopLevelItem(root_item)
-        n_att = sum(1 for p in msg.walk() if p.get_content_disposition()=="attachment")
-        self._all_messages = [{
-            "index":0,"msg_obj":None,"_mbox_msg":msg,
-            "subject":str(msg.get("Subject",""))[:100],
-            "sender": str(msg.get("From",""))[:60],
-            "date":   str(msg.get("Date",""))[:30],
-            "size":   os.path.getsize(path),
-            "n_att":  n_att,
-        }]
-        self.msg_count_label.setText("1 message")
-        self._render_msg_table(self._all_messages)
-        self._display_mbox_msg(msg)
-
-    # ── Filter / search ──────────────────────────────────────────────
-    def _filter_messages(self, text):
-        text = text.lower()
-        if not text:
-            filtered = self._all_messages
-        else:
-            filtered = [m for m in self._all_messages
-                        if text in m["subject"].lower()
-                        or text in m["sender"].lower()
-                        or text in m["date"].lower()]
-        self._render_msg_table(filtered)
-        self.msg_count_label.setText(
-            f"{len(filtered)} / {len(self._all_messages)} messages")
-
-    # ── Context menu ─────────────────────────────────────────────────
-    def _msg_ctx(self, pos):
-        row = self.msg_table.rowAt(pos.y())
-        if row < 0: return
-        menu = QMenu(self)
-        menu.addAction("💾 Export Message…", self._export_selected)
-        menu.addAction("Copy Subject", lambda: (
-            QApplication.clipboard().setText(
-                self._messages[row]["subject"] if row < len(self._messages) else "")))
-        menu.addAction("Copy Sender", lambda: (
-            QApplication.clipboard().setText(
-                self._messages[row]["sender"] if row < len(self._messages) else "")))
-        menu.exec(self.msg_table.mapToGlobal(pos))
-
-    # ── Export ───────────────────────────────────────────────────────
-    def _export_selected(self):
-        rows = self.msg_table.selectionModel().selectedRows()
-        if not rows:
-            QMessageBox.information(self,"Export","Select one or more messages first.")
-            return
-        dst_dir = QFileDialog.getExistingDirectory(self,"Export Messages To")
-        if not dst_dir: return
-        exported = 0
-        for idx in rows:
-            r = idx.row()
-            if r >= len(self._messages): continue
-            m = self._messages[r]
-            fn = os.path.join(dst_dir,
-                f"msg_{r:04d}_{m['subject'][:30]}.txt".replace("/","_"))
-            try:
-                with open(fn,"w",encoding="utf-8") as f:
-                    f.write(f"From:    {m['sender']}\n")
-                    f.write(f"Subject: {m['subject']}\n")
-                    f.write(f"Date:    {m['date']}\n\n")
-                    if m.get("msg_obj"):
-                        try:
-                            body = m["msg_obj"].get_plain_text_body()
-                            if body: f.write(body.decode(errors='replace') if isinstance(body,bytes) else str(body))
-                        except Exception: pass
-                exported += 1
-            except Exception:
-                pass
-        QMessageBox.information(self,"Export",f"Exported {exported} message(s) to:\n{dst_dir}")
-
-    # ── Helpers ──────────────────────────────────────────────────────
-    def _safe_str(self, val):
-        if val is None: return ""
-        if isinstance(val, bytes): return val.decode(errors='replace')
-        return str(val)
-
-    def _close_current(self):
-        if self._pst:
-            try: self._pst.close()
-            except Exception: pass
-            self._pst = None
-        self.folder_tree.clear()
-        self.msg_table.setRowCount(0)
-        self.header_box.clear()
-        self.body_view.clear()
-        self.attach_bar.setVisible(False)
-        self._messages = []
-        self._all_messages = []
-        self._folder_map = {}
-
-
 # ══════════════════════════════════════════════════════════════
 #  MAIN WINDOW
 # ══════════════════════════════════════════════════════════════
@@ -5442,7 +4190,6 @@ class MainWindow(QMainWindow):
             ("Analysis Results",  lambda: self.tabs.setCurrentIndex(2)),
             ("Timeline",          lambda: self.tabs.setCurrentIndex(3)),
             ("Remote Agent",      lambda: self.tabs.setCurrentIndex(4)),
-            ("Email Viewer",      lambda: self.tabs.setCurrentIndex(5)),
         ])
         menu("&Help", [
             ("About", self._about),
@@ -5500,7 +4247,6 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.setTabPosition(QTabWidget.TabPosition.North)
-        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         # Tab 0: Evidence Browser
         self.browser = EvidenceBrowser(self)
@@ -5522,10 +4268,6 @@ class MainWindow(QMainWindow):
         # Tab 4: Remote Agent
         self.agent_tab = AgentTab(self.art_tab)
         self.tabs.addTab(self.agent_tab, "⚡  Remote Agent")
-
-        # Tab 5: Email Viewer
-        self.email_tab = EmailViewerTab()
-        self.tabs.addTab(self.email_tab, "📧  Email Viewer")
 
         lay.addWidget(self.tabs)
 
@@ -5568,7 +4310,6 @@ class MainWindow(QMainWindow):
                 self.browser._load_dir(Path(p).parent)
                 self.browser.content.load_path(p)
             self.set_status(f"Added: {os.path.basename(p)}")
-        self._sync_evidence_cache()
 
     def _add_image(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -5578,7 +4319,6 @@ class MainWindow(QMainWindow):
         if path:
             self.browser.add_evidence_image(path)
             self.set_status(f"Image loaded: {os.path.basename(path)}")
-            self._sync_evidence_cache()
 
     def _add_disk(self):
         parts = psutil.disk_partitions()
@@ -5613,40 +4353,6 @@ class MainWindow(QMainWindow):
         if ext in (".e01",".dd",".img",".raw",".vmdk",".vhd",".iso"):
             self.browser.add_evidence_image(path)
         self.set_status(f"Added to evidence: {os.path.basename(path)}")
-        self._sync_evidence_cache()
-
-    def _sync_evidence_cache(self):
-        """Rebuild the evidence items cache from the tree for ArtifactTab."""
-        items = []
-        # Images
-        ir = self.browser.img_root
-        for i in range(ir.childCount()):
-            child = ir.child(i)
-            d = child.data(0, Qt.ItemDataRole.UserRole) or {}
-            if d.get("path"):
-                items.append({"label": child.text(0).strip(),
-                               "type":  d.get("type","image"),
-                               "path":  d["path"]})
-        # Local filesystem roots
-        lr = self.browser.ev_tree.topLevelItem(0)  # "File System"
-        if lr:
-            for i in range(lr.childCount()):
-                child = lr.child(i)
-                d = child.data(0, Qt.ItemDataRole.UserRole) or {}
-                if d.get("path"):
-                    items.append({"label": child.text(0).strip(),
-                                   "type":  d.get("type","dir"),
-                                   "path":  d["path"]})
-        # Remote targets
-        rr = self.browser.remote_root
-        for i in range(rr.childCount()):
-            child = rr.child(i)
-            d = child.data(0, Qt.ItemDataRole.UserRole) or {}
-            items.append({"label": child.text(0).strip(),
-                           "type":  "remote",
-                           "path":  d.get("label","")})
-        self._evidence_items_cache = items
-        self.art_tab.refresh_evidence_list(items)
 
     def _refresh_view(self):
         self.browser._load_dir(self.browser.current_dir)
@@ -5656,18 +4362,13 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(1)
         self.art_tab._emit_process()
 
-    def _run_collection(self, names: list, target_path: str = "", target_type: str = "local"):
+    def _run_collection(self, names: list):
         self.tabs.setCurrentIndex(2)
         self.results_tab.clear_all()
         self.progress_bar.setValue(0)
-        tp = target_path or ""
-        tt = target_type or "local"
-        label = tp if tp else "Local System"
-        self.set_status(f"Collecting {len(names)} artifact(s) from: {label}")
+        self.set_status(f"Collecting {len(names)} artifact(s)…")
 
-        self._worker = ArtifactWorker(names,
-                                      target_path=tp or None,
-                                      target_type=tt)
+        self._worker = ArtifactWorker(names)
         self._worker.progress.connect(self._on_worker_progress)
         self._worker.result.connect(self._on_worker_result)
         self._worker.finished.connect(self._on_worker_done)
@@ -5690,17 +4391,6 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(100)
         self.set_status(f"✓ Collection complete — {len(self.artifact_results)} artifact(s)")
         self.timeline_tab.build_from(self.artifact_results)
-        # Feed any email results to the email viewer
-        email_keys = [k for k in self.artifact_results
-                      if any(x in k for x in ("PST","MSG","MBOX","Email","Thunderbird"))]
-        for k in email_keys:
-            self.email_tab.load_results(k, self.artifact_results[k])
-
-    def _on_tab_changed(self, idx):
-        """Refresh evidence list in ArtifactTab when switching to it."""
-        if idx == 1:  # Artifact Selection tab
-            items = getattr(self, '_evidence_items_cache', [])
-            self.art_tab.refresh_evidence_list(items)
 
     # ── Timeline ─────────────────────────────
     def _build_timeline(self):

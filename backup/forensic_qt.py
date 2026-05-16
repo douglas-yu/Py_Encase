@@ -446,139 +446,1380 @@ ARTIFACT_CATEGORIES = {
 # ══════════════════════════════════════════════════════════════
 
 def collect_artifact(name):
+    """
+    Collect a named forensic artifact from the local system.
+    Cross-platform: Windows uses winreg + WMI paths; Linux uses /proc, /etc, sysfs.
+    """
+    import glob, sqlite3, csv as _csv
     results = []
+    OS = platform.system()   # 'Windows', 'Linux', 'Darwin'
+
+    def _run(cmd, timeout=8):
+        """Run a shell command, return stdout lines list."""
+        try:
+            out = subprocess.check_output(cmd, text=True, timeout=timeout,
+                                          stderr=subprocess.DEVNULL)
+            return [l for l in out.splitlines() if l.strip()]
+        except Exception:
+            return []
+
+    def _read(path, max_bytes=65536):
+        try:
+            with open(path, errors='replace') as f:
+                return f.read(max_bytes)
+        except Exception:
+            return ""
+
+    def _sqlite_query(db_path, sql, params=()):
+        """Query a SQLite DB safely (copies to temp to avoid lock issues)."""
+        rows = []
+        tmp = None
+        try:
+            import shutil as _sh
+            tmp = db_path + ".forensic_tmp"
+            _sh.copy2(db_path, tmp)
+            con = sqlite3.connect(tmp)
+            con.row_factory = sqlite3.Row
+            cur = con.execute(sql, params)
+            cols = [d[0] for d in cur.description]
+            for row in cur.fetchall():
+                rows.append(dict(zip(cols, row)))
+            con.close()
+        except Exception as e:
+            rows.append({"Error": str(e)})
+        finally:
+            try:
+                if tmp and os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+        return rows
+
     try:
-        if name == "Running Processes":
-            for p in psutil.process_iter(['pid','name','username','status','create_time','exe','memory_info','cpu_percent']):
+        # ── SYSTEM INFORMATION ───────────────────────────────────────
+        if name == "OS Version & Build":
+            u = platform.uname()
+            results.append({
+                "System":    u.system,
+                "Node":      u.node,
+                "Release":   u.release,
+                "Version":   u.version,
+                "Machine":   u.machine,
+                "Processor": u.processor,
+                "Python":    sys.version.split()[0],
+            })
+            if OS == "Linux":
+                for osr in ["/etc/os-release", "/etc/lsb-release"]:
+                    if os.path.exists(osr):
+                        for line in _read(osr).splitlines():
+                            if "=" in line:
+                                k, _, v = line.partition("=")
+                                results.append({"Property": k.strip(),
+                                                "Value": v.strip().strip('"')})
+                        break
+
+        elif name == "Hostname & Domain":
+            hn = socket.gethostname()
+            try:   ip = socket.gethostbyname(hn)
+            except: ip = "N/A"
+            results.append({"Hostname": hn, "FQDN": socket.getfqdn(), "IP": ip})
+            if OS == "Linux":
+                for f in ["/etc/hostname", "/etc/mailname"]:
+                    if os.path.exists(f):
+                        results.append({"Source": f, "Value": _read(f).strip()})
+                for line in _run(["hostname", "--all-ip-addresses"]):
+                    results.append({"All IPs": line})
+
+        elif name == "System Uptime":
+            boot = datetime.datetime.fromtimestamp(psutil.boot_time())
+            up   = datetime.datetime.now() - boot
+            m    = psutil.virtual_memory()
+            results.append({
+                "Boot Time":   boot.strftime("%Y-%m-%d %H:%M:%S"),
+                "Uptime":      str(up).split('.')[0],
+                "RAM Total":   fmt_size(m.total),
+                "RAM Used":    fmt_size(m.used),
+                "RAM %":       f"{m.percent}%",
+                "RAM Available": fmt_size(m.available),
+            })
+            for d in psutil.disk_partitions():
+                try:
+                    u = psutil.disk_usage(d.mountpoint)
+                    results.append({
+                        "Device": d.device, "Mount": d.mountpoint,
+                        "FS": d.fstype,
+                        "Total": fmt_size(u.total),
+                        "Used":  fmt_size(u.used),
+                        "Free":  fmt_size(u.free),
+                        "Used%": f"{u.percent}%",
+                    })
+                except Exception:
+                    pass
+
+        elif name == "Hardware Profile":
+            cpu = psutil.cpu_freq()
+            results.append({
+                "CPU Physical Cores": str(psutil.cpu_count(logical=False)),
+                "CPU Logical Cores":  str(psutil.cpu_count(logical=True)),
+                "CPU Freq (MHz)":     f"{cpu.current:.0f}" if cpu else "N/A",
+                "CPU Max (MHz)":      f"{cpu.max:.0f}" if cpu else "N/A",
+                "CPU Usage %":        f"{psutil.cpu_percent(interval=0.5)}%",
+                "RAM Total":          fmt_size(psutil.virtual_memory().total),
+                "Swap Total":         fmt_size(psutil.swap_memory().total),
+            })
+            for i, d in enumerate(psutil.disk_partitions(all=False)):
+                try:
+                    u = psutil.disk_usage(d.mountpoint)
+                    results.append({
+                        "Disk #": str(i + 1),
+                        "Device": d.device,
+                        "Mount":  d.mountpoint,
+                        "FS":     d.fstype,
+                        "Total":  fmt_size(u.total),
+                        "Used":   fmt_size(u.used),
+                        "Free":   fmt_size(u.free),
+                    })
+                except Exception:
+                    pass
+            # CPU per-core
+            for ci, pct in enumerate(psutil.cpu_percent(interval=0.2, percpu=True)):
+                results.append({"Core": f"CPU {ci}", "Usage %": f"{pct}%"})
+
+        elif name == "BIOS/UEFI Info":
+            if OS == "Linux":
+                dmi_base = "/sys/class/dmi/id"
+                fields = ["bios_vendor","bios_version","bios_date",
+                          "board_vendor","board_name","board_version",
+                          "product_name","product_version","sys_vendor",
+                          "chassis_type"]
+                for field in fields:
+                    p = os.path.join(dmi_base, field)
+                    if os.path.exists(p):
+                        results.append({"Property": field.replace("_", " ").title(),
+                                        "Value":    _read(p).strip()})
+                # Also try dmidecode if available
+                for line in _run(["dmidecode", "-t", "0"], timeout=5):
+                    if ":" in line:
+                        k, _, v = line.partition(":")
+                        results.append({"DMI": k.strip(), "Value": v.strip()})
+            elif OS == "Windows":
+                lines = _run(["wmic", "bios", "get", "Manufacturer,Name,Version,ReleaseDate", "/format:csv"])
+                for line in lines[1:]:
+                    parts = line.split(",")
+                    if len(parts) >= 4:
+                        results.append({"Manufacturer":parts[1],"Name":parts[2],
+                                        "Version":parts[3],"Date":parts[4] if len(parts)>4 else ""})
+            else:
+                results.append({"Note": "BIOS info requires root/admin on this platform."})
+
+        elif name == "Installed Software":
+            if OS == "Linux":
+                # Try dpkg
+                lines = _run(["dpkg", "-l"], timeout=15)
+                for line in lines:
+                    if line.startswith("ii"):
+                        p = line.split()
+                        if len(p) >= 4:
+                            results.append({"Package":p[1],"Version":p[2],
+                                            "Arch":p[3],"Status":"Installed"})
+                if not results:
+                    # Try rpm
+                    lines = _run(["rpm", "-qa", "--queryformat",
+                                  "%{NAME}|%{VERSION}|%{RELEASE}|%{INSTALLTIME:date}\n"],
+                                 timeout=15)
+                    for line in lines:
+                        parts = line.split("|")
+                        if len(parts) >= 3:
+                            results.append({"Package":parts[0],"Version":parts[1],
+                                            "Release":parts[2],
+                                            "Installed":parts[3] if len(parts)>3 else ""})
+            elif OS == "Windows":
+                lines = _run(["wmic","product","get",
+                               "Name,Version,Vendor,InstallDate","/format:csv"])
+                for line in lines[1:]:
+                    parts = line.split(",")
+                    if len(parts) >= 4 and parts[1].strip():
+                        results.append({"Name":parts[1],"Version":parts[2],
+                                        "Vendor":parts[3],
+                                        "Installed":parts[4] if len(parts)>4 else ""})
+            elif OS == "Darwin":
+                lines = _run(["system_profiler","SPApplicationsDataType","-detailLevel","mini"])
+                pkg = {}
+                for line in lines:
+                    line = line.strip()
+                    if line.endswith(":") and not line.startswith(" "):
+                        if pkg: results.append(pkg)
+                        pkg = {"Application": line[:-1]}
+                    elif ":" in line:
+                        k, _, v = line.partition(":")
+                        pkg[k.strip()] = v.strip()
+                if pkg:
+                    results.append(pkg)
+
+        elif name == "Loaded Drivers/Modules":
+            if OS == "Linux":
+                lines = _run(["lsmod"])
+                for line in lines[1:]:  # skip header
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        results.append({"Module": parts[0], "Size": parts[1],
+                                        "Used By": " ".join(parts[2:])})
+            elif OS == "Windows":
+                lines = _run(["driverquery", "/fo", "csv", "/v"])
+                reader = _csv.reader(lines)
+                headers = next(reader, [])
+                for row in reader:
+                    if row:
+                        results.append(dict(zip(headers, row)))
+            else:
+                results.append({"Note": "Module listing not available on this platform."})
+
+        elif name == "Scheduled Tasks":
+            if OS == "Linux":
+                # System crontabs
+                cron_sources = ["/etc/crontab"] + \
+                               glob.glob("/etc/cron.d/*") + \
+                               glob.glob("/etc/cron.daily/*") + \
+                               glob.glob("/etc/cron.weekly/*") + \
+                               glob.glob("/etc/cron.monthly/*") + \
+                               glob.glob("/var/spool/cron/crontabs/*")
+                for cp in cron_sources:
+                    if os.path.isfile(cp):
+                        try:
+                            s = os.stat(cp)
+                            content = _read(cp)
+                            tasks = [l for l in content.splitlines()
+                                     if l.strip() and not l.startswith("#")]
+                            results.append({
+                                "Source":    cp,
+                                "Modified":  fmt_ts(s.st_mtime),
+                                "Tasks":     str(len(tasks)),
+                                "Preview":   tasks[0][:80] if tasks else "(empty)",
+                            })
+                        except Exception:
+                            pass
+                # systemd timers
+                for line in _run(["systemctl", "list-timers", "--all",
+                                   "--no-pager", "--no-legend"]):
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        results.append({"Timer": parts[-1], "Next": parts[0],
+                                        "Last": parts[4] if len(parts) > 4 else "",
+                                        "Type": "systemd"})
+            elif OS == "Windows":
+                lines = _run(["schtasks", "/query", "/fo", "csv", "/v"])
+                try:
+                    reader = _csv.reader(lines)
+                    headers = next(reader, [])
+                    for row in reader:
+                        if row and len(row) >= 3:
+                            results.append(dict(zip(headers, row)))
+                except Exception:
+                    pass
+
+        # ── USER & ACCOUNT ACTIVITY ──────────────────────────────────
+        elif name == "Local User Accounts":
+            if OS in ("Linux", "Darwin"):
+                try:
+                    with open("/etc/passwd") as f:
+                        for line in f:
+                            p = line.strip().split(":")
+                            if len(p) >= 7:
+                                uid = int(p[2])
+                                results.append({
+                                    "Username": p[0],
+                                    "UID":      p[2],
+                                    "GID":      p[3],
+                                    "Comment":  p[4],
+                                    "Home":     p[5],
+                                    "Shell":    p[6],
+                                    "Type":     "System" if uid < 1000 else "User",
+                                })
+                except Exception as e:
+                    results.append({"Error": str(e)})
+            elif OS == "Windows":
+                lines = _run(["wmic", "useraccount", "get",
+                               "Name,SID,Disabled,PasswordRequired,LocalAccount",
+                               "/format:csv"])
+                for line in lines[1:]:
+                    parts = line.split(",")
+                    if len(parts) >= 5 and parts[1].strip():
+                        results.append({"Name":parts[1],"SID":parts[5] if len(parts)>5 else "",
+                                        "Disabled":parts[2],"PwdRequired":parts[4]})
+            # Current logged-in users
+            for u in psutil.users():
+                results.append({"User": u.name, "Terminal": u.terminal or "",
+                                 "Host": u.host or "", "Started": fmt_ts(u.started),
+                                 "Type": "Active Session"})
+
+        elif name == "Last Login Times":
+            if OS == "Linux":
+                lines = _run(["last", "-n", "50", "-F"])
+                for line in lines:
+                    if line.strip() and not line.startswith("wtmp"):
+                        parts = line.split()
+                        if len(parts) >= 3:
+                            results.append({
+                                "User":     parts[0],
+                                "Terminal": parts[1],
+                                "From":     parts[2] if len(parts) > 2 else "",
+                                "Login":    " ".join(parts[3:8]) if len(parts) > 7 else "",
+                                "Duration": parts[-1] if parts[-1] != parts[2] else "",
+                            })
+            elif OS == "Windows":
+                lines = _run(["wevtutil", "qe", "Security",
+                               "/q:*[System[EventID=4624]]",
+                               "/c:30", "/rd:true", "/f:text"])
+                ev = {}
+                for line in lines:
+                    line = line.strip()
+                    if "Account Name:" in line:
+                        ev["Account"] = line.split(":", 1)[1].strip()
+                    elif "Logon Type:" in line:
+                        ev["Type"] = line.split(":", 1)[1].strip()
+                    elif "Date:" in line:
+                        ev["Date"] = line.split(":", 1)[1].strip()
+                        if ev.get("Account"):
+                            results.append(dict(ev)); ev = {}
+
+        elif name == "Recent Files (MRU)":
+            home = Path.home()
+            found = []
+            search_dirs = [home, home/"Documents", home/"Downloads",
+                           home/"Desktop", home/"Pictures"]
+            if OS == "Windows":
+                search_dirs += [
+                    home/"AppData/Roaming/Microsoft/Windows/Recent",
+                ]
+            for d in search_dirs:
+                if d.exists():
+                    try:
+                        for entry in d.iterdir():
+                            if entry.is_file():
+                                try:
+                                    s = entry.stat()
+                                    found.append((s.st_atime, entry, s))
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+            found.sort(reverse=True)
+            for at, f, s in found[:60]:
+                results.append({
+                    "File":     f.name,
+                    "Directory":str(f.parent),
+                    "Size":     fmt_size(s.st_size),
+                    "Accessed": fmt_ts(s.st_atime),
+                    "Modified": fmt_ts(s.st_mtime),
+                    "Type":     detect_type(str(f)),
+                })
+
+        # ── NETWORK ARTIFACTS ────────────────────────────────────────
+        elif name == "Running Processes":
+            for p in psutil.process_iter(
+                    ['pid','name','username','status','create_time',
+                     'exe','memory_info','cpu_percent','cmdline']):
                 try:
                     i = p.info
                     mem = fmt_size(i['memory_info'].rss) if i['memory_info'] else "N/A"
-                    results.append({"PID":str(i['pid']),"Name":i['name'] or "","User":i['username'] or "",
-                        "Status":i['status'],"Memory":mem,
-                        "Started":fmt_ts(i['create_time']) if i['create_time'] else "","Path":i['exe'] or ""})
-                except: pass
+                    cmd = " ".join(i['cmdline'][:4]) if i.get('cmdline') else ""
+                    results.append({
+                        "PID":     str(i['pid']),
+                        "Name":    i['name'] or "",
+                        "User":    i['username'] or "",
+                        "Status":  i['status'],
+                        "Memory":  mem,
+                        "CPU%":    f"{i['cpu_percent'] or 0:.1f}",
+                        "Started": fmt_ts(i['create_time']) if i['create_time'] else "",
+                        "Path":    i['exe'] or "",
+                        "CmdLine": cmd[:120],
+                    })
+                except Exception:
+                    pass
 
         elif name == "Active Connections":
             for c in psutil.net_connections(kind='inet'):
                 try:
                     la = f"{c.laddr.ip}:{c.laddr.port}" if c.laddr else ""
                     ra = f"{c.raddr.ip}:{c.raddr.port}" if c.raddr else ""
-                    try: pn = psutil.Process(c.pid).name() if c.pid else ""
-                    except: pn = ""
-                    results.append({"PID":str(c.pid) if c.pid else "","Process":pn,
-                        "Proto":c.type.name if hasattr(c.type,"name") else str(c.type),
-                        "Local":la,"Remote":ra,"Status":c.status})
-                except: pass
+                    try:
+                        pn = psutil.Process(c.pid).name() if c.pid else ""
+                    except Exception:
+                        pn = ""
+                    results.append({
+                        "PID":      str(c.pid) if c.pid else "",
+                        "Process":  pn,
+                        "Protocol": c.type.name if hasattr(c.type, "name") else str(c.type),
+                        "Local":    la,
+                        "Remote":   ra,
+                        "Status":   c.status,
+                    })
+                except Exception:
+                    pass
 
         elif name == "Network Interfaces":
+            stats = psutil.net_if_stats()
+            counters = psutil.net_io_counters(pernic=True)
             for iface, addrs in psutil.net_if_addrs().items():
-                st = psutil.net_if_stats().get(iface)
+                st  = stats.get(iface)
+                cnt = counters.get(iface)
                 for a in addrs:
-                    results.append({"Interface":iface,"Family":str(a.family),
-                        "Address":a.address,"Netmask":a.netmask or "",
-                        "Speed":f"{st.speed}Mbps" if st else "",
-                        "Up":"Yes" if (st and st.isup) else "No"})
+                    results.append({
+                        "Interface": iface,
+                        "Family":    str(a.family).replace("AddressFamily.", ""),
+                        "Address":   a.address,
+                        "Netmask":   a.netmask or "",
+                        "Broadcast": a.broadcast or "",
+                        "Speed":     f"{st.speed}Mbps" if st else "",
+                        "MTU":       str(st.mtu) if st else "",
+                        "Up":        "Yes" if (st and st.isup) else "No",
+                        "Bytes Sent":   fmt_size(cnt.bytes_sent) if cnt else "",
+                        "Bytes Recv":   fmt_size(cnt.bytes_recv) if cnt else "",
+                    })
 
-        elif name == "OS Version & Build":
-            u = platform.uname()
-            results.append({"System":u.system,"Node":u.node,"Release":u.release,
-                "Version":u.version,"Machine":u.machine,"Processor":u.processor,
-                "Python":sys.version.split()[0]})
+        elif name == "ARP Cache":
+            if OS == "Linux":
+                lines = _run(["cat", "/proc/net/arp"])
+                for line in lines[1:]:  # skip header
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        results.append({
+                            "IP":        parts[0],
+                            "HW Type":   parts[1],
+                            "Flags":     parts[2],
+                            "MAC":       parts[3],
+                            "Interface": parts[5] if len(parts) > 5 else "",
+                        })
+            elif OS == "Windows":
+                for line in _run(["arp", "-a"]):
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[1].count("-") == 5:
+                        results.append({"IP": parts[0], "MAC": parts[1], "Type": parts[2]})
 
-        elif name == "Hostname & Domain":
-            results.append({"Hostname":socket.gethostname(),"FQDN":socket.getfqdn(),
-                "IP":socket.gethostbyname(socket.gethostname())})
+        elif name == "DNS Cache":
+            if OS == "Linux":
+                # Check systemd-resolved
+                for line in _run(["systemd-resolve", "--statistics"]):
+                    results.append({"Stat": line})
+                # Also check /etc/hosts
+                for line in _read("/etc/hosts").splitlines():
+                    if line.strip() and not line.startswith("#"):
+                        results.append({"Source": "/etc/hosts", "Entry": line.strip()})
+            elif OS == "Windows":
+                for line in _run(["ipconfig", "/displaydns"]):
+                    if "Record Name" in line or "Type" in line or "Data" in line:
+                        results.append({"Entry": line.strip()})
 
-        elif name == "System Uptime":
-            boot = datetime.datetime.fromtimestamp(psutil.boot_time())
-            up   = datetime.datetime.now() - boot
-            m    = psutil.virtual_memory()
-            d    = psutil.disk_usage('/')
-            results.append({"Boot":boot.strftime("%Y-%m-%d %H:%M:%S"),
-                "Uptime":str(up).split('.')[0],
-                "RAM Total":fmt_size(m.total),"RAM Used":fmt_size(m.used),"RAM %":f"{m.percent}%",
-                "Disk Total":fmt_size(d.total),"Disk Used":fmt_size(d.used),"Disk %":f"{d.percent}%"})
+        elif name == "Firewall Rules":
+            if OS == "Linux":
+                for line in _run(["iptables", "-L", "-n", "--line-numbers"],
+                                  timeout=5):
+                    results.append({"Rule": line})
+                for line in _run(["ufw", "status", "verbose"], timeout=5):
+                    results.append({"UFW": line})
+            elif OS == "Windows":
+                lines = _run(["netsh", "advfirewall", "firewall",
+                               "show", "rule", "name=all"])
+                rule = {}
+                for line in lines:
+                    if ":" in line:
+                        k, _, v = line.partition(":")
+                        rule[k.strip()] = v.strip()
+                        if k.strip() == "Action":
+                            results.append(dict(rule)); rule = {}
 
-        elif name == "Hardware Profile":
-            cpu = psutil.cpu_freq()
-            results.append({"CPU Physical":str(psutil.cpu_count(logical=False)),
-                "CPU Logical":str(psutil.cpu_count(logical=True)),
-                "CPU MHz":f"{cpu.current:.0f}" if cpu else "N/A",
-                "CPU Usage":f"{psutil.cpu_percent(interval=0.3)}%",
-                "RAM":fmt_size(psutil.virtual_memory().total),
-                "Swap":fmt_size(psutil.swap_memory().total)})
-            for i, d in enumerate(psutil.disk_partitions()):
+        elif name == "WiFi Profiles":
+            if OS == "Linux":
+                nm_dir = "/etc/NetworkManager/system-connections"
+                if os.path.isdir(nm_dir):
+                    for f in os.listdir(nm_dir):
+                        fp = os.path.join(nm_dir, f)
+                        content = _read(fp)
+                        ssid = ""
+                        for line in content.splitlines():
+                            if line.startswith("ssid="):
+                                ssid = line.split("=", 1)[1]
+                        results.append({"Profile": f, "SSID": ssid,
+                                        "Path": fp})
+            elif OS == "Windows":
+                profiles = _run(["netsh", "wlan", "show", "profiles"])
+                for line in profiles:
+                    if "All User Profile" in line:
+                        name_part = line.split(":", 1)[-1].strip()
+                        detail = _run(["netsh", "wlan", "show", "profile",
+                                       name_part, "key=clear"])
+                        key = next((l.split(":", 1)[-1].strip()
+                                    for l in detail if "Key Content" in l), "")
+                        results.append({"SSID": name_part, "Key": key})
+
+        elif name == "Browser History":
+            home = Path.home()
+            browser_dbs = []
+            if OS == "Linux":
+                browser_dbs += list(home.glob(".mozilla/firefox/*/places.sqlite"))
+                browser_dbs += list(home.glob(".config/google-chrome/*/History"))
+                browser_dbs += list(home.glob(".config/chromium/*/History"))
+            elif OS == "Windows":
+                browser_dbs += list((home/"AppData/Roaming/Mozilla/Firefox/Profiles").glob("*/places.sqlite")) if \
+                    (home/"AppData/Roaming/Mozilla/Firefox/Profiles").exists() else []
+                browser_dbs += list((home/"AppData/Local/Google/Chrome/User Data").glob("*/History")) if \
+                    (home/"AppData/Local/Google/Chrome/User Data").exists() else []
+            elif OS == "Darwin":
+                browser_dbs += list(home.glob("Library/Application Support/Firefox/Profiles/*/places.sqlite"))
+                browser_dbs += list(home.glob("Library/Application Support/Google/Chrome/*/History"))
+
+            for db in browser_dbs[:3]:
+                db = str(db)
+                if "places.sqlite" in db:
+                    rows = _sqlite_query(db,
+                        "SELECT url, title, visit_count, last_visit_date "
+                        "FROM moz_places ORDER BY last_visit_date DESC LIMIT 100")
+                    for r in rows:
+                        r["Browser"] = "Firefox"
+                        r["Source"] = os.path.basename(os.path.dirname(db))
+                        results.append(r)
+                elif "History" in db:
+                    rows = _sqlite_query(db,
+                        "SELECT url, title, visit_count, last_visit_time "
+                        "FROM urls ORDER BY last_visit_time DESC LIMIT 100")
+                    for r in rows:
+                        r["Browser"] = "Chrome/Chromium"
+                        r["Source"] = os.path.basename(os.path.dirname(db))
+                        results.append(r)
+            if not results:
+                results.append({"Note": "No browser history databases found.",
+                                 "Searched": str(home)})
+
+        elif name == "Browser Cookies":
+            home = Path.home()
+            cookie_dbs = []
+            if OS == "Linux":
+                cookie_dbs += list(home.glob(".mozilla/firefox/*/cookies.sqlite"))
+                cookie_dbs += list(home.glob(".config/google-chrome/*/Cookies"))
+                cookie_dbs += list(home.glob(".config/chromium/*/Cookies"))
+            for db in cookie_dbs[:3]:
+                db = str(db)
+                if "cookies.sqlite" in db:
+                    rows = _sqlite_query(db,
+                        "SELECT host, name, value, expiry, lastAccessed "
+                        "FROM moz_cookies ORDER BY lastAccessed DESC LIMIT 200")
+                    for r in rows:
+                        r["Browser"] = "Firefox"; results.append(r)
+                else:
+                    rows = _sqlite_query(db,
+                        "SELECT host_key, name, value, expires_utc, last_access_utc "
+                        "FROM cookies ORDER BY last_access_utc DESC LIMIT 200")
+                    for r in rows:
+                        r["Browser"] = "Chrome/Chromium"; results.append(r)
+            if not results:
+                results.append({"Note": "No cookie databases found."})
+
+        # ── PERSISTENCE MECHANISMS ───────────────────────────────────
+        elif name == "Registry Run Keys":
+            if OS == "Windows":
                 try:
-                    u = psutil.disk_usage(d.mountpoint)
-                    results.append({"#":f"Disk {i+1}","Device":d.device,"Mount":d.mountpoint,
-                        "FS":d.fstype,"Total":fmt_size(u.total),"Used":fmt_size(u.used),"Free":fmt_size(u.free)})
-                except: pass
+                    import winreg
+                    run_keys = [
+                        (winreg.HKEY_CURRENT_USER,
+                         r"Software\Microsoft\Windows\CurrentVersion\Run"),
+                        (winreg.HKEY_LOCAL_MACHINE,
+                         r"Software\Microsoft\Windows\CurrentVersion\Run"),
+                        (winreg.HKEY_LOCAL_MACHINE,
+                         r"Software\Microsoft\Windows\CurrentVersion\RunOnce"),
+                        (winreg.HKEY_CURRENT_USER,
+                         r"Software\Microsoft\Windows\CurrentVersion\RunOnce"),
+                    ]
+                    for hive, key_path in run_keys:
+                        try:
+                            key = winreg.OpenKey(hive, key_path)
+                            i = 0
+                            while True:
+                                try:
+                                    vname, vdata, vtype = winreg.EnumValue(key, i)
+                                    results.append({
+                                        "Hive":  "HKCU" if hive == winreg.HKEY_CURRENT_USER else "HKLM",
+                                        "Key":   key_path,
+                                        "Name":  vname,
+                                        "Value": str(vdata)[:200],
+                                        "Type":  str(vtype),
+                                    })
+                                    i += 1
+                                except OSError:
+                                    break
+                        except OSError:
+                            pass
+                except ImportError:
+                    results.append({"Note": "winreg not available (not Windows)"})
+            elif OS == "Linux":
+                # Linux equivalents: ~/.config/autostart, /etc/xdg/autostart
+                for d in [Path.home()/".config/autostart",
+                           Path("/etc/xdg/autostart")]:
+                    if d.exists():
+                        for f in d.iterdir():
+                            if f.suffix == ".desktop":
+                                content = _read(str(f))
+                                exec_val = next(
+                                    (l.split("=",1)[1] for l in content.splitlines()
+                                     if l.startswith("Exec=")), "")
+                                enabled = next(
+                                    (l.split("=",1)[1] for l in content.splitlines()
+                                     if l.startswith("Hidden=")), "false")
+                                results.append({
+                                    "Source":  str(d),
+                                    "File":    f.name,
+                                    "Exec":    exec_val,
+                                    "Enabled": "No" if enabled.lower()=="true" else "Yes",
+                                })
 
-        elif name == "Local User Accounts":
-            for u in psutil.users():
-                results.append({"User":u.name,"Terminal":u.terminal or "","Host":u.host or "",
-                    "Started":fmt_ts(u.started)})
+        elif name == "Startup Folder Items":
+            if OS == "Windows":
+                startup_dirs = [
+                    Path.home()/"AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup",
+                    Path("C:/ProgramData/Microsoft/Windows/Start Menu/Programs/StartUp"),
+                ]
+            elif OS == "Linux":
+                startup_dirs = [
+                    Path.home()/".config/autostart",
+                    Path("/etc/xdg/autostart"),
+                    Path("/etc/init.d"),
+                ]
+            else:
+                startup_dirs = [Path("/Library/LaunchAgents"),
+                                Path.home()/"Library/LaunchAgents"]
+            for d in startup_dirs:
+                if d.exists():
+                    for entry in d.iterdir():
+                        try:
+                            s = entry.stat()
+                            results.append({
+                                "Name":     entry.name,
+                                "Directory":str(d),
+                                "Size":     fmt_size(s.st_size),
+                                "Modified": fmt_ts(s.st_mtime),
+                                "Type":     detect_type(str(entry)),
+                            })
+                        except Exception:
+                            pass
 
+        elif name == "Services (Auto-Start)":
+            if OS == "Linux":
+                # systemd services
+                lines = _run(["systemctl", "list-units", "--type=service",
+                               "--all", "--no-pager", "--no-legend"])
+                for line in lines:
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        results.append({
+                            "Unit":        parts[0],
+                            "Load":        parts[1],
+                            "Active":      parts[2],
+                            "Sub":         parts[3],
+                            "Description": " ".join(parts[4:]) if len(parts) > 4 else "",
+                        })
+                # Also enabled services
+                for line in _run(["systemctl", "list-unit-files",
+                                   "--type=service", "--no-pager", "--no-legend"]):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        results.append({"Service": parts[0], "State": parts[1],
+                                        "Type": "unit-file"})
+            elif OS == "Windows":
+                lines = _run(["sc", "query", "type=", "all", "state=", "all"])
+                svc = {}
+                for line in lines:
+                    line = line.strip()
+                    if line.startswith("SERVICE_NAME:"):
+                        if svc: results.append(svc)
+                        svc = {"Name": line.split(":", 1)[1].strip()}
+                    elif ":" in line:
+                        k, _, v = line.partition(":")
+                        svc[k.strip()] = v.strip()
+                if svc:
+                    results.append(svc)
+
+        elif name == "WMI Subscriptions":
+            if OS == "Windows":
+                lines = _run(["wmic", "path",
+                               "ActiveScriptEventConsumer", "get", "/format:csv"])
+                for line in lines[1:]:
+                    if line.strip():
+                        results.append({"WMI Consumer": line.strip()})
+                lines = _run(["wmic", "path",
+                               "CommandLineEventConsumer", "get", "/format:csv"])
+                for line in lines[1:]:
+                    if line.strip():
+                        results.append({"WMI CmdLine Consumer": line.strip()})
+            else:
+                results.append({"Note": "WMI is a Windows-only feature.",
+                                 "Platform": OS})
+
+        elif name == "AppInit DLLs":
+            if OS == "Windows":
+                try:
+                    import winreg
+                    for key_path in [
+                        r"Software\Microsoft\Windows NT\CurrentVersion\Windows",
+                        r"Software\Wow6432Node\Microsoft\Windows NT\CurrentVersion\Windows",
+                    ]:
+                        try:
+                            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path)
+                            val, _ = winreg.QueryValueEx(key, "AppInit_DLLs")
+                            results.append({"Key": key_path, "AppInit_DLLs": val or "(empty)"})
+                        except Exception:
+                            pass
+                except ImportError:
+                    results.append({"Note": "winreg not available"})
+            else:
+                results.append({"Note": "AppInit DLLs is Windows-specific.", "Platform": OS})
+
+        elif name == "COM Hijacking Keys":
+            if OS == "Windows":
+                try:
+                    import winreg
+                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                        r"Software\Classes\CLSID")
+                    i = 0
+                    while True:
+                        try:
+                            clsid = winreg.EnumKey(key, i)
+                            results.append({"CLSID": clsid,
+                                            "Location": "HKCU\\Software\\Classes\\CLSID",
+                                            "Risk": "Potential Hijack"})
+                            i += 1
+                        except OSError:
+                            break
+                except Exception:
+                    results.append({"Note": "COM key enumeration failed or not Windows."})
+            else:
+                results.append({"Note": "COM hijacking keys are Windows-specific."})
+
+        elif name == "Browser Extensions":
+            home = Path.home()
+            ext_dirs = []
+            if OS == "Linux":
+                ext_dirs += list(home.glob(".config/google-chrome/*/Extensions/*"))
+                ext_dirs += list(home.glob(".config/chromium/*/Extensions/*"))
+                ext_dirs += list(home.glob(".mozilla/firefox/*/extensions"))
+            elif OS == "Windows":
+                ext_dirs += list((home/"AppData/Local/Google/Chrome/User Data").glob("*/Extensions/*")) \
+                    if (home/"AppData/Local/Google/Chrome/User Data").exists() else []
+            for ext_dir in ext_dirs[:50]:
+                manifest = Path(ext_dir) / "manifest.json"
+                if not manifest.exists():
+                    for sub in Path(ext_dir).rglob("manifest.json"):
+                        manifest = sub; break
+                if manifest.exists():
+                    try:
+                        with open(manifest) as mf:
+                            m = json.load(mf)
+                        results.append({
+                            "Name":        m.get("name",""),
+                            "Version":     m.get("version",""),
+                            "Description": m.get("description","")[:80],
+                            "Permissions": str(m.get("permissions",[])),
+                            "Path":        str(ext_dir),
+                        })
+                    except Exception:
+                        pass
+            if not results:
+                results.append({"Note": "No browser extensions found."})
+
+        elif name == "Task Scheduler Jobs":
+            # Alias to Scheduled Tasks
+            return collect_artifact("Scheduled Tasks")
+
+        # ── FILE SYSTEM ARTIFACTS ────────────────────────────────────
         elif name == "Recently Accessed Files":
             home = Path.home()
             found = []
-            for d in [home, home/"Documents", home/"Downloads", home/"Desktop"]:
+            for d in [home, home/"Documents", home/"Downloads",
+                      home/"Desktop", home/"Pictures"]:
                 if d.exists():
-                    for f in d.iterdir():
-                        if f.is_file():
-                            try:
-                                s = f.stat()
-                                found.append((s.st_atime, f, s))
-                            except: pass
+                    try:
+                        for entry in d.iterdir():
+                            if entry.is_file():
+                                try:
+                                    s = entry.stat()
+                                    found.append((s.st_atime, entry, s))
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
             found.sort(reverse=True)
-            for at, f, s in found[:50]:
-                results.append({"File":f.name,"Dir":str(f.parent),"Size":fmt_size(s.st_size),
-                    "Accessed":fmt_ts(s.st_atime),"Modified":fmt_ts(s.st_mtime),"Type":detect_type(str(f))})
+            for at, f, s in found[:60]:
+                results.append({
+                    "File":     f.name,
+                    "Directory":str(f.parent),
+                    "Size":     fmt_size(s.st_size),
+                    "Accessed": fmt_ts(s.st_atime),
+                    "Modified": fmt_ts(s.st_mtime),
+                    "Type":     detect_type(str(f)),
+                })
+
+        elif name == "Prefetch Files":
+            if OS == "Windows":
+                pf_dir = Path("C:/Windows/Prefetch")
+                if pf_dir.exists():
+                    for f in sorted(pf_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)[:100]:
+                        try:
+                            s = f.stat()
+                            results.append({
+                                "File":    f.name,
+                                "Size":    fmt_size(s.st_size),
+                                "Created": fmt_ts(s.st_ctime),
+                                "Modified":fmt_ts(s.st_mtime),
+                                "Accessed":fmt_ts(s.st_atime),
+                            })
+                        except Exception:
+                            pass
+                else:
+                    results.append({"Note": "Prefetch dir not found. May be disabled."})
+            elif OS == "Linux":
+                # Linux: /proc/<pid>/exe as analog — recently executed binaries
+                for pid_dir in sorted(Path("/proc").iterdir(),
+                                      key=lambda p: p.stat().st_mtime if p.exists() else 0,
+                                      reverse=True)[:50]:
+                    if pid_dir.name.isdigit():
+                        try:
+                            exe = os.readlink(pid_dir/"exe")
+                            comm = (pid_dir/"comm").read_text().strip()
+                            s = pid_dir.stat()
+                            results.append({
+                                "PID":     pid_dir.name,
+                                "Process": comm,
+                                "Exe":     exe,
+                                "Started": fmt_ts(s.st_mtime),
+                            })
+                        except Exception:
+                            pass
+
+        elif name == "LNK / Shortcut Files":
+            if OS == "Windows":
+                search_dirs = [
+                    Path.home()/"AppData/Roaming/Microsoft/Windows/Recent",
+                    Path.home()/"Desktop",
+                    Path("C:/ProgramData/Microsoft/Windows/Start Menu"),
+                ]
+            else:
+                search_dirs = [Path.home()/".local/share/applications",
+                               Path("/usr/share/applications")]
+            for d in search_dirs:
+                if d.exists():
+                    for f in d.rglob("*.lnk" if OS=="Windows" else "*.desktop"):
+                        try:
+                            s = f.stat()
+                            results.append({
+                                "File":    f.name,
+                                "Path":    str(f),
+                                "Size":    fmt_size(s.st_size),
+                                "Modified":fmt_ts(s.st_mtime),
+                            })
+                        except Exception:
+                            pass
 
         elif name == "Temp Directory Contents":
             tmp = tempfile.gettempdir()
-            for f in sorted(os.listdir(tmp))[:60]:
-                fp = os.path.join(tmp, f)
+            entries = []
+            try:
+                entries = sorted(os.scandir(tmp),
+                                 key=lambda e: e.stat().st_mtime, reverse=True)
+            except Exception:
+                pass
+            for entry in entries[:80]:
                 try:
-                    s = os.stat(fp)
-                    results.append({"Name":f,"IsDir":"Yes" if os.path.isdir(fp) else "No",
-                        "Size":fmt_size(s.st_size) if os.path.isfile(fp) else "—",
-                        "Created":fmt_ts(s.st_ctime),"Modified":fmt_ts(s.st_mtime)})
-                except: pass
+                    s = entry.stat()
+                    results.append({
+                        "Name":    entry.name,
+                        "Is Dir":  "Yes" if entry.is_dir() else "No",
+                        "Size":    fmt_size(s.st_size) if entry.is_file() else "—",
+                        "Created": fmt_ts(s.st_ctime),
+                        "Modified":fmt_ts(s.st_mtime),
+                        "Type":    "Directory" if entry.is_dir() else detect_type(entry.path),
+                    })
+                except Exception:
+                    pass
 
-        elif name == "Installed Software":
-            if platform.system() == "Linux":
-                try:
-                    out = subprocess.check_output(["dpkg","-l"], text=True, timeout=10)
-                    for line in out.splitlines()[5:80]:
-                        pts = line.split()
-                        if len(pts) >= 3 and pts[0] == "ii":
-                            results.append({"Package":pts[1],"Version":pts[2],"Status":"Installed"})
-                except Exception as e:
-                    results.append({"Error":str(e)})
-
-        elif name == "Scheduled Tasks":
-            if platform.system() == "Linux":
-                for cp in ["/etc/crontab","/etc/cron.d","/var/spool/cron"]:
-                    if os.path.isdir(cp):
-                        for f in os.listdir(cp)[:20]:
-                            fp = os.path.join(cp, f)
-                            try:
-                                s = os.stat(fp)
-                                results.append({"Path":fp,"Modified":fmt_ts(s.st_mtime),"Type":"cron"})
-                            except: pass
-                    elif os.path.isfile(cp):
+        elif name == "Recycle Bin Contents":
+            if OS == "Windows":
+                rb = Path("C:/$Recycle.Bin")
+                if rb.exists():
+                    for f in rb.rglob("*"):
                         try:
-                            s = os.stat(cp)
-                            results.append({"Path":cp,"Modified":fmt_ts(s.st_mtime),"Type":"crontab"})
-                        except: pass
+                            s = f.stat()
+                            results.append({"File": f.name, "Path": str(f),
+                                            "Size": fmt_size(s.st_size),
+                                            "Modified": fmt_ts(s.st_mtime)})
+                        except Exception:
+                            pass
+                else:
+                    results.append({"Note": "Recycle Bin not accessible."})
+            elif OS == "Linux":
+                trash = Path.home()/".local/share/Trash/files"
+                if trash.exists():
+                    for f in trash.iterdir():
+                        try:
+                            s = f.stat()
+                            results.append({"File": f.name, "Path": str(f),
+                                            "Size": fmt_size(s.st_size),
+                                            "Modified": fmt_ts(s.st_mtime)})
+                        except Exception:
+                            pass
+                else:
+                    results.append({"Note": "Trash is empty or not found.",
+                                    "Path": str(trash)})
+
+        elif name == "Volume Shadow Copies":
+            if OS == "Windows":
+                for line in _run(["vssadmin", "list", "shadows"]):
+                    results.append({"Entry": line})
+            else:
+                results.append({"Note": "Volume Shadow Copies are Windows-specific.",
+                                 "Alternative": "Use LVM snapshots on Linux."})
+
+        elif name == "Alternate Data Streams":
+            if OS == "Windows":
+                for line in _run(["streams.exe", "-s", "C:\\Users",
+                                   "-accepteula"]):
+                    if ":$DATA" in line:
+                        results.append({"ADS": line.strip()})
+                if not results:
+                    results.append({"Note": "Sysinternals streams.exe not found.",
+                                    "Tip": "Download from Microsoft and re-run."})
+            else:
+                results.append({"Note": "ADS is an NTFS/Windows-specific feature."})
+
+        elif name == "$MFT Entries":
+            if OS == "Windows":
+                results.append({"Note": "MFT parsing requires low-level disk access.",
+                                 "Tip": "Use FTK Imager or mount image for full MFT."})
+            else:
+                results.append({"Note": "MFT is Windows NTFS-specific.",
+                                 "Platform": OS})
+
+        # ── EVENT LOGS ───────────────────────────────────────────────
+        elif name == "Security Event Log":
+            if OS == "Windows":
+                lines = _run(["wevtutil", "qe", "Security",
+                               "/c:50", "/rd:true", "/f:text"])
+                ev = {}
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        if ev: results.append(ev); ev = {}
+                    elif ":" in line:
+                        k, _, v = line.partition(":")
+                        ev[k.strip()] = v.strip()
+                if ev:
+                    results.append(ev)
+            elif OS == "Linux":
+                for log in ["/var/log/auth.log", "/var/log/secure"]:
+                    if os.path.exists(log):
+                        for line in _read(log).splitlines()[-100:]:
+                            if line.strip():
+                                results.append({"Log": log, "Entry": line})
+                        break
+                if not results:
+                    results.append({"Note": "No auth log found.",
+                                    "Tried": "/var/log/auth.log, /var/log/secure"})
+
+        elif name == "System Event Log":
+            if OS == "Windows":
+                lines = _run(["wevtutil", "qe", "System",
+                               "/c:50", "/rd:true", "/f:text"])
+                ev = {}
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        if ev: results.append(ev); ev = {}
+                    elif ":" in line:
+                        k, _, v = line.partition(":")
+                        ev[k.strip()] = v.strip()
+            elif OS == "Linux":
+                for log in ["/var/log/syslog", "/var/log/messages"]:
+                    if os.path.exists(log):
+                        for line in _read(log).splitlines()[-150:]:
+                            if line.strip():
+                                results.append({"Log": log, "Entry": line})
+                        break
+                # Also journalctl
+                if not results:
+                    for line in _run(["journalctl", "-n", "100",
+                                       "--no-pager", "--output=short"]):
+                        results.append({"Source": "journalctl", "Entry": line})
+
+        elif name == "Application Event Log":
+            if OS == "Windows":
+                lines = _run(["wevtutil", "qe", "Application",
+                               "/c:50", "/rd:true", "/f:text"])
+                ev = {}
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        if ev: results.append(ev); ev = {}
+                    elif ":" in line:
+                        k, _, v = line.partition(":")
+                        ev[k.strip()] = v.strip()
+            elif OS == "Linux":
+                for log in ["/var/log/dpkg.log", "/var/log/apt/history.log"]:
+                    if os.path.exists(log):
+                        for line in _read(log).splitlines()[-100:]:
+                            if line.strip():
+                                results.append({"Log": log, "Entry": line})
+
+        elif name == "PowerShell Operational Log":
+            if OS == "Windows":
+                lines = _run(["wevtutil", "qe",
+                               "Microsoft-Windows-PowerShell/Operational",
+                               "/c:50", "/rd:true", "/f:text"])
+                ev = {}
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        if ev: results.append(ev); ev = {}
+                    elif ":" in line:
+                        k, _, v = line.partition(":")
+                        ev[k.strip()] = v.strip()
+            elif OS == "Linux":
+                # PowerShell Core history
+                ps_hist = Path.home()/".local/share/powershell/PSReadLine/ConsoleHost_history.txt"
+                if ps_hist.exists():
+                    for line in _read(str(ps_hist)).splitlines()[-100:]:
+                        if line.strip():
+                            results.append({"Command": line.strip()})
+                else:
+                    results.append({"Note": "PowerShell not installed or no history found."})
+
+        elif name == "RDP Session Log":
+            if OS == "Windows":
+                lines = _run(["wevtutil", "qe",
+                               "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+                               "/c:30", "/rd:true", "/f:text"])
+                ev = {}
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        if ev: results.append(ev); ev = {}
+                    elif ":" in line:
+                        k, _, v = line.partition(":")
+                        ev[k.strip()] = v.strip()
+            elif OS == "Linux":
+                # Check for xrdp or ssh sessions
+                for log in ["/var/log/xrdp.log", "/var/log/xrdp-sesman.log"]:
+                    if os.path.exists(log):
+                        for line in _read(log).splitlines()[-50:]:
+                            results.append({"Log": log, "Entry": line})
+                for line in _run(["last", "-n", "30"]):
+                    if "pts" in line or "tty" in line:
+                        results.append({"Session": line})
+
+        elif name == "Account Logon Events":
+            if OS == "Linux":
+                for line in _run(["last", "-n", "60", "-F"]):
+                    if line.strip() and not line.startswith("wtmp"):
+                        parts = line.split()
+                        results.append({
+                            "User":     parts[0] if parts else "",
+                            "Terminal": parts[1] if len(parts)>1 else "",
+                            "From":     parts[2] if len(parts)>2 else "",
+                            "Login":    " ".join(parts[3:8]) if len(parts)>7 else "",
+                        })
+                for line in _run(["lastlog", "--time", "30"]):
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[0] != "Username":
+                        results.append({
+                            "User": parts[0], "Port": parts[1],
+                            "From": parts[2],
+                            "Latest": " ".join(parts[3:]),
+                        })
+            elif OS == "Windows":
+                lines = _run(["wevtutil", "qe", "Security",
+                               "/q:*[System[EventID=4624 or EventID=4634]]",
+                               "/c:50", "/rd:true", "/f:text"])
+                ev = {}
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        if ev: results.append(ev); ev = {}
+                    elif ":" in line:
+                        k, _, v = line.partition(":")
+                        ev[k.strip()] = v.strip()
+
+        elif name == "Process Creation Events (4688)":
+            if OS == "Windows":
+                lines = _run(["wevtutil", "qe", "Security",
+                               "/q:*[System[EventID=4688]]",
+                               "/c:50", "/rd:true", "/f:text"])
+                ev = {}
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        if ev: results.append(ev); ev = {}
+                    elif ":" in line:
+                        k, _, v = line.partition(":")
+                        ev[k.strip()] = v.strip()
+            elif OS == "Linux":
+                # Linux process audit log
+                for log in ["/var/log/audit/audit.log"]:
+                    if os.path.exists(log):
+                        for line in _read(log).splitlines()[-100:]:
+                            if "type=EXECVE" in line or "type=SYSCALL" in line:
+                                results.append({"Entry": line})
+                if not results:
+                    for line in _run(["journalctl", "-n", "100",
+                                       "--no-pager", "_COMM=sudo"]):
+                        results.append({"Source": "journalctl sudo", "Entry": line})
+
+        # ── MEMORY ARTIFACTS ─────────────────────────────────────────
+        elif name == "Process Memory Strings":
+            suspicious = []
+            for p in psutil.process_iter(['pid','name','exe']):
+                try:
+                    maps_file = f"/proc/{p.pid}/maps"
+                    if os.path.exists(maps_file):
+                        with open(maps_file) as mf:
+                            maps = mf.read()
+                        for line in maps.splitlines():
+                            if any(x in line for x in
+                                   ["/tmp/", "/dev/shm/", "deleted", "(deleted)"]):
+                                results.append({
+                                    "PID":     str(p.pid),
+                                    "Process": p.info['name'] or "",
+                                    "Mapping": line,
+                                    "Risk":    "Suspicious mapping",
+                                })
+                except Exception:
+                    pass
+            if not results:
+                for p in psutil.process_iter(['pid','name']):
+                    try:
+                        cmdline_file = f"/proc/{p.pid}/cmdline"
+                        if os.path.exists(cmdline_file):
+                            with open(cmdline_file, 'rb') as cf:
+                                cmdline = cf.read().replace(b'\x00', b' ').decode(errors='replace')
+                            if cmdline.strip():
+                                results.append({"PID": str(p.pid),
+                                                "Name": p.info['name'] or "",
+                                                "CmdLine": cmdline.strip()[:200]})
+                    except Exception:
+                        pass
+
+        elif name == "Injected DLLs":
+            if OS == "Windows":
+                lines = _run(["tasklist", "/m", "/fo", "csv"])
+                try:
+                    reader = _csv.reader(lines)
+                    headers = next(reader, [])
+                    for row in reader:
+                        if row:
+                            results.append(dict(zip(headers, row)))
+                except Exception:
+                    pass
+            elif OS == "Linux":
+                for p in psutil.process_iter(['pid','name']):
+                    try:
+                        maps_file = f"/proc/{p.pid}/maps"
+                        if os.path.exists(maps_file):
+                            with open(maps_file) as mf:
+                                for line in mf:
+                                    if ".so" in line and ("rwxp" in line or "rwx" in line):
+                                        results.append({
+                                            "PID":     str(p.pid),
+                                            "Process": p.info['name'] or "",
+                                            "Library": line.split()[-1] if line.split() else "",
+                                            "Perms":   line.split()[1] if len(line.split())>1 else "",
+                                            "Risk":    "Executable writable mapping",
+                                        })
+                    except Exception:
+                        pass
+                if not results:
+                    results.append({"Note": "No suspicious injected mappings found."})
+
+        elif name == "Hollowed Processes":
+            suspicious = []
+            for p in psutil.process_iter(['pid','name','exe','status']):
+                try:
+                    exe = p.info.get('exe') or ''
+                    maps_file = f"/proc/{p.pid}/maps"
+                    if OS == "Linux" and os.path.exists(maps_file):
+                        with open(maps_file) as mf:
+                            content = mf.read()
+                        if "(deleted)" in content and exe:
+                            suspicious.append({
+                                "PID":     str(p.pid),
+                                "Name":    p.info['name'] or "",
+                                "Exe":     exe,
+                                "Note":    "Executable mapping deleted from disk",
+                                "Risk":    "⚠ Possible hollowing",
+                            })
+                except Exception:
+                    pass
+            if suspicious:
+                results.extend(suspicious)
+            else:
+                results.append({"Note": "No obvious process hollowing indicators found."})
+
+        elif name == "Heap Allocations":
+            results.append({
+                "Note":      "Live heap analysis requires kernel-level access.",
+                "Available": "Process maps shown below.",
+                "Platform":  OS,
+            })
+            for p in psutil.process_iter(['pid','name','memory_info']):
+                try:
+                    mi = p.info.get('memory_info')
+                    if mi:
+                        results.append({
+                            "PID":    str(p.pid),
+                            "Name":   p.info['name'] or "",
+                            "RSS":    fmt_size(mi.rss),
+                            "VMS":    fmt_size(mi.vms),
+                        })
+                except Exception:
+                    pass
+
+        elif name == "Kernel Objects":
+            if OS == "Linux":
+                for line in _run(["cat", "/proc/sys/kernel/dmesg_restrict"]):
+                    results.append({"dmesg_restrict": line})
+                for line in _run(["dmesg", "--level=err,warn",
+                                   "--notime"], timeout=5)[:50]:
+                    results.append({"dmesg": line})
+                # Loaded kernel modules
+                for line in _run(["lsmod"])[:30]:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        results.append({"Module":parts[0],"Size":parts[1],
+                                        "Used":parts[2]})
+            else:
+                results.append({"Note": "Kernel object enumeration requires OS-specific tools."})
+
+        # ── CREDENTIALS & SECRETS ────────────────────────────────────
+        elif name == "SAM Database Hash Dump":
+            if OS == "Windows":
+                results.append({
+                    "Warning": "SAM dump requires SYSTEM privileges.",
+                    "Tool":    "Use secretsdump.py or reg save HKLM\\SAM for offline extraction.",
+                    "Status":  "Requires elevation",
+                })
+            elif OS == "Linux":
+                shadow = "/etc/shadow"
+                if os.path.exists(shadow):
+                    try:
+                        with open(shadow) as f:
+                            for line in f:
+                                parts = line.strip().split(":")
+                                if len(parts) >= 2:
+                                    algo = {"$1$":"MD5","$5$":"SHA-256",
+                                            "$6$":"SHA-512","$y$":"yescrypt",
+                                            "*":"Locked","!":"Locked"
+                                            }.get(parts[1][:3], parts[1][:3] if parts[1] else "No Password")
+                                    results.append({
+                                        "User":    parts[0],
+                                        "Hash":    parts[1][:32] + "…" if len(parts[1]) > 32 else parts[1],
+                                        "Algorithm": algo,
+                                        "Last Changed": fmt_ts(int(parts[2])*86400) if parts[2].isdigit() else parts[2],
+                                    })
+                    except PermissionError:
+                        results.append({"Status": "Permission denied.",
+                                        "Note": "Run as root to read /etc/shadow."})
+                else:
+                    results.append({"Note": "/etc/shadow not found."})
+
+        elif name == "LSA Secrets":
+            if OS == "Windows":
+                results.append({
+                    "Warning": "LSA secrets require SYSTEM privileges.",
+                    "Tool":    "Use secretsdump.py with valid credentials for extraction.",
+                    "Status":  "Requires elevation",
+                })
+            else:
+                results.append({"Note": "LSA Secrets are Windows-specific."})
+
+        elif name == "DPAPI Master Keys":
+            if OS == "Windows":
+                dpapi_dir = Path.home()/"AppData/Roaming/Microsoft/Protect"
+                if dpapi_dir.exists():
+                    for f in dpapi_dir.rglob("*"):
+                        if f.is_file():
+                            try:
+                                s = f.stat()
+                                results.append({
+                                    "File":    f.name,
+                                    "Path":    str(f),
+                                    "Size":    fmt_size(s.st_size),
+                                    "Modified":fmt_ts(s.st_mtime),
+                                })
+                            except Exception:
+                                pass
+                else:
+                    results.append({"Note": "DPAPI directory not found."})
+            else:
+                results.append({"Note": "DPAPI is Windows-specific."})
+
+        elif name == "Browser Saved Passwords":
+            home = Path.home()
+            login_dbs = []
+            if OS == "Linux":
+                login_dbs += list(home.glob(".config/google-chrome/*/Login Data"))
+                login_dbs += list(home.glob(".config/chromium/*/Login Data"))
+            elif OS == "Windows":
+                login_dbs += list((home/"AppData/Local/Google/Chrome/User Data").glob("*/Login Data")) \
+                    if (home/"AppData/Local/Google/Chrome/User Data").exists() else []
+            for db in login_dbs[:3]:
+                rows = _sqlite_query(str(db),
+                    "SELECT origin_url, username_value, length(password_value) as pwd_len, "
+                    "date_created FROM logins ORDER BY date_created DESC LIMIT 100")
+                for r in rows:
+                    r["Note"] = "Password encrypted (DPAPI/keyring)"
+                    results.append(r)
+            if not results:
+                results.append({"Note": "No saved password databases found or accessible."})
+
+        elif name == "Certificate Store":
+            if OS == "Linux":
+                cert_dirs = ["/etc/ssl/certs", "/usr/share/ca-certificates"]
+                for d in cert_dirs:
+                    if os.path.isdir(d):
+                        for f in sorted(os.listdir(d))[:50]:
+                            fp = os.path.join(d, f)
+                            if os.path.isfile(fp):
+                                try:
+                                    s = os.stat(fp)
+                                    results.append({
+                                        "Certificate": f,
+                                        "Directory":   d,
+                                        "Size":        fmt_size(s.st_size),
+                                        "Modified":    fmt_ts(s.st_mtime),
+                                    })
+                                except Exception:
+                                    pass
+            elif OS == "Windows":
+                lines = _run(["certutil", "-store", "MY"])
+                cert = {}
+                for line in lines:
+                    if ":" in line:
+                        k, _, v = line.partition(":")
+                        cert[k.strip()] = v.strip()
+                        if k.strip() == "Signature matches Public Key":
+                            results.append(dict(cert)); cert = {}
+
+        # ── GENERIC FALLBACK for any uncaught names ───────────────────
         else:
-            results.append({"Artifact":name,"Status":"Collected",
-                "Timestamp":datetime.datetime.now().strftime("%H:%M:%S"),
-                "Note":"Deploy agent for full OS-level collection."})
+            results.append({
+                "Artifact":  name,
+                "Status":    "Not Implemented",
+                "Platform":  OS,
+                "Note":      f"'{name}' requires platform-specific tools or elevated privileges. "
+                             f"Deploy the remote agent on the target host for full collection.",
+            })
+
     except Exception as e:
-        results.append({"Error":str(e),"Artifact":name})
+        results.append({"Error": str(e), "Artifact": name,
+                        "Traceback": __import__('traceback').format_exc()[:500]})
+
     return results
+
+
 
 # ══════════════════════════════════════════════════════════════
 #  WORKER THREADS
@@ -966,7 +2207,391 @@ class ContentViewer(QWidget):
         except Exception as e:
             self.strings_view.setPlainText(f"[Error: {e}]")
 
+
+
 # ══════════════════════════════════════════════════════════════
+#  FORENSIC IMAGE FILESYSTEM  (pytsk3 + libewf ctypes / ewfmount)
+#
+#  E01/EWF backend priority:
+#    1. ctypes libewf  (libewf.so.2 on Linux, libewf.dll on Windows)
+#       No pip package needed. Install once:
+#         Linux:   sudo apt install ewf-tools   (or libewf2)
+#         Windows: download libewf from https://github.com/libyal/libewf/releases
+#    2. pyewf          pip install pyewf  (if wheel available)
+#    3. ewfmount FUSE  Linux only, apt install ewf-tools
+#  DD / RAW / ISO:  pytsk3 direct, no extra library needed
+# ══════════════════════════════════════════════════════════════
+
+def _load_libewf_ctypes():
+    """Load libewf shared library via ctypes. Returns CDLL or None."""
+    import ctypes
+    if platform.system() == 'Windows':
+        candidates = [
+            'libewf.dll', 'libewf-2.dll',
+            r'C:\Program Files\EWF Tools\libewf.dll',
+            r'C:\ewf-tools\libewf.dll',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'libewf.dll'),
+        ]
+    elif platform.system() == 'Darwin':
+        candidates = ['libewf.dylib', 'libewf.2.dylib',
+                      '/usr/local/lib/libewf.dylib',
+                      '/opt/homebrew/lib/libewf.dylib']
+    else:
+        candidates = ['libewf.so.2', 'libewf.so',
+                      '/usr/lib/x86_64-linux-gnu/libewf.so.2',
+                      '/usr/lib/libewf.so.2']
+    for name in candidates:
+        try:
+            lib = ctypes.CDLL(name)
+            lib.libewf_get_version.restype = ctypes.c_char_p
+            lib.libewf_get_version()
+            return lib
+        except Exception:
+            pass
+    return None
+
+
+def _ewf_available():
+    """Probe for EWF backend. Returns (method_str, backend_obj) or (None, None)."""
+    lib = _load_libewf_ctypes()
+    if lib:
+        return ('ctypes_libewf', lib)
+    try:
+        import pyewf
+        return ('pyewf', pyewf)
+    except ImportError:
+        pass
+    if platform.system() != 'Windows' and shutil.which('ewfmount'):
+        return ('ewfmount', None)
+    return (None, None)
+
+
+def _make_ewf_img_class():
+    """Build and return an EWFImgInfo class (deferred import of pytsk3)."""
+    import pytsk3, ctypes
+
+    class EWFImgInfo(pytsk3.Img_Info):
+        """pytsk3.Img_Info backed by a ctypes libewf handle."""
+        def __init__(self, lib, handle, media_size):
+            self._lib        = lib
+            self._handle     = handle
+            self._media_size = media_size
+            lib.libewf_handle_read_random.restype  = ctypes.c_ssize_t
+            lib.libewf_handle_read_random.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_size_t, ctypes.c_int64, ctypes.c_void_p]
+            super().__init__(url='')
+
+        def read(self, offset, length):
+            import ctypes as _ct
+            buf = _ct.create_string_buffer(length)
+            n   = self._lib.libewf_handle_read_random(
+                      self._handle, buf, length, offset, None)
+            return buf.raw[:max(0, n)]
+
+        def get_size(self):
+            return self._media_size
+
+    return EWFImgInfo
+
+
+class ForensicImageFS:
+    """
+    Unified forensic image access via pytsk3.
+    Supports: E01/EWF, DD, RAW, ISO. Use ForensicImageFS.get(path).
+    """
+    _cache      = {}
+    _mount_dirs = {}
+
+    def __init__(self, image_path):
+        self.image_path  = image_path
+        self.fs          = None
+        self.img         = None
+        self.partitions  = []
+        self.active_part = 0
+        self.error       = ""
+        self._mount_dir  = None
+        self._ewf_handle = None
+        self._ewf_lib    = None
+        self._open()
+
+    @classmethod
+    def get(cls, path):
+        if path not in cls._cache:
+            cls._cache[path] = ForensicImageFS(path)
+        return cls._cache[path]
+
+    @classmethod
+    def invalidate(cls, path):
+        if path in cls._cache:
+            try: cls._cache[path].cleanup()
+            except Exception: pass
+            del cls._cache[path]
+
+    def _open(self):
+        try:
+            import pytsk3
+        except ImportError:
+            self.error = "pytsk3 not installed. Run:  pip install pytsk3"
+            return
+        ext    = os.path.splitext(self.image_path)[1].lower()
+        is_ewf = ext in ('.e01', '.ewf', '.ex01', '.e02', '.s01', '.l01')
+        if is_ewf:
+            self._open_ewf(pytsk3)
+        else:
+            self._open_raw(pytsk3, self.image_path)
+
+    def _open_ewf(self, pytsk3):
+        """Try EWF backends in order: ctypes_libewf -> pyewf -> ewfmount."""
+        import ctypes
+        method, backend = _ewf_available()
+
+        if method == 'ctypes_libewf':
+            lib = backend
+            try:
+                lib.libewf_handle_initialize.restype  = ctypes.c_int
+                lib.libewf_handle_initialize.argtypes = [
+                    ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+                lib.libewf_handle_open.restype  = ctypes.c_int
+                lib.libewf_handle_open.argtypes = [
+                    ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p),
+                    ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+                lib.libewf_handle_get_media_size.restype  = ctypes.c_int
+                lib.libewf_handle_get_media_size.argtypes = [
+                    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64),
+                    ctypes.c_void_p]
+
+                handle = ctypes.c_void_p()
+                if lib.libewf_handle_initialize(ctypes.byref(handle), None) != 1:
+                    raise RuntimeError("libewf_handle_initialize failed")
+
+                base = os.path.splitext(self.image_path)[0]
+                seg_files = [self.image_path.encode()]
+                for n in range(2, 100):
+                    for sfx in ('.E%02d' % n, '.e%02d' % n):
+                        seg = base + sfx
+                        if os.path.exists(seg):
+                            seg_files.append(seg.encode())
+                            break
+                    else:
+                        break
+
+                c_files = (ctypes.c_char_p * len(seg_files))(*seg_files)
+                if lib.libewf_handle_open(handle, c_files, len(seg_files), 1, None) != 1:
+                    raise RuntimeError("libewf_handle_open failed")
+
+                media_sz = ctypes.c_uint64()
+                lib.libewf_handle_get_media_size(handle, ctypes.byref(media_sz), None)
+                self._ewf_lib    = lib
+                self._ewf_handle = handle
+                EWFImgInfo       = _make_ewf_img_class()
+                self.img         = EWFImgInfo(lib, handle, media_sz.value)
+                self._finish_open(pytsk3)
+                return
+            except Exception as e:
+                if self._ewf_handle:
+                    try: lib.libewf_handle_close(self._ewf_handle, None)
+                    except Exception: pass
+                    self._ewf_handle = None
+                self._ewf_lib = None
+                if platform.system() == 'Windows':
+                    self.error = (
+                        "libewf.dll failed: %s\n"
+                        "Download from https://github.com/libyal/libewf/releases\n"
+                        "Place libewf.dll next to forensic_qt.py" % e)
+                    return
+
+        if method == 'pyewf':
+            try:
+                filenames = backend.glob(self.image_path) or [self.image_path]
+                ewf_h = backend.handle()
+                ewf_h.open(filenames)
+                self._ewf_handle = ewf_h
+                self.img = pytsk3.Img_Info(ewf_h)
+                self._finish_open(pytsk3)
+                return
+            except Exception as e:
+                if platform.system() == 'Windows':
+                    self.error = "pyewf failed: %s" % e
+                    return
+
+        if platform.system() != 'Windows' and shutil.which('ewfmount'):
+            self._open_ewf_fuse(pytsk3)
+            return
+
+        self.error = (
+            "No EWF library found.  "
+            "Windows: place libewf.dll next to this script  "
+            "(download from https://github.com/libyal/libewf/releases).  "
+            "Linux: sudo apt install ewf-tools  OR  install libewf2.")
+
+    def _open_ewf_fuse(self, pytsk3):
+        mnt = tempfile.mkdtemp(prefix='fpro_ewf_')
+        self._mount_dir = mnt
+        ForensicImageFS._mount_dirs[self.image_path] = mnt
+        ret = os.system('ewfmount "%s" "%s" 2>/dev/null' % (self.image_path, mnt))
+        if ret != 0:
+            self.error = ("ewfmount failed (exit %d). "
+                          "Try: sudo apt install ewf-tools" % ret)
+            return
+        ewf1 = os.path.join(mnt, 'ewf1')
+        if not os.path.exists(ewf1):
+            cands = sorted(os.listdir(mnt))
+            ewf1  = os.path.join(mnt, cands[0]) if cands else None
+        if not ewf1:
+            self.error = "ewfmount produced no output in %s" % mnt
+            return
+        self._open_raw(pytsk3, ewf1)
+
+    def _open_raw(self, pytsk3, raw_path):
+        try:
+            self.img = pytsk3.Img_Info(raw_path)
+        except Exception as e:
+            self.error = "pytsk3.Img_Info: %s" % e
+            return
+        self._finish_open(pytsk3)
+
+    def _finish_open(self, pytsk3):
+        try:
+            vol = pytsk3.Volume_Info(self.img)
+            for part in vol:
+                desc = part.desc.decode(errors='replace').strip()
+                if any(s in desc for s in
+                       ('Unallocated', 'Safety', 'Meta', 'Table', 'DOS')):
+                    continue
+                self.partitions.append({
+                    'desc':   desc,
+                    'offset': part.start * vol.info.block_size,
+                    'size':   part.len   * vol.info.block_size,
+                    'addr':   part.addr,
+                })
+            for idx, p in enumerate(self.partitions):
+                try:
+                    self.fs = pytsk3.FS_Info(self.img, offset=p['offset'])
+                    self.active_part = idx
+                    return
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        try:
+            self.fs = pytsk3.FS_Info(self.img)
+            if not self.partitions:
+                try:   sz = os.path.getsize(self.image_path)
+                except: sz = 0
+                self.partitions = [{'desc':'Whole Image','offset':0,'size':sz,'addr':0}]
+        except Exception as e:
+            self.error = ("No filesystem found. %s  "
+                          "Supported: NTFS FAT ext2/3/4 ISO9660 HFS+" % e)
+
+    def switch_partition(self, idx):
+        if not self.img or idx >= len(self.partitions):
+            return False
+        try:
+            import pytsk3
+            self.fs = pytsk3.FS_Info(self.img, offset=self.partitions[idx]['offset'])
+            self.active_part = idx
+            return True
+        except Exception as e:
+            self.error = str(e)
+            return False
+
+    def list_dir(self, inode=None, path=None):
+        if not self.fs:
+            return []
+        try:
+            import pytsk3
+        except ImportError:
+            return []
+        entries = []
+        try:
+            d = (self.fs.open_dir(inode=inode) if inode is not None
+                 else self.fs.open_dir(path=path or '/'))
+            for e in d:
+                try:
+                    name = e.info.name.name.decode(errors='replace')
+                    if name in ('.', '..', '$OrphanFiles'):
+                        continue
+                    meta   = e.info.meta
+                    is_dir = bool(meta and meta.type == pytsk3.TSK_FS_META_TYPE_DIR)
+                    entries.append({
+                        'name':   name,
+                        'is_dir': is_dir,
+                        'size':   meta.size   if meta else 0,
+                        'mtime':  meta.mtime  if meta else 0,
+                        'atime':  meta.atime  if meta else 0,
+                        'ctime':  meta.crtime if meta else 0,
+                        'inode':  meta.addr   if meta else 0,
+                        'type':   'Directory' if is_dir else detect_type_by_name(name),
+                    })
+                except Exception:
+                    pass
+        except Exception as e:
+            entries.append({'name':'[Error: %s]' % e,'is_dir':False,
+                            'size':0,'mtime':0,'atime':0,'ctime':0,'inode':0,'type':'Error'})
+        entries.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
+        return entries
+
+    def read_file(self, inode, max_bytes=4*1024*1024):
+        if not self.fs:
+            return b''
+        try:
+            f    = self.fs.open_meta(inode=inode)
+            size = min(f.info.meta.size, max_bytes)
+            return f.read_random(0, size)
+        except Exception as e:
+            return ('[Read error: %s]' % e).encode()
+
+    def cleanup(self):
+        import ctypes
+        if self._ewf_handle and self._ewf_lib:
+            try: self._ewf_lib.libewf_handle_close(self._ewf_handle, None)
+            except Exception: pass
+            self._ewf_handle = None
+            self._ewf_lib    = None
+        elif self._ewf_handle:
+            try: self._ewf_handle.close()
+            except Exception: pass
+            self._ewf_handle = None
+        if self._mount_dir and os.path.isdir(self._mount_dir):
+            os.system('fusermount -u "%s" 2>/dev/null || umount "%s" 2>/dev/null'
+                      % (self._mount_dir, self._mount_dir))
+            try: os.rmdir(self._mount_dir)
+            except Exception: pass
+            self._mount_dir = None
+
+    def fs_type_str(self):
+        if not self.fs: return 'Unknown'
+        return {2:'FAT12',4:'FAT16',8:'FAT32',0x0b:'exFAT',0x80:'ext2',
+                0x81:'ext3',0x82:'ext4',0x03:'NTFS',0x0c:'ISO9660',
+                0x10:'HFS+',0x12:'YAFFS2'
+                }.get(self.fs.info.ftype, 'FS type %d' % self.fs.info.ftype)
+
+    def ewf_backend(self):
+        m, _ = _ewf_available()
+        return m or 'none'
+
+
+def detect_type_by_name(name):
+    return {
+        '.jpg':'JPEG Image','.jpeg':'JPEG Image','.png':'PNG Image',
+        '.gif':'GIF Image','.bmp':'BMP Image','.tiff':'TIFF Image',
+        '.mp3':'MP3 Audio','.wav':'WAV Audio','.flac':'FLAC Audio',
+        '.mp4':'MP4 Video','.avi':'AVI Video','.mkv':'MKV Video',
+        '.pdf':'PDF Document','.zip':'ZIP Archive','.rar':'RAR Archive',
+        '.7z':'7-Zip','.tar':'TAR','.gz':'GZip',
+        '.exe':'PE Executable','.dll':'DLL Library','.sys':'Driver',
+        '.py':'Python Script','.js':'JavaScript','.sh':'Shell Script',
+        '.bat':'Batch Script','.ps1':'PowerShell',
+        '.txt':'Text File','.log':'Log File','.xml':'XML File',
+        '.json':'JSON File','.csv':'CSV File','.html':'HTML File',
+        '.db':'SQLite DB','.sqlite':'SQLite DB','.sqlite3':'SQLite DB',
+        '.evtx':'Event Log','.reg':'Registry','.lnk':'LNK Shortcut',
+        '.pf':'Prefetch','.hive':'Registry Hive',
+        '.e01':'EnCase E01','.dd':'DD Image','.img':'Disk Image',
+        '.raw':'RAW Image','.vmdk':'VMware Disk','.vhd':'VHD Image',
+    }.get(os.path.splitext(name)[1].lower(), 'File')
+
 #  EVIDENCE BROWSER  (classic 3-pane)
 # ══════════════════════════════════════════════════════════════
 
@@ -1099,7 +2724,8 @@ class EvidenceBrowser(QWidget):
 
         home_item = self._make_item(f"🏠  Home ({Path.home().name})",
                                     color=C['accent'],
-                                    data={"type":"dir","path":str(Path.home())})
+                                    data={"type": "dir", "path": str(Path.home())})
+        self._add_lazy_dir_child(home_item, str(Path.home()))
         fs_root.addChild(home_item)
 
         for part in psutil.disk_partitions():
@@ -1108,7 +2734,8 @@ class EvidenceBrowser(QWidget):
                 pct = u.percent
                 label = f"💾  {part.device}  [{part.fstype}]  {pct:.0f}%"
                 item = self._make_item(label, color=C['orange'],
-                                       data={"type":"dir","path":part.mountpoint})
+                                       data={"type": "dir", "path": part.mountpoint})
+                self._add_lazy_dir_child(item, str(part.mountpoint))
                 fs_root.addChild(item)
             except: pass
 
@@ -1125,30 +2752,284 @@ class EvidenceBrowser(QWidget):
         fs_root.setExpanded(True)
 
     def add_evidence_image(self, path):
-        label = f"🖴  {os.path.basename(path)}"
-        item = self._make_item(label, color=C['orange'],
-                               data={"type":"image","path":path})
-        size_item = self._make_item(f"   Size: {fmt_size(os.path.getsize(path))}",
-                                    color=C['fg2'])
-        type_item = self._make_item(f"   Type: {detect_type(path)}",
-                                    color=C['fg2'])
-        item.addChild(size_item)
-        item.addChild(type_item)
+        """Add forensic image or disk directory to the evidence tree."""
+        is_dir = os.path.isdir(path)
+        if is_dir:
+            label = "💾  %s" % (os.path.basename(path) or path)
+            item  = self._make_item(label, color=C['orange'],
+                                    data={"type": "dir", "path": path})
+            self._add_lazy_dir_child(item, path)
+        else:
+            label = "🖴  %s" % os.path.basename(path)
+            item  = self._make_item(label, color=C['orange'],
+                                    data={"type": "image", "path": path})
+            self._add_image_sentinel(item, path, inode=None)
         self.img_root.addChild(item)
         self.img_root.setExpanded(True)
+        if not getattr(self, "_expand_connected", False):
+            self.ev_tree.itemExpanded.connect(self._on_item_expanded)
+            self._expand_connected = True
 
-    def add_remote_target(self, label):
-        item = self._make_item(f"🌐  {label}", color=C['purple'],
-                               data={"type":"remote","label":label})
-        self.remote_root.addChild(item)
-        self.remote_root.setExpanded(True)
+    def _add_lazy_dir_child(self, parent_item, dir_path):
+        """Sentinel for host-filesystem directories."""
+        s = QTreeWidgetItem(["__lazy_dir__"])
+        s.setData(0, Qt.ItemDataRole.UserRole,
+                  {"type": "sentinel_dir", "path": str(dir_path)})
+        parent_item.addChild(s)
+        if not getattr(self, "_expand_connected", False):
+            self.ev_tree.itemExpanded.connect(self._on_item_expanded)
+            self._expand_connected = True
+
+    def _add_image_sentinel(self, parent_item, image_path, inode=None):
+        """Sentinel for forensic image directories."""
+        s = QTreeWidgetItem(["__lazy_img__"])
+        s.setData(0, Qt.ItemDataRole.UserRole,
+                  {"type": "sentinel_img",
+                   "image_path": image_path,
+                   "inode": inode})
+        parent_item.addChild(s)
+
+    def _on_item_expanded(self, item):
+        """Expand handler — replaces sentinel with real children."""
+        if item.childCount() != 1:
+            return
+        child = item.child(0)
+        d = child.data(0, Qt.ItemDataRole.UserRole) or {}
+        t = d.get("type", "")
+        if t == "sentinel_dir" or t == "sentinel":
+            item.removeChild(child)
+            self._populate_dir_children(item, Path(d["path"]))
+        elif t == "sentinel_img":
+            item.removeChild(child)
+            self._populate_image_children(item, d["image_path"], d.get("inode"))
+
+    def _populate_dir_children(self, parent_item, dir_path):
+        """Host filesystem directory listing."""
+        try:
+            entries = sorted(dir_path.iterdir(),
+                             key=lambda x: (not x.is_dir(), x.name.lower()))
+        except PermissionError:
+            parent_item.addChild(self._make_item("  [Permission Denied]", color=C['red']))
+            return
+        except Exception as e:
+            parent_item.addChild(self._make_item("  [Error: %s]" % e, color=C['red']))
+            return
+        dirs  = [e for e in entries if e.is_dir()]
+        files = [e for e in entries if e.is_file()]
+        for entry in dirs:
+            child = self._make_item("📁  %s" % entry.name, color=C['orange'],
+                                    data={"type": "dir", "path": str(entry)})
+            self._add_lazy_dir_child(child, str(entry))
+            parent_item.addChild(child)
+        for entry in files[:300]:
+            icon = self._file_icon(entry.name)
+            try:    sz = fmt_size(entry.stat().st_size)
+            except: sz = ""
+            child = self._make_item("%s  %s  (%s)" % (icon, entry.name, sz),
+                                    color=C['fg2'],
+                                    data={"type": "file", "path": str(entry)})
+            parent_item.addChild(child)
+        if not dirs and not files:
+            parent_item.addChild(self._make_item("  [Empty]", color=C['fg3']))
+
+    def _populate_image_children(self, parent_item, image_path, parent_inode):
+        """Forensic image directory listing via pytsk3."""
+        loading = self._make_item("  ⏳ Reading filesystem…", color=C['fg2'])
+        parent_item.addChild(loading)
+        QApplication.processEvents()
+        try:
+            import pytsk3
+        except ImportError:
+            parent_item.removeChild(loading)
+            parent_item.addChild(self._make_item(
+                "  [pytsk3 not installed]", color=C['red']))
+            return
+        ifs = ForensicImageFS.get(image_path)
+        parent_item.removeChild(loading)
+        if ifs.error:
+            parent_item.addChild(self._make_item(
+                "  [Error: %s]" % ifs.error, color=C['red']))
+            return
+        if not ifs.fs:
+            parent_item.addChild(self._make_item(
+                "  [No readable filesystem found]", color=C['orange']))
+            return
+        entries = ifs.list_dir(inode=parent_inode)
+        if not entries:
+            parent_item.addChild(self._make_item("  [Empty]", color=C['fg3']))
+            return
+        dirs  = [e for e in entries if e['is_dir']]
+        files = [e for e in entries if not e['is_dir']]
+        for e in dirs:
+            child = self._make_item("📁  %s" % e['name'], color=C['orange'],
+                                    data={"type":       "img_dir",
+                                          "image_path": image_path,
+                                          "inode":      e['inode'],
+                                          "name":       e['name']})
+            self._add_image_sentinel(child, image_path, e['inode'])
+            parent_item.addChild(child)
+        for e in files[:500]:
+            icon = self._file_icon(e['name'])
+            sz   = fmt_size(e['size']) if e['size'] else ""
+            child = self._make_item("%s  %s  (%s)" % (icon, e['name'], sz),
+                                    color=C['fg2'],
+                                    data={"type":       "img_file",
+                                          "image_path": image_path,
+                                          "inode":      e['inode'],
+                                          "name":       e['name'],
+                                          "size":       e['size'],
+                                          "mtime":      e['mtime']})
+            parent_item.addChild(child)
 
     def _on_tree_select(self, item, _prev):
         if not item: return
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if not data: return
-        if data.get("type") == "dir":
+        t = data.get("type")
+        if t == "dir":
             self._load_dir(Path(data["path"]))
+        elif t == "file":
+            p = Path(data["path"])
+            self._load_dir(p.parent)
+            self.content.load_path(str(p))
+        elif t == "image":
+            # Top-level image node — show header info + load hex
+            p = data.get("path", "")
+            if p and os.path.isfile(p):
+                self.content.load_path(p)
+                self._show_image_info_in_list(p)
+        elif t == "img_dir":
+            # Navigate image directory into file list
+            self._load_image_dir(data["image_path"], data["inode"], data["name"])
+        elif t == "img_file":
+            # Load file from image into content viewer
+            self._load_image_file(data["image_path"], data["inode"], data["name"])
+
+    def _show_image_info_in_list(self, path):
+        """Show forensic image header/partition info in the file list pane."""
+        self.file_table.setSortingEnabled(False)
+        self.file_table.setRowCount(0)
+        self.file_table.setColumnCount(2)
+        self.file_table.setHorizontalHeaderLabels(["Property", "Value"])
+        hdr = self.file_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        info_rows = []
+        try:
+            sz = os.path.getsize(path)
+            with open(path, "rb") as f:
+                header = f.read(512)
+            info_rows += [
+                ("Image File",  path),
+                ("Format",      detect_type(path)),
+                ("Size",        "%s  (%d bytes)" % (fmt_size(sz), sz)),
+                ("Modified",    fmt_ts(os.path.getmtime(path))),
+                ("Created",     fmt_ts(os.path.getctime(path))),
+            ]
+            if header[:3] == b"EVF" or path.lower().endswith(".e01"):
+                info_rows.append(("EWF/E01", "Expert Witness Format detected"))
+            if len(header) >= 512 and header[510] == 0x55 and header[511] == 0xAA:
+                info_rows.append(("MBR", "0x55AA signature — valid MBR"))
+                type_names = {0x07:"NTFS",0x0B:"FAT32",0x0C:"FAT32 LBA",
+                              0x82:"Linux Swap",0x83:"Linux",0x8E:"LVM",
+                              0xEE:"GPT Protective",0xEF:"EFI System"}
+                for i in range(4):
+                    off = 446 + i * 16
+                    pe  = header[off:off+16]
+                    if len(pe) == 16 and pe[4] != 0:
+                        pt  = pe[4]
+                        lba = struct.unpack_from("<I", pe, 8)[0]
+                        sec = struct.unpack_from("<I", pe, 12)[0]
+                        info_rows.append((
+                            "  Partition %d" % (i+1),
+                            "0x%02X (%s)  LBA=%d  %s" % (
+                                pt, type_names.get(pt,"Unknown"),
+                                lba, fmt_size(sec*512))))
+            if len(header) >= 8 and header[:8] == b"EFI PART":
+                info_rows.append(("GPT", "EFI PART signature — GPT disk"))
+            # Show FS type from pytsk3 if parseable
+            try:
+                ifs = ForensicImageFS.get(path)
+                if ifs.fs:
+                    info_rows.append(("Filesystem",  ifs.fs_type_str()))
+                    info_rows.append(("Partitions",  str(len(ifs.partitions))))
+                    for i, p2 in enumerate(ifs.partitions):
+                        info_rows.append(("  Part %d" % i,
+                            "%s  offset=%d  %s" % (
+                                p2['desc'], p2['offset'], fmt_size(p2['size']))))
+                    info_rows.append(("Tree", "Expand the node in the tree to browse files"))
+                elif ifs.error:
+                    info_rows.append(("FS Parse Error", ifs.error))
+            except Exception as e:
+                info_rows.append(("FS Info", str(e)))
+        except Exception as e:
+            info_rows.append(("Error", str(e)))
+
+        for prop, val in info_rows:
+            r = self.file_table.rowCount()
+            self.file_table.insertRow(r)
+            pi = QTableWidgetItem(str(prop))
+            pi.setForeground(QBrush(QColor(C["fg2"])))
+            vi = QTableWidgetItem(str(val))
+            vi.setForeground(QBrush(QColor(C["fg"])))
+            self.file_table.setItem(r, 0, pi)
+            self.file_table.setItem(r, 1, vi)
+        self.path_edit.setText("[Image]  %s" % path)
+        self.main.set_status("  Image: %s  (%s)" % (
+            os.path.basename(path), fmt_size(os.path.getsize(path))))
+
+    def _load_image_dir(self, image_path, inode, name):
+        """Show directory contents of an image folder in the file list."""
+        self.file_table.setSortingEnabled(False)
+        self.file_table.setRowCount(0)
+        # Store context so double-click / select knows we're in image mode
+        self._img_context = {"image_path": image_path, "inode": inode}
+        ifs = ForensicImageFS.get(image_path)
+        if not ifs.fs:
+            return
+        entries = ifs.list_dir(inode=inode)
+        cols = ["Name", "Size", "Type", "Modified", "Inode"]
+        self.file_table.setColumnCount(len(cols))
+        self.file_table.setHorizontalHeaderLabels(cols)
+        self.file_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
+        for c in range(1, len(cols)):
+            self.file_table.horizontalHeader().setSectionResizeMode(
+                c, QHeaderView.ResizeMode.ResizeToContents)
+        for e in entries:
+            r = self.file_table.rowCount()
+            self.file_table.insertRow(r)
+            icon = "📁" if e['is_dir'] else self._file_icon(e['name'])
+            name_item = QTableWidgetItem("%s  %s" % (icon, e['name']))
+            name_item.setData(Qt.ItemDataRole.UserRole,
+                              {"is_img": True, "image_path": image_path,
+                               "inode": e['inode'], "is_dir": e['is_dir'],
+                               "name": e['name']})
+            if e['is_dir']:
+                name_item.setForeground(QBrush(QColor(C['orange'])))
+            self.file_table.setItem(r, 0, name_item)
+            sz_item = QTableWidgetItem(fmt_size(e['size']) if e['size'] else "")
+            sz_item.setForeground(QBrush(QColor(C['fg2'])))
+            self.file_table.setItem(r, 1, sz_item)
+            self.file_table.setItem(r, 2, QTableWidgetItem(e.get('type','')))
+            mt_item = QTableWidgetItem(fmt_ts(e['mtime']) if e['mtime'] else "")
+            mt_item.setForeground(QBrush(QColor(C['fg2'])))
+            self.file_table.setItem(r, 3, mt_item)
+            ino_item = QTableWidgetItem(str(e['inode']))
+            ino_item.setForeground(QBrush(QColor(C['fg2'])))
+            self.file_table.setItem(r, 4, ino_item)
+        self.path_edit.setText("[%s]  inode=%s  %s" % (
+            os.path.basename(image_path), inode, name))
+        self.file_table.setSortingEnabled(True)
+
+    def _load_image_file(self, image_path, inode, name):
+        """Load a file from inside the forensic image into the content viewer."""
+        ifs = ForensicImageFS.get(image_path)
+        if not ifs.fs:
+            return
+        data = ifs.read_file(inode)
+        self.content.load_bytes(data, name)
+        self.main.set_status("  Loaded from image: %s  (%s)" % (name, fmt_size(len(data))))
 
     def _on_file_select(self, selected, _):
         idxs = self.file_table.selectedItems()
@@ -1156,7 +3037,15 @@ class EvidenceBrowser(QWidget):
         row = self.file_table.currentRow()
         name_item = self.file_table.item(row, 0)
         if not name_item: return
-        name = name_item.data(Qt.ItemDataRole.UserRole) or name_item.text()
+        item_data = name_item.data(Qt.ItemDataRole.UserRole)
+        # Image entry
+        if isinstance(item_data, dict) and item_data.get("is_img"):
+            d = item_data
+            if not d["is_dir"]:
+                self._load_image_file(d["image_path"], d["inode"], d["name"])
+            return
+        # Host filesystem entry
+        name = item_data if isinstance(item_data, str) else name_item.text()
         path = self.current_dir / name
         if path.is_file():
             self.content.load_path(str(path))
@@ -1165,7 +3054,17 @@ class EvidenceBrowser(QWidget):
         row = index.row()
         name_item = self.file_table.item(row, 0)
         if not name_item: return
-        name = name_item.data(Qt.ItemDataRole.UserRole) or name_item.text()
+        item_data = name_item.data(Qt.ItemDataRole.UserRole)
+        # Image entry
+        if isinstance(item_data, dict) and item_data.get("is_img"):
+            d = item_data
+            if d["is_dir"]:
+                self._load_image_dir(d["image_path"], d["inode"], d["name"])
+            else:
+                self._load_image_file(d["image_path"], d["inode"], d["name"])
+            return
+        # Host filesystem entry
+        name = item_data if isinstance(item_data, str) else name_item.text()
         if name == "..":
             self._go_up(); return
         path = self.current_dir / name
@@ -1534,8 +3433,15 @@ class ResultsTab(QWidget):
         self.results[name] = rows
         item = QListWidgetItem(f"  {name}")
         item.setForeground(QBrush(QColor(C['green'])))
+        # Store result count as tooltip
+        item.setToolTip(f"{len(rows)} record(s)")
         self.art_list.addItem(item)
+        # Select the newly added item to immediately show its data
+        self.art_list.blockSignals(True)
         self.art_list.setCurrentRow(self.art_list.count() - 1)
+        self.art_list.blockSignals(False)
+        # Manually trigger display so every new result auto-shows
+        self._show_result(name, rows)
 
     def set_progress(self, val: int):
         self.progress.setValue(val)
@@ -1551,37 +3457,54 @@ class ResultsTab(QWidget):
         if row < 0: return
         name = self.art_list.item(row).text().strip()
         rows = self.results.get(name, [])
+        self._show_result(name, rows)
+
+    def _show_result(self, name: str, rows: list):
+        """Display results for the given artifact name."""
         self.result_header.setText(f"  {name}  —  {len(rows)} record(s)")
         self._populate_table(rows)
 
     def _populate_table(self, rows):
+        # Fully disable sorting before ANY structural changes
         self.result_table.setSortingEnabled(False)
+        self.result_table.clearContents()
         self.result_table.setRowCount(0)
+
         if not rows:
             self.result_table.setColumnCount(1)
             self.result_table.setHorizontalHeaderLabels(["No data"])
-            self.row_count_label.setText("")
+            self.row_count_label.setText("0 rows")
             return
 
-        cols = list(rows[0].keys())
-        self.result_table.setColumnCount(len(cols))
-        self.result_table.setHorizontalHeaderLabels(cols)
+        # Collect all unique columns (some rows may have different keys)
+        all_keys = []
+        seen = set()
+        for row in rows:
+            for k in row.keys():
+                if k not in seen:
+                    all_keys.append(k)
+                    seen.add(k)
 
-        for i, cols_w in enumerate(self.result_table.horizontalHeader().count() * [None]):
-            self.result_table.horizontalHeader().setSectionResizeMode(
-                i, QHeaderView.ResizeMode.ResizeToContents)
-        if cols:
-            self.result_table.horizontalHeader().setSectionResizeMode(
-                len(cols)-1, QHeaderView.ResizeMode.Stretch)
+        self.result_table.setColumnCount(len(all_keys))
+        self.result_table.setHorizontalHeaderLabels(all_keys)
 
+        # Set column resize modes BEFORE inserting rows
+        hdr = self.result_table.horizontalHeader()
+        for i in range(len(all_keys)):
+            hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        if all_keys:
+            hdr.setSectionResizeMode(len(all_keys) - 1, QHeaderView.ResizeMode.Stretch)
+
+        # Insert all rows (sorting still OFF — prevents mid-insert scrambling)
+        self.result_table.setRowCount(len(rows))
         for r_idx, row in enumerate(rows):
-            self.result_table.insertRow(r_idx)
-            for c_idx, col in enumerate(cols):
+            for c_idx, col in enumerate(all_keys):
                 val = str(row.get(col, ""))
-                item = QTableWidgetItem(val)
-                item.setForeground(QBrush(QColor(C['fg'])))
-                self.result_table.setItem(r_idx, c_idx, item)
+                cell = QTableWidgetItem(val)
+                cell.setForeground(QBrush(QColor(C['fg'])))
+                self.result_table.setItem(r_idx, c_idx, cell)
 
+        # Re-enable sorting only after all data is in place
         self.result_table.setSortingEnabled(True)
         self.row_count_label.setText(f"{len(rows)} rows")
         self._filter_rows(self.filter_edit.text())
