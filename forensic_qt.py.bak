@@ -3704,24 +3704,14 @@ class EvidenceBrowser(QWidget):
                 menu.addAction("📧 Open in Email Viewer",
                     lambda: self._open_in_email_viewer(d["image_path"], d["inode"], d["name"]))
                 bm_sub2 = menu.addMenu("Add to Bookmark…")
-                # Pre-compute a safe snapshot before building lambdas — same
-                # pattern the host-file branch already uses — prevents KeyError
-                # / crash when any field is absent in item_data.
-                _bm2 = {
-                    "name":       d.get("name", ""),
-                    "image_path": d.get("image_path", ""),
-                    "inode":      str(d.get("inode", "")),
-                    "size":       d.get("size", 0),
-                }
                 for tag in ["Key Finding","File of Interest","Malware Indicator",
                             "Suspicious","IOC"]:
                     bm_sub2.addAction(tag,
-                        lambda t=tag, dd=_bm2: self.main._on_bookmark(
+                        lambda _, t=tag, dd=d: self.main._on_bookmark(
                             "Image Browser",
-                            {"Name":  dd["name"],
-                             "Image": dd["image_path"],
-                             "Inode": dd["inode"],
-                             "Size":  fmt_size(dd["size"])}, t))
+                            {"Name": dd["name"], "Image": dd["image_path"],
+                             "Inode": str(dd["inode"]),
+                             "Size": fmt_size(dd.get("size",0))}, t))
         else:
             name = item_data if isinstance(item_data, str) else name_item.text()
             path = self.current_dir / name
@@ -3756,7 +3746,7 @@ class EvidenceBrowser(QWidget):
             for tag in ["Key Finding","File of Interest","Malware Indicator",
                         "Suspicious","IOC","Cleared"]:
                 bm_sub.addAction(tag,
-                    lambda t=tag, d=_bm_data: self.main._on_bookmark(
+                    lambda _, t=tag, d=_bm_data: self.main._on_bookmark(
                         "File Browser", dict(d), t))
 
         menu.exec(self.file_table.mapToGlobal(pos))
@@ -4346,7 +4336,7 @@ class ResultsTab(QWidget):
         for tag in ["Key Finding","Malware Indicator","Suspicious","Cleared",
                     "IOC","File of Interest","User Activity","Network Activity"]:
             bm.addAction(tag,
-                lambda t=tag: self.bookmark_requested.emit(
+                lambda _, t=tag: self.bookmark_requested.emit(
                     self._current_name, dict(rd), t))
 
         menu.addSeparator()

@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QMenuBar, QMenu, QFileDialog, QMessageBox, QDialog, QDialogButtonBox,
     QVBoxLayout, QHBoxLayout, QGridLayout, QScrollArea, QFrame, QProgressBar,
     QCheckBox, QComboBox, QGroupBox, QListWidget, QListWidgetItem, QSizePolicy,
-    QStackedWidget, QFormLayout, QSpinBox,  QToolButton, QAbstractItemView,
+    QStackedWidget, QFormLayout, QSpinBox, QToolButton, QAbstractItemView,
     QScrollBar,
 )
 from PyQt6.QtCore import (
@@ -2401,7 +2401,9 @@ class HexViewer(QWidget):
 class ContentViewer(QWidget):
     def __init__(self):
         super().__init__()
-        self._current_path = None
+        self._current_path  = None
+        self._current_bytes = b""
+        self._current_name  = ""
         self._setup()
 
     def _setup(self):
@@ -2490,6 +2492,15 @@ class ContentViewer(QWidget):
             btn.setChecked(m == mode)
         if self._current_path:
             self._load_for_mode(self._current_path, mode)
+        elif self._current_bytes:
+            # Bytes mode — serve from stored buffer
+            if mode == "Image":
+                self._load_image_from_bytes(self._current_bytes, self._current_name)
+            elif mode == "Strings":
+                self._load_strings_from_bytes(self._current_bytes)
+            elif mode == "Metadata":
+                self._load_meta_from_bytes(self._current_name, self._current_bytes)
+            # Text and Hex are already loaded in load_bytes()
 
     def load_path(self, path: str):
         self._current_path = path
@@ -2498,14 +2509,42 @@ class ContentViewer(QWidget):
         self._load_for_mode(path, mode)
 
     def load_bytes(self, data: bytes, name: str = ""):
+        """Load raw bytes — supports Text, Hex, Image, Strings modes."""
         self._current_path = None
+        self._current_bytes = data          # keep for Image/Strings modes
+        self._current_name  = name
         self.path_label.setText(name)
+
+        # Always load hex
         self.hex_view.load_data(data)
+
+        # Text decode
         try:
-            txt = data.decode("utf-8","replace")
+            txt = data.decode("utf-8", "replace")
             self.text_view.setPlainText(txt[:200_000])
-        except:
+        except Exception:
             self.text_view.setPlainText("[Binary data]")
+
+        # Image — try immediately so switching to Image tab works
+        self._load_image_from_bytes(data, name)
+
+        # Strings
+        self._load_strings_from_bytes(data)
+
+        # Metadata from bytes (basic)
+        self._load_meta_from_bytes(name, data)
+
+        # Switch to best mode for this content
+        ext = os.path.splitext(name)[1].lower()
+        image_exts = {".jpg",".jpeg",".png",".gif",".bmp",".tiff",".tif",
+                      ".webp",".ico",".svg"}
+        if ext in image_exts:
+            self._switch_mode("Image")
+        elif ext in (".txt",".log",".xml",".json",".csv",".html",".htm",
+                     ".py",".js",".sh",".bat",".ps1",".reg",".ini",".cfg"):
+            self._switch_mode("Text")
+        else:
+            self._switch_mode("Hex")
 
     def clear(self):
         self._current_path = None
@@ -2550,27 +2589,117 @@ class ContentViewer(QWidget):
             self.text_view.setPlainText(f"[Error: {e}]")
 
     def _load_image(self, path):
+        # Load image from a host filesystem path, delegate rendering to _render_pixmap.
         pix = QPixmap(path)
         if pix.isNull():
-            # Try raw bytes
             try:
-                with open(path,"rb") as f:
+                with open(path, "rb") as f:
                     data = f.read()
                 img = QImage.fromData(data)
                 if not img.isNull():
                     pix = QPixmap.fromImage(img)
-            except: pass
-        if pix.isNull():
+            except Exception:
+                pass
+        self._render_pixmap(pix)
+
+    def _render_pixmap(self, pix):
+        # Scale and display a QPixmap, or show error text if null.
+        if pix is None or pix.isNull():
             self.image_label.setText(
-                f'<span style="color:{C["fg2"]}">[ No image preview available ]</span>')
+                '<span style="color:#8b949e">[ No image preview ]</span>')
         else:
+            parent = self.image_label.parent()
+            w = max(parent.width()  - 20, 100) if parent else 600
+            h = max(parent.height() - 20, 100) if parent else 400
             scaled = pix.scaled(
-                self.image_label.parent().width() - 20,
-                self.image_label.parent().height() - 20,
+                w, h,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
             self.image_label.setPixmap(scaled)
+
+    def _load_image_from_bytes(self, data: bytes, name: str = ""):
+        # Load and display an image from raw bytes (forensic image files).
+        pix    = QPixmap()
+        loaded = False
+        if data:
+            try:
+                img = QImage.fromData(data)
+                if not img.isNull():
+                    pix    = QPixmap.fromImage(img)
+                    loaded = True
+            except Exception:
+                pass
+            if not loaded:
+                try:
+                    p2 = QPixmap()
+                    if p2.loadFromData(data):
+                        pix    = p2
+                        loaded = True
+                except Exception:
+                    pass
+            if not loaded:
+                try:
+                    import tempfile
+                    ext = os.path.splitext(name)[1] if name else ".bin"
+                    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tf:
+                        tf.write(data)
+                        tmp_path = tf.name
+                    pix = QPixmap(tmp_path)
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+                except Exception:
+                    pix = QPixmap()
+        self._render_pixmap(pix)
+
+    def _load_strings_from_bytes(self, data: bytes):
+        # Extract printable ASCII strings (>=4 chars) from raw bytes.
+        try:
+            strings = []
+            cur     = []
+            for b in data[:4 * 1024 * 1024]:
+                if 32 <= b < 127:
+                    cur.append(chr(b))
+                else:
+                    if len(cur) >= 4:
+                        strings.append("".join(cur))
+                    cur = []
+            if len(cur) >= 4:
+                strings.append("".join(cur))
+            header = "[%d strings found]\n\n" % len(strings)
+            self.strings_view.setPlainText(header + "\n".join(strings[:5000]))
+        except Exception as e:
+            self.strings_view.setPlainText("[Strings error: %s]" % e)
+
+    def _load_meta_from_bytes(self, name: str, data: bytes):
+        # Show basic metadata for a bytes buffer (no filesystem access needed).
+        self.meta_table.setRowCount(0)
+        self.meta_table.setColumnCount(2)
+        self.meta_table.setHorizontalHeaderLabels(["Property", "Value"])
+        hdr = self.meta_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        rows = [
+            ("Name",   name or "(unknown)"),
+            ("Size",   "%s  (%d bytes)" % (fmt_size(len(data)), len(data))),
+            ("Type",   detect_type_by_name(name) if name else "Unknown"),
+        ]
+        if data:
+            rows.append(("MD5",    hashlib.md5(data).hexdigest()))
+            rows.append(("SHA-256",hashlib.sha256(data).hexdigest()))
+            rows.append(("Header", " ".join("%02X" % b for b in data[:16])))
+        for prop, val in rows:
+            r = self.meta_table.rowCount()
+            self.meta_table.insertRow(r)
+            pi = QTableWidgetItem(str(prop))
+            pi.setForeground(QBrush(QColor(C["fg2"])))
+            vi = QTableWidgetItem(str(val))
+            vi.setForeground(QBrush(QColor(C["fg"])))
+            self.meta_table.setItem(r, 0, pi)
+            self.meta_table.setItem(r, 1, vi)
+
 
     def _load_meta(self, path):
         self.meta_table.setRowCount(0)
@@ -2622,7 +2751,7 @@ class ContentViewer(QWidget):
             if len(cur) >= 4:
                 strings.append("".join(cur))
             self.strings_view.setPlainText(
-                f"[{len(strings)} strings found]\n\n" + "\n".join(strings[:5000]))
+                "[%d strings found]\n\n" % len(strings) + "\n".join(strings[:5000]))
         except Exception as e:
             self.strings_view.setPlainText(f"[Error: {e}]")
 
@@ -3167,11 +3296,15 @@ class EvidenceBrowser(QWidget):
         # File list table
         self.file_table = QTableWidget(0, 6)
         self.file_table.setHorizontalHeaderLabels(
-            ["Name","Size","Type","Modified","Created","Permissions"])
+            ["Name","Size","Type","Modified","Created","Permissions",
+             "Path","Inode","MD5","SHA-256"])
         self.file_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for i in range(1,6):
+        for i in range(1, 10):
             self.file_table.horizontalHeader().setSectionResizeMode(
                 i, QHeaderView.ResizeMode.ResizeToContents)
+        # Hide hash columns by default — computed on demand
+        for col in (8, 9):
+            self.file_table.setColumnHidden(col, True)
         self.file_table.verticalHeader().setVisible(False)
         self.file_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.file_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -3601,41 +3734,63 @@ class EvidenceBrowser(QWidget):
         self.file_table.insertRow(row)
 
         icon = "📁" if is_dir else self._file_icon(name)
-        display = f"{icon}  {name}"
-        name_item = QTableWidgetItem(display)
+        name_item = QTableWidgetItem(f"{icon}  {name}")
         name_item.setData(Qt.ItemDataRole.UserRole, name)
         if is_dir:
             name_item.setForeground(QBrush(QColor(C['orange'])))
-
         self.file_table.setItem(row, 0, name_item)
 
         if entry and entry.exists():
             try:
                 s = entry.stat()
-                size_val = s.st_size if entry.is_file() else -1
-                size_item = QTableWidgetItem(fmt_size(s.st_size) if entry.is_file() else "")
-                size_item.setData(Qt.ItemDataRole.UserRole, size_val)
-                size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+                # Size
+                size_item = QTableWidgetItem(
+                    fmt_size(s.st_size) if entry.is_file() else "")
+                size_item.setData(Qt.ItemDataRole.UserRole,
+                                  s.st_size if entry.is_file() else -1)
+                size_item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 size_item.setForeground(QBrush(QColor(C['fg2'])))
                 self.file_table.setItem(row, 1, size_item)
 
+                # Type
                 ftype = "Directory" if entry.is_dir() else detect_type(str(entry))
                 t_item = QTableWidgetItem(ftype)
                 t_item.setForeground(QBrush(QColor(C['fg2'])))
                 self.file_table.setItem(row, 2, t_item)
 
+                # Modified
                 mod_item = QTableWidgetItem(fmt_ts(s.st_mtime))
                 mod_item.setForeground(QBrush(QColor(C['fg2'])))
                 self.file_table.setItem(row, 3, mod_item)
 
+                # Created
                 cre_item = QTableWidgetItem(fmt_ts(s.st_ctime))
                 cre_item.setForeground(QBrush(QColor(C['fg2'])))
                 self.file_table.setItem(row, 4, cre_item)
 
+                # Permissions
                 perm_item = QTableWidgetItem(oct(stat.S_IMODE(s.st_mode)))
                 perm_item.setForeground(QBrush(QColor(C['fg2'])))
                 self.file_table.setItem(row, 5, perm_item)
-            except: pass
+
+                # Full path
+                path_item = QTableWidgetItem(str(entry))
+                path_item.setForeground(QBrush(QColor(C['fg2'])))
+                self.file_table.setItem(row, 6, path_item)
+
+                # Inode
+                ino_item = QTableWidgetItem(str(s.st_ino))
+                ino_item.setForeground(QBrush(QColor(C['fg2'])))
+                self.file_table.setItem(row, 7, ino_item)
+
+                # MD5 / SHA-256 — empty placeholders, filled by Hash DB
+                self.file_table.setItem(row, 8, QTableWidgetItem(""))
+                self.file_table.setItem(row, 9, QTableWidgetItem(""))
+
+            except Exception:
+                pass
 
     def _file_icon(self, name):
         ext = Path(name).suffix.lower()
@@ -3704,24 +3859,14 @@ class EvidenceBrowser(QWidget):
                 menu.addAction("📧 Open in Email Viewer",
                     lambda: self._open_in_email_viewer(d["image_path"], d["inode"], d["name"]))
                 bm_sub2 = menu.addMenu("Add to Bookmark…")
-                # Pre-compute a safe snapshot before building lambdas — same
-                # pattern the host-file branch already uses — prevents KeyError
-                # / crash when any field is absent in item_data.
-                _bm2 = {
-                    "name":       d.get("name", ""),
-                    "image_path": d.get("image_path", ""),
-                    "inode":      str(d.get("inode", "")),
-                    "size":       d.get("size", 0),
-                }
                 for tag in ["Key Finding","File of Interest","Malware Indicator",
                             "Suspicious","IOC"]:
                     bm_sub2.addAction(tag,
-                        lambda t=tag, dd=_bm2: self.main._on_bookmark(
+                        lambda _, t=tag, dd=d: self.main._on_bookmark(
                             "Image Browser",
-                            {"Name":  dd["name"],
-                             "Image": dd["image_path"],
-                             "Inode": dd["inode"],
-                             "Size":  fmt_size(dd["size"])}, t))
+                            {"Name": dd["name"], "Image": dd["image_path"],
+                             "Inode": str(dd["inode"]),
+                             "Size": fmt_size(dd.get("size",0))}, t))
         else:
             name = item_data if isinstance(item_data, str) else name_item.text()
             path = self.current_dir / name
@@ -3756,7 +3901,7 @@ class EvidenceBrowser(QWidget):
             for tag in ["Key Finding","File of Interest","Malware Indicator",
                         "Suspicious","IOC","Cleared"]:
                 bm_sub.addAction(tag,
-                    lambda t=tag, d=_bm_data: self.main._on_bookmark(
+                    lambda _, t=tag, d=_bm_data: self.main._on_bookmark(
                         "File Browser", dict(d), t))
 
         menu.exec(self.file_table.mapToGlobal(pos))
@@ -4346,7 +4491,7 @@ class ResultsTab(QWidget):
         for tag in ["Key Finding","Malware Indicator","Suspicious","Cleared",
                     "IOC","File of Interest","User Activity","Network Activity"]:
             bm.addAction(tag,
-                lambda t=tag: self.bookmark_requested.emit(
+                lambda _, t=tag: self.bookmark_requested.emit(
                     self._current_name, dict(rd), t))
 
         menu.addSeparator()
@@ -5828,17 +5973,16 @@ TAG_TO_TAB = {
 
 class BookmarkTab(QWidget):
     """
-    Bookmark manager with labelled sub-tabs (default categories).
-    Each sub-tab shows a table of bookmarked rows with notes,
-    source artifact name, timestamp, and tag.
-    Double-click a bookmark row to jump back to the artifact in Results tab.
+    Bookmark manager — sidebar with category list, main table, detail panel.
+    Completely avoids QTabWidget (which caused signal-during-sort crashes).
     """
-    # Emits artifact_name when user wants to navigate to it in results
     navigate_to = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
-        self._tab_tables = []   # list of QTableWidget, one per sub-tab
+        self._tables     = {}   # cat_idx -> QTableWidget
+        self._details    = {}   # cat_idx -> QTextEdit
+        self._cur_idx    = 0
         self._setup()
 
     def _setup(self):
@@ -5846,209 +5990,275 @@ class BookmarkTab(QWidget):
         lay.setContentsMargins(0,0,0,0)
         lay.setSpacing(0)
 
-        # Toolbar
+        # ── Top toolbar ───────────────────────────────────────────────
         tb = QWidget()
         tb.setStyleSheet(f"background:{C['bg3']};border-bottom:1px solid {C['border']};")
         tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(8,4,8,4)
-        tbl.setSpacing(6)
-
+        tbl.setContentsMargins(8,4,8,4); tbl.setSpacing(6)
         title = QLabel("🔖  BOOKMARKS")
         title.setStyleSheet(f"color:{C['accent']};font-weight:bold;font-size:10pt;")
         tbl.addWidget(title)
         tbl.addStretch()
-
-        for label, slot in [
-            ("Export All…",     self._export_all),
-            ("Clear Tab",       self._clear_current_tab),
-            ("Clear All",       self._clear_all),
-        ]:
+        for label, slot in [("💾 Export All…", self._export_all),
+                             ("🗑 Clear Category", self._clear_current),
+                             ("🗑 Clear All",      self._clear_all)]:
             btn = QPushButton(label)
-            btn.setFixedHeight(26)
-            btn.clicked.connect(slot)
+            btn.setFixedHeight(26); btn.clicked.connect(slot)
             tbl.addWidget(btn)
-
         self.bm_count = QLabel("0 bookmarks")
         self.bm_count.setStyleSheet(f"color:{C['fg2']};font-size:9pt;padding:0 8px;")
         tbl.addWidget(self.bm_count)
         lay.addWidget(tb)
 
-        # Sub-tabs — one per default category
-        self.sub_tabs = QTabWidget()
-        self.sub_tabs.setTabPosition(QTabWidget.TabPosition.North)
-        self.sub_tabs.setStyleSheet(
-            f"QTabWidget::pane{{border:none;background:{C['bg']}}}"
-            f"QTabBar::tab{{background:{C['bg3']};color:{C['fg2']};"
-            f"border:1px solid {C['border']};border-bottom:none;"
-            f"padding:5px 14px;margin-right:1px;font-size:9pt;}}"
-            f"QTabBar::tab:selected{{background:{C['bg']};color:{C['accent']};"
-            f"border-bottom:2px solid {C['accent']};}}"
-            f"QTabBar::tab:hover:!selected{{background:{C['btn_hover']};}}")
-        lay.addWidget(self.sub_tabs)
+        # ── Body: sidebar + stacked content ──────────────────────────
+        body_split = QSplitter(Qt.Orientation.Horizontal)
+        body_split.setHandleWidth(2)
 
-        # Build each sub-tab
-        COLS = ["Artifact","Tag","Timestamp","Summary","Notes"]
-        for tab_label, col, desc in BOOKMARK_TABS_DEF:
+        # LEFT sidebar — category list
+        sidebar = QWidget()
+        sidebar.setMinimumWidth(160); sidebar.setMaximumWidth(220)
+        sidebar.setStyleSheet(f"background:{C['sidebar']};")
+        sl = QVBoxLayout(sidebar)
+        sl.setContentsMargins(0,0,0,0); sl.setSpacing(0)
+        sh = QLabel("  CATEGORIES")
+        sh.setStyleSheet(f"background:{C['bg3']};color:{C['fg2']};font-size:8pt;"
+                         f"font-weight:bold;padding:5px 8px;"
+                         f"border-bottom:1px solid {C['border']};")
+        sl.addWidget(sh)
+
+        self.cat_list = QListWidget()
+        self.cat_list.setStyleSheet(
+            f"QListWidget{{background:{C['sidebar']};border:none;outline:none;}}"
+            f"QListWidget::item{{padding:8px 12px;color:{C['fg']};font-size:9pt;"
+            f"border-bottom:1px solid {C['border']};}}"
+            f"QListWidget::item:selected{{background:{C['sel']};color:{C['accent']};"
+            f"border-left:3px solid {C['accent']};}}"
+            f"QListWidget::item:hover:!selected{{background:{C['bg3']};}}")
+        self.cat_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.cat_list.currentRowChanged.connect(self._on_cat_select)
+
+        # Populate sidebar items
+        for label, col, desc in BOOKMARK_TABS_DEF:
+            item = QListWidgetItem(label)
+            item.setForeground(QBrush(QColor(col)))
+            item.setToolTip(desc)
+            # Count badge — updated dynamically
+            item.setData(Qt.ItemDataRole.UserRole, 0)
+            self.cat_list.addItem(item)
+
+        sl.addWidget(self.cat_list)
+        body_split.addWidget(sidebar)
+
+        # RIGHT: stacked widget (one page per category)
+        self._stack = QStackedWidget()
+
+        COLS = ["Artifact", "Tag", "Timestamp", "Summary", "Notes"]
+        for idx, (tab_label, col, desc) in enumerate(BOOKMARK_TABS_DEF):
             page = QWidget()
             page.setStyleSheet(f"background:{C['bg']};")
             pl = QVBoxLayout(page)
-            pl.setContentsMargins(0,0,0,0)
-            pl.setSpacing(0)
+            pl.setContentsMargins(0,0,0,0); pl.setSpacing(0)
 
-            # Description bar
             desc_bar = QLabel(f"  {desc}")
             desc_bar.setStyleSheet(
                 f"background:{C['bg2']};color:{C['fg2']};font-size:8pt;"
                 f"padding:4px 8px;border-bottom:1px solid {C['border']};")
             pl.addWidget(desc_bar)
 
-            # Splitter: table top, detail bottom
             vs = QSplitter(Qt.Orientation.Vertical)
             vs.setHandleWidth(3)
 
             tbl_w = QTableWidget(0, len(COLS))
             tbl_w.setHorizontalHeaderLabels(COLS)
-            tbl_w.horizontalHeader().setSectionResizeMode(
-                3, QHeaderView.ResizeMode.Stretch)   # Summary stretches
-            tbl_w.horizontalHeader().setSectionResizeMode(
-                4, QHeaderView.ResizeMode.Stretch)   # Notes stretches
-            for ci in (0,1,2):
+            tbl_w.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+            tbl_w.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+            for ci in (0, 1, 2):
                 tbl_w.horizontalHeader().setSectionResizeMode(
                     ci, QHeaderView.ResizeMode.ResizeToContents)
             tbl_w.verticalHeader().setVisible(False)
             tbl_w.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             tbl_w.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
             tbl_w.setAlternatingRowColors(True)
-            tbl_w.setSortingEnabled(True)
             tbl_w.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             tbl_w.customContextMenuRequested.connect(
-                lambda pos, t=tbl_w: self._bm_ctx(pos, t))
-            tbl_w.currentCellChanged.connect(
-                lambda r,c,pr,pc, t=tbl_w, ti=len(self._tab_tables):
-                    self._on_bm_select(r, t, ti))
-            tbl_w.setStyleSheet(
-                f"QTableWidget{{background:{C['panel']};color:{C['fg']};"
-                f"border:none;gridline-color:{C['border']};}}"
-                f"QTableWidget::item:selected{{background:{C['sel']};color:{C['accent']};}}")
+                lambda pos, t=tbl_w, i=idx: self._bm_ctx(pos, t, i))
+            # Store detail ref on table; connect selection AFTER setup
             vs.addWidget(tbl_w)
-            self._tab_tables.append(tbl_w)
+            self._tables[idx] = tbl_w
 
-            # Detail panel
             detail_w = QWidget()
             detail_w.setStyleSheet(f"background:{C['bg2']};")
             dl = QVBoxLayout(detail_w)
-            dl.setContentsMargins(0,0,0,0)
-            dl.setSpacing(0)
+            dl.setContentsMargins(0,0,0,0); dl.setSpacing(0)
             dh = QLabel("  ITEM DETAIL")
             dh.setStyleSheet(
                 f"background:{C['bg3']};color:{C['fg2']};font-size:8pt;"
                 f"font-weight:bold;padding:3px 8px;"
                 f"border-top:1px solid {C['border']};")
             dl.addWidget(dh)
-            detail_txt = QTextEdit()
-            detail_txt.setReadOnly(True)
-            detail_txt.setStyleSheet(
+            det = QTextEdit()
+            det.setReadOnly(True)
+            det.setStyleSheet(
                 f"background:{C['bg2']};color:{C['fg']};"
                 f"font-family:'Consolas','Courier New',monospace;"
                 f"font-size:9pt;border:none;padding:6px;")
-            dl.addWidget(detail_txt)
-            # Store detail widget reference on the table
-            tbl_w._detail = detail_txt
+            dl.addWidget(det)
+            self._details[idx] = det
+            tbl_w._detail_ref  = det
             vs.addWidget(detail_w)
             vs.setSizes([300, 160])
-
             pl.addWidget(vs)
-            self.sub_tabs.addTab(page, tab_label)
+            self._stack.addWidget(page)
 
-        self.sub_tabs.currentChanged.connect(self._on_sub_tab_changed)
+            # Connect selection AFTER table is fully set up
+            tbl_w.itemSelectionChanged.connect(
+                lambda t=tbl_w, i=idx: self._on_row_select(t, i))
+
+        body_split.addWidget(self._stack)
+        body_split.setSizes([190, 900])
+        lay.addWidget(body_split)
+
+        # Select first category
+        self.cat_list.setCurrentRow(0)
+
+    def _on_cat_select(self, idx):
+        if idx < 0: return
+        self._cur_idx = idx
+        self._stack.setCurrentIndex(idx)
+        self._update_count()
+
+    def _on_row_select(self, tbl, idx):
+        try:
+            rows = tbl.selectedItems()
+            if not rows: return
+            row = tbl.currentRow()
+            if row < 0 or row >= tbl.rowCount(): return
+            art_item = tbl.item(row, 0)
+            if not art_item: return
+            rd = art_item.data(Qt.ItemDataRole.UserRole) or {}
+            tag_item = tbl.item(row, 1)
+            ts_item  = tbl.item(row, 2)
+            det      = self._details.get(idx)
+            if not det: return
+
+            def _e(s):
+                return (str(s).replace("&","&amp;")
+                               .replace("<","&lt;").replace(">","&gt;"))
+
+            html  = ["<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"]
+            html.append(
+                f"<p><b style='color:{C['accent']}'>{_e(art_item.text())}</b>"
+                f"&nbsp;<span style='color:{C['orange']}'>"
+                f"{_e(tag_item.text() if tag_item else '')}</span>"
+                f"&nbsp;&nbsp;<span style='color:{C['fg2']};font-size:8pt;'>"
+                f"{_e(ts_item.text() if ts_item else '')}</span></p>"
+                f"<hr style='border-color:{C['border']};margin:4px 0;'>")
+            for k, v in rd.items():
+                html.append(
+                    f"<div style='margin:2px 0;'>"
+                    f"<span style='color:{C['fg2']};min-width:130px;"
+                    f"display:inline-block;font-size:8pt;'>{_e(k)}:</span>"
+                    f"<span style='color:{C['fg']};'>&nbsp;{_e(str(v)[:500])}"
+                    f"</span></div>")
+            html.append("</div>")
+            det.setHtml("".join(html))
+        except Exception as e:
+            try:
+                det = self._details.get(idx)
+                if det: det.setPlainText(f"[Error: {e}]")
+            except Exception:
+                pass
 
     # ── Add bookmark ──────────────────────────────────────────────────
     def add_bookmark(self, artifact_name: str, row_data: dict, tag: str):
-        """Add a row_data dict as a bookmark under the appropriate sub-tab."""
-        tab_idx = TAG_TO_TAB.get(tag, 0)
-        # Clamp to available tabs
-        tab_idx = min(tab_idx, len(self._tab_tables) - 1)
-        tbl = self._tab_tables[tab_idx]
+        try:
+            cat_idx = TAG_TO_TAB.get(tag, 0)
+            cat_idx = min(cat_idx, len(BOOKMARK_TABS_DEF) - 1)
+            tbl     = self._tables.get(cat_idx)
+            if tbl is None:
+                return
 
-        # Build summary from first few fields
-        summary = "  |  ".join(
-            f"{k}: {str(v)[:40]}" for k,v in list(row_data.items())[:4])
-        ts  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        row = tbl.rowCount()
-        tbl.setSortingEnabled(False)
-        tbl.insertRow(row)
+            summary  = "  |  ".join(
+                f"{k}: {str(v)[:40]}" for k, v in list(row_data.items())[:4])
+            ts       = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            tag_col  = (C['red']    if 'Malware'   in tag else
+                        C['orange'] if 'Suspicious' in tag else
+                        C['yellow'] if 'Key'        in tag else
+                        C['purple'] if 'IOC'        in tag else
+                        C['green']  if ('User' in tag or 'Cleared' in tag) else
+                        C['accent'])
 
-        tag_col  = C['red'] if 'Malware' in tag else \
-                   C['orange'] if 'Suspicious' in tag else \
-                   C['yellow'] if 'Key' in tag else \
-                   C['purple'] if 'IOC' in tag else \
-                   C['green']  if 'User' in tag or 'Cleared' in tag else \
-                   C['accent']
+            # Disable ALL signals + sorting for the ENTIRE insert sequence
+            tbl.blockSignals(True)
+            tbl.setSortingEnabled(False)
 
-        for ci, (val, color) in enumerate([
-            (artifact_name, C['accent']),
-            (tag,           tag_col),
-            (ts,            C['fg2']),
-            (summary,       C['fg']),
-            ("",            C['fg']),   # Notes — editable
-        ]):
-            item = QTableWidgetItem(val)
-            item.setForeground(QBrush(QColor(color)))
-            if ci == 4:
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
-                item.setToolTip("Double-click to add notes")
-            else:
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            # Store full row_data in first column for retrieval
-            if ci == 0:
-                item.setData(Qt.ItemDataRole.UserRole, row_data)
-            tbl.setItem(row, ci, item)
+            new_row = tbl.rowCount()
+            tbl.insertRow(new_row)
 
-        tbl.setSortingEnabled(True)
-        self._update_count()
+            cells = [
+                (str(artifact_name), C['accent'], False, dict(row_data)),
+                (str(tag),           tag_col,     False, None),
+                (str(ts),            C['fg2'],    False, None),
+                (str(summary),       C['fg'],     False, None),
+                ("",                 C['fg'],     True,  None),
+            ]
+            for ci, (val, color, editable, udata) in enumerate(cells):
+                cell = QTableWidgetItem(val)
+                cell.setForeground(QBrush(QColor(color)))
+                flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                if editable:
+                    flags |= Qt.ItemFlag.ItemIsEditable
+                    cell.setToolTip("Double-click to add notes")
+                cell.setFlags(flags)
+                if udata is not None:
+                    cell.setData(Qt.ItemDataRole.UserRole, udata)
+                tbl.setItem(new_row, ci, cell)
 
-        # Flash the sub-tab to show where it was added
-        self.sub_tabs.setCurrentIndex(tab_idx)
-        tbl.scrollToBottom()
-        tbl.selectRow(tbl.rowCount() - 1)
+            # Re-enable after ALL cells written
+            tbl.setSortingEnabled(True)
+            tbl.blockSignals(False)
 
-    def _on_bm_select(self, row, tbl, tab_idx):
-        if row < 0 or not hasattr(tbl, '_detail'): return
-        item = tbl.item(row, 0)
-        if not item: return
-        rd = item.data(Qt.ItemDataRole.UserRole) or {}
-        # Build HTML detail
-        parts = [f"<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"]
-        art_item = tbl.item(row, 0)
-        tag_item = tbl.item(row, 1)
-        ts_item  = tbl.item(row, 2)
-        if art_item: parts.append(
-            f"<p><b style='color:{C['accent']}'>{art_item.text()}</b>"
-            f" &nbsp;<span style='color:{C['orange']}'>{tag_item.text() if tag_item else ''}</span>"
-            f"&nbsp;&nbsp;<span style='color:{C['fg2']};font-size:8pt;'>{ts_item.text() if ts_item else ''}</span></p>")
-        parts.append("<hr style='border-color:#30363d;margin:6px 0;'>")
-        for k, v in rd.items():
-            v2 = str(v)[:500]
-            parts.append(
-                f"<div style='margin:2px 0;'>"
-                f"<span style='color:{C['fg2']};min-width:140px;display:inline-block;"
-                f"font-size:8pt;'>{k}:</span>"
-                f"<span style='color:{C['fg']};'>&nbsp;{v2}</span></div>")
-        parts.append("</div>")
-        tbl._detail.setHtml("".join(parts))
+            # Update sidebar badge and count
+            self._update_count()
+            # Switch sidebar to the right category
+            self.cat_list.setCurrentRow(cat_idx)
 
-    def _on_sub_tab_changed(self, idx):
-        self._update_count()
+            # Scroll to new row — find it by timestamp (unique enough)
+            for r in range(tbl.rowCount()):
+                ts_item = tbl.item(r, 2)
+                if ts_item and ts_item.text() == ts:
+                    tbl.scrollToItem(tbl.item(r, 0),
+                                     QAbstractItemView.ScrollHint.EnsureVisible)
+                    break
 
-    # ── Context menu ──────────────────────────────────────────────────
-    def _bm_ctx(self, pos, tbl):
+        except Exception as e:
+            import traceback
+            print(f"[BookmarkTab.add_bookmark] {e}\n{traceback.format_exc()}")
+
+    def _current_table(self):
+        return self._tables.get(self._cur_idx)
+
+    def _update_count(self):
+        total = sum(t.rowCount() for t in self._tables.values())
+        cur   = (self._tables[self._cur_idx].rowCount()
+                 if self._cur_idx in self._tables else 0)
+        self.bm_count.setText(f"{total} total  |  {cur} in category")
+        # Update sidebar badges
+        for i in range(self.cat_list.count()):
+            n    = self._tables.get(i, {})
+            cnt  = n.rowCount() if hasattr(n, 'rowCount') else 0
+            base = BOOKMARK_TABS_DEF[i][0] if i < len(BOOKMARK_TABS_DEF) else ""
+            item = self.cat_list.item(i)
+            if item:
+                item.setText(f"{base}  ({cnt})" if cnt else base)
+
+    def _bm_ctx(self, pos, tbl, idx):
         row = tbl.rowAt(pos.y())
         if row < 0: return
-        item = tbl.item(row, 0)
-        rd   = item.data(Qt.ItemDataRole.UserRole) if item else {}
-        art  = item.text() if item else ""
-
-        menu = QMenu(self)
+        item0 = tbl.item(row, 0)
+        rd    = item0.data(Qt.ItemDataRole.UserRole) if item0 else {}
+        art   = item0.text() if item0 else ""
+        menu  = QMenu(self)
         menu.addAction("🔍 Go to Artifact in Results",
             lambda: self.navigate_to.emit(art))
         menu.addAction("📋 Copy Summary",
@@ -6058,61 +6268,45 @@ class BookmarkTab(QWidget):
             lambda: QApplication.clipboard().setText(
                 json.dumps(rd, default=str)))
         menu.addSeparator()
-
-        # Move to different tab
-        move_m = menu.addMenu("Move to Tab…")
+        move_m = menu.addMenu("Move to Category…")
         for i, (lbl, _, _d) in enumerate(BOOKMARK_TABS_DEF):
-            move_m.addAction(lbl, lambda _, ti=i, r=row, t=tbl: self._move_row(t, r, ti))
-
+            if i != idx:
+                move_m.addAction(lbl,
+                    lambda _, ti=i, r=row, t=tbl: self._move_row(t, r, ti))
         menu.addSeparator()
-        menu.addAction("🗑 Remove Bookmark", lambda: (tbl.removeRow(row),
-                                                       self._update_count()))
+        menu.addAction("🗑 Remove", lambda: (
+            tbl.removeRow(row), self._update_count()))
         menu.exec(tbl.mapToGlobal(pos))
 
     def _move_row(self, src_tbl, row, dest_idx):
-        """Move a bookmark row to a different sub-tab."""
-        if dest_idx >= len(self._tab_tables): return
-        dest_tbl = self._tab_tables[dest_idx]
         item0 = src_tbl.item(row, 0)
         if not item0: return
         rd  = item0.data(Qt.ItemDataRole.UserRole) or {}
         art = item0.text()
-        tag = BOOKMARK_TABS_DEF[dest_idx][0]
+        tag = BOOKMARK_TABS_DEF[dest_idx][0].split()[-1]
         src_tbl.removeRow(row)
-        self.add_bookmark(art, rd, tag.split()[-1])   # strip emoji
-        self.sub_tabs.setCurrentIndex(dest_idx)
-        self._update_count()
+        self.add_bookmark(art, rd, tag)
 
-    # ── Utilities ─────────────────────────────────────────────────────
-    def _update_count(self):
-        total = sum(t.rowCount() for t in self._tab_tables)
-        cur   = self._tab_tables[self.sub_tabs.currentIndex()].rowCount() \
-                if self.sub_tabs.currentIndex() < len(self._tab_tables) else 0
-        self.bm_count.setText(
-            f"{total} total  |  {cur} in this tab")
-
-    def _clear_current_tab(self):
-        idx = self.sub_tabs.currentIndex()
-        if idx < 0 or idx >= len(self._tab_tables): return
-        tbl = self._tab_tables[idx]
-        if tbl.rowCount() == 0: return
+    def _clear_current(self):
+        tbl = self._current_table()
+        if not tbl or tbl.rowCount() == 0: return
         if QMessageBox.question(
-                self, "Clear Tab",
-                f"Remove all {tbl.rowCount()} bookmark(s) from this tab?",
+                self, "Clear Category",
+                f"Remove all {tbl.rowCount()} bookmark(s) from this category?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         ) == QMessageBox.StandardButton.Yes:
             tbl.setRowCount(0)
             self._update_count()
 
     def _clear_all(self):
-        total = sum(t.rowCount() for t in self._tab_tables)
+        total = sum(t.rowCount() for t in self._tables.values())
         if total == 0: return
         if QMessageBox.question(
-                self, "Clear All Bookmarks",
-                f"Remove all {total} bookmarks across all tabs?",
+                self, "Clear All",
+                f"Remove all {total} bookmarks?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         ) == QMessageBox.StandardButton.Yes:
-            for t in self._tab_tables: t.setRowCount(0)
+            for t in self._tables.values(): t.setRowCount(0)
             self._update_count()
 
     def _export_all(self):
@@ -6122,19 +6316,18 @@ class BookmarkTab(QWidget):
         if not path: return
         all_bm = []
         for ti, (tab_label, _, _d) in enumerate(BOOKMARK_TABS_DEF):
-            tbl = self._tab_tables[ti]
+            tbl = self._tables.get(ti)
+            if not tbl: continue
             for r in range(tbl.rowCount()):
                 item0 = tbl.item(r, 0)
                 rd    = item0.data(Qt.ItemDataRole.UserRole) if item0 else {}
-                note  = tbl.item(r, 4).text() if tbl.item(r, 4) else ""
-                ts    = tbl.item(r, 2).text() if tbl.item(r, 2) else ""
                 all_bm.append({
-                    "tab":      tab_label,
-                    "artifact": item0.text() if item0 else "",
-                    "tag":      tbl.item(r,1).text() if tbl.item(r,1) else "",
-                    "timestamp":ts,
-                    "notes":    note,
-                    "data":     rd,
+                    "category":  tab_label,
+                    "artifact":  item0.text() if item0 else "",
+                    "tag":       tbl.item(r,1).text() if tbl.item(r,1) else "",
+                    "timestamp": tbl.item(r,2).text() if tbl.item(r,2) else "",
+                    "notes":     tbl.item(r,4).text() if tbl.item(r,4) else "",
+                    "data":      rd,
                 })
         if path.endswith(".json"):
             with open(path,"w") as f: json.dump(all_bm, f, indent=2, default=str)
@@ -6142,41 +6335,36 @@ class BookmarkTab(QWidget):
             import csv as _csv
             with open(path,"w",newline="") as f:
                 w = _csv.writer(f)
-                w.writerow(["Tab","Artifact","Tag","Timestamp","Notes","Summary"])
+                w.writerow(["Category","Artifact","Tag","Timestamp","Notes","Summary"])
                 for bm in all_bm:
-                    summary = "  |  ".join(f"{k}: {v}" for k,v in list(bm["data"].items())[:4])
-                    w.writerow([bm["tab"],bm["artifact"],bm["tag"],
+                    summary = " | ".join(
+                        f"{k}: {v}" for k,v in list(bm["data"].items())[:4])
+                    w.writerow([bm["category"],bm["artifact"],bm["tag"],
                                 bm["timestamp"],bm["notes"],summary])
-        else:  # HTML
+        else:
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            rows_html = ""
+            for bm in all_bm:
+                summary = " | ".join(f"{k}: {v}" for k,v in list(bm["data"].items())[:4])
+                rows_html += (f"<tr><td>{bm['category']}</td>"
+                              f"<td>{bm['artifact']}</td>"
+                              f"<td>{bm['tag']}</td>"
+                              f"<td>{bm['timestamp']}</td>"
+                              f"<td>{summary}</td>"
+                              f"<td>{bm['notes']}</td></tr>")
             html = (f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
-                    f"<title>Bookmarks Export</title>"
-                    f"<style>body{{background:#0d1117;color:#e6edf3;"
-                    f"font-family:'Segoe UI',sans-serif;margin:32px}}"
-                    f"h1{{color:#58a6ff}}h2{{color:#d29922;margin-top:20px}}"
-                    f"table{{border-collapse:collapse;width:100%;margin:8px 0}}"
+                    f"<title>Bookmarks</title><style>"
+                    f"body{{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;margin:32px}}"
+                    f"h1{{color:#58a6ff}}table{{border-collapse:collapse;width:100%}}"
                     f"th{{background:#21262d;color:#8b949e;padding:6px 10px;text-align:left}}"
                     f"td{{padding:5px 10px;border-bottom:1px solid #21262d}}"
                     f"tr:nth-child(even){{background:#1a2030}}</style></head><body>"
-                    f"<h1>ForensicPro Bookmarks</h1>"
-                    f"<p style='color:#8b949e'>Exported: {now}</p>")
-            for tab_label, _, _d in BOOKMARK_TABS_DEF:
-                tab_bms = [b for b in all_bm if b["tab"] == tab_label]
-                if not tab_bms: continue
-                html += f"<h2>{tab_label} ({len(tab_bms)})</h2>"
-                html += ("<table><tr><th>Artifact</th><th>Timestamp</th>"
-                         "<th>Summary</th><th>Notes</th></tr>")
-                for bm in tab_bms:
-                    summary = "  |  ".join(
-                        f"{k}: {v}" for k,v in list(bm["data"].items())[:4])
-                    html += (f"<tr><td>{bm['artifact']}</td>"
-                             f"<td>{bm['timestamp']}</td>"
-                             f"<td>{summary}</td>"
-                             f"<td>{bm['notes']}</td></tr>")
-                html += "</table>"
-            html += "</body></html>"
+                    f"<h1>ForensicPro Bookmarks — {now}</h1>"
+                    f"<table><tr><th>Category</th><th>Artifact</th><th>Tag</th>"
+                    f"<th>Timestamp</th><th>Summary</th><th>Notes</th></tr>"
+                    f"{rows_html}</table></body></html>")
             with open(path,"w") as f: f.write(html)
-        QMessageBox.information(self, "Exported",
+        QMessageBox.information(self,"Exported",
             f"Exported {len(all_bm)} bookmark(s) to:\n{path}")
 
 
@@ -6603,25 +6791,251 @@ class MainWindow(QMainWindow):
 
     # ── Verify hashes ─────────────────────────
     def _verify_all(self):
-        paths = []
-        for i in range(self.browser.img_root.childCount()):
-            child = self.browser.img_root.child(i)
-            data  = child.data(0, Qt.ItemDataRole.UserRole)
-            if data and data.get("path"):
-                paths.append(data["path"])
-        if not paths:
-            QMessageBox.information(self,"Verify","No forensic images to hash."); return
+        """Open the Hash Database / Calculator dialog."""
+        self._open_hash_db()
 
-        self.set_status(f"Hashing {len(paths)} image(s)…")
-        def run():
-            lines = []
-            for p in paths:
-                if os.path.isfile(p):
-                    m = md5_path(p); s = sha256_path(p)
-                    lines.append(f"{os.path.basename(p)}\n  MD5:    {m}\n  SHA-256:{s}\n")
-            QMessageBox.information(self,"Hash Results","\n".join(lines) or "No files hashed.")
-            self.set_status("Hash verification complete.")
-        threading.Thread(target=run, daemon=True).start()
+    def _open_hash_db(self):
+        """Hash Database — compute and store MD5/SHA-256 for files in the browser list."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Hash Database & Calculator")
+        dlg.resize(900, 600)
+        dlg.setStyleSheet(STYLESHEET)
+        lay = QVBoxLayout(dlg)
+
+        # ── Top bar ─────────────────────────────────────────────
+        tb = QWidget()
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(6,4,6,4); tbl.setSpacing(6)
+
+        calc_btn   = QPushButton("⚡ Calculate Hashes for Listed Files")
+        calc_btn.setObjectName("accent")
+        import_btn = QPushButton("📂 Import Hash DB (CSV/JSON)…")
+        export_btn = QPushButton("💾 Export Hash DB…")
+        clear_btn  = QPushButton("🗑 Clear DB")
+        verify_btn = QPushButton("✓ Verify Selected File…")
+
+        for btn in (calc_btn, import_btn, export_btn, clear_btn, verify_btn):
+            btn.setFixedHeight(28)
+            tbl.addWidget(btn)
+        tbl.addStretch()
+
+        self._hash_progress = QProgressBar()
+        self._hash_progress.setFixedWidth(200)
+        self._hash_progress.setFixedHeight(18)
+        self._hash_progress.setTextVisible(True)
+        self._hash_progress.setValue(0)
+        tbl.addWidget(self._hash_progress)
+        lay.addWidget(tb)
+
+        # ── Search bar ───────────────────────────────────────────
+        sb = QWidget()
+        sbl = QHBoxLayout(sb)
+        sbl.setContentsMargins(6,2,6,2)
+        sbl.addWidget(QLabel("Filter:"))
+        hash_filter = QLineEdit()
+        hash_filter.setPlaceholderText("Filter by filename, MD5, SHA-256…")
+        sbl.addWidget(hash_filter)
+        lay.addWidget(sb)
+
+        # ── Hash table ───────────────────────────────────────────
+        hash_cols = ["File","Size","MD5","SHA-256","Path","Status"]
+        hash_tbl  = QTableWidget(0, len(hash_cols))
+        hash_tbl.setHorizontalHeaderLabels(hash_cols)
+        hash_tbl.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents)
+        hash_tbl.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.ResizeToContents)
+        hash_tbl.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeMode.Stretch)
+        hash_tbl.verticalHeader().setVisible(False)
+        hash_tbl.setAlternatingRowColors(True)
+        hash_tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        hash_tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        lay.addWidget(hash_tbl)
+
+        # In-memory hash database {path: {md5, sha256, size}}
+        if not hasattr(self, '_hash_db'):
+            self._hash_db = {}
+
+        def _refresh_table(filter_text=""):
+            ft = filter_text.lower()
+            hash_tbl.setSortingEnabled(False)
+            hash_tbl.setRowCount(0)
+            for path, info in self._hash_db.items():
+                fn = os.path.basename(path)
+                if ft and not any(ft in x.lower() for x in
+                                  (fn, info.get("md5",""), info.get("sha256",""), path)):
+                    continue
+                r = hash_tbl.rowCount()
+                hash_tbl.insertRow(r)
+                status = info.get("status","")
+                status_col = C['green'] if status=="OK" else C['red'] if status=="MISMATCH" else C['fg2']
+                for ci, val in enumerate([
+                    fn,
+                    fmt_size(info.get("size",0)),
+                    info.get("md5",""),
+                    info.get("sha256",""),
+                    path,
+                    status,
+                ]):
+                    cell = QTableWidgetItem(str(val))
+                    cell.setForeground(QBrush(QColor(status_col if ci==5 else C['fg'])))
+                    hash_tbl.setItem(r, ci, cell)
+            hash_tbl.setSortingEnabled(True)
+
+        hash_filter.textChanged.connect(_refresh_table)
+        _refresh_table()
+
+        def _calc_hashes():
+            # Collect files from the browser's current file list
+            files = []
+            fb = self.browser.file_table
+            for r in range(fb.rowCount()):
+                item = fb.item(r, 6)  # Path column
+                if item and item.text():
+                    p = item.text()
+                    if os.path.isfile(p):
+                        files.append(p)
+            if not files:
+                QMessageBox.information(dlg,"No Files",
+                    "Navigate to a directory in the Evidence Browser first.")
+                return
+            calc_btn.setEnabled(False)
+            self._hash_progress.setMaximum(len(files))
+            self._hash_progress.setValue(0)
+
+            def run():
+                for i, path in enumerate(files):
+                    try:
+                        sz  = os.path.getsize(path)
+                        m5  = md5_path(path)
+                        sh  = sha256_path(path)
+                        self._hash_db[path] = {
+                            "md5": m5, "sha256": sh,
+                            "size": sz, "status": "OK"}
+                        # Update file browser MD5/SHA-256 columns in-place
+                        fb = self.browser.file_table
+                        for r in range(fb.rowCount()):
+                            pi = fb.item(r, 6)
+                            if pi and pi.text() == path:
+                                fb.item(r, 8) and fb.item(r, 8).setText(m5)
+                                fb.item(r, 9) and fb.item(r, 9).setText(sh)
+                                # Show hash columns now that we have data
+                                self.browser.file_table.setColumnHidden(8, False)
+                                self.browser.file_table.setColumnHidden(9, False)
+                                break
+                    except Exception as e:
+                        self._hash_db[path] = {"md5":"","sha256":"","size":0,
+                                                "status":f"ERROR: {e}"}
+                    self._hash_progress.setValue(i+1)
+                _refresh_table()
+                calc_btn.setEnabled(True)
+                self.set_status(f"  Hashed {len(files)} files.")
+
+            threading.Thread(target=run, daemon=True).start()
+
+        def _import_db():
+            path, _ = QFileDialog.getOpenFileName(
+                dlg,"Import Hash DB","","CSV (*.csv);;JSON (*.json);;All (*)")
+            if not path: return
+            try:
+                if path.endswith(".json"):
+                    with open(path) as f: data = json.load(f)
+                    self._hash_db.update(data)
+                else:
+                    import csv as _csv
+                    with open(path,newline="") as f:
+                        for row in _csv.DictReader(f):
+                            p = row.get("Path","")
+                            if p:
+                                self._hash_db[p] = {
+                                    "md5":    row.get("MD5",""),
+                                    "sha256": row.get("SHA-256",""),
+                                    "size":   int(row.get("Size",0) or 0),
+                                    "status": row.get("Status",""),
+                                }
+                _refresh_table()
+                QMessageBox.information(dlg,"Imported",
+                    f"Imported {len(self._hash_db)} hash records.")
+            except Exception as e:
+                QMessageBox.critical(dlg,"Import Error",str(e))
+
+        def _export_db():
+            path, _ = QFileDialog.getSaveFileName(
+                dlg,"Export Hash DB","hash_db",
+                "CSV (*.csv);;JSON (*.json)")
+            if not path: return
+            try:
+                if path.endswith(".json"):
+                    with open(path,"w") as f:
+                        json.dump(self._hash_db, f, indent=2, default=str)
+                else:
+                    import csv as _csv
+                    with open(path,"w",newline="") as f:
+                        w = _csv.writer(f)
+                        w.writerow(["File","Path","MD5","SHA-256","Size","Status"])
+                        for p, info in self._hash_db.items():
+                            w.writerow([os.path.basename(p), p,
+                                        info.get("md5",""), info.get("sha256",""),
+                                        info.get("size",""), info.get("status","")])
+                QMessageBox.information(dlg,"Exported",f"Saved to:\n{path}")
+            except Exception as e:
+                QMessageBox.critical(dlg,"Export Error",str(e))
+
+        def _clear_db():
+            if QMessageBox.question(dlg,"Clear Hash DB",
+                    f"Clear all {len(self._hash_db)} hash records?",
+                    QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No
+            ) == QMessageBox.StandardButton.Yes:
+                self._hash_db.clear()
+                _refresh_table()
+
+        def _verify_file():
+            path, _ = QFileDialog.getOpenFileName(dlg,"Select File to Verify","","All (*)")
+            if not path: return
+            self.set_status(f"  Computing hashes for {os.path.basename(path)}…")
+            m5  = md5_path(path)
+            sh  = sha256_path(path)
+            sz  = os.path.getsize(path)
+            stored = self._hash_db.get(path)
+            if stored:
+                md5_match  = stored.get("md5","")  == m5
+                sha_match  = stored.get("sha256","") == sh
+                status     = "MATCH ✓" if (md5_match and sha_match) else "MISMATCH ✗"
+                stored["status"] = "OK" if (md5_match and sha_match) else "MISMATCH"
+                QMessageBox.information(dlg,"Verify Result",
+                    f"File: {os.path.basename(path)}\n\n"
+                    f"Computed MD5:     {m5}\n"
+                    f"Stored MD5:       {stored.get('md5','')}\n"
+                    f"MD5 match:        {'Yes ✓' if md5_match else 'No ✗'}\n\n"
+                    f"Computed SHA-256: {sh}\n"
+                    f"Stored SHA-256:   {stored.get('sha256','')}\n"
+                    f"SHA-256 match:    {'Yes ✓' if sha_match else 'No ✗'}\n\n"
+                    f"Overall status:   {status}")
+            else:
+                # Add to DB
+                self._hash_db[path] = {"md5":m5,"sha256":sh,"size":sz,"status":"OK"}
+                QMessageBox.information(dlg,"Hash Computed",
+                    f"File: {os.path.basename(path)}\n\n"
+                    f"MD5:     {m5}\n"
+                    f"SHA-256: {sh}\n"
+                    f"Size:    {fmt_size(sz)}\n\n"
+                    f"Added to hash database.")
+            _refresh_table()
+            self.set_status("  Hash verification complete.")
+
+        calc_btn.clicked.connect(_calc_hashes)
+        import_btn.clicked.connect(_import_db)
+        export_btn.clicked.connect(_export_db)
+        clear_btn.clicked.connect(_clear_db)
+        verify_btn.clicked.connect(_verify_file)
+
+        # Close button
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        lay.addWidget(close_btn)
+
+        dlg.exec()
 
     # ── Case management ───────────────────────
     def _new_case(self):

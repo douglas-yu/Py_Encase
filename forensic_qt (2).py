@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QMenuBar, QMenu, QFileDialog, QMessageBox, QDialog, QDialogButtonBox,
     QVBoxLayout, QHBoxLayout, QGridLayout, QScrollArea, QFrame, QProgressBar,
     QCheckBox, QComboBox, QGroupBox, QListWidget, QListWidgetItem, QSizePolicy,
-    QStackedWidget, QFormLayout, QSpinBox,  QToolButton, QAbstractItemView,
+    QStackedWidget, QFormLayout, QSpinBox, QToolButton, QAbstractItemView,
     QScrollBar,
 )
 from PyQt6.QtCore import (
@@ -32,7 +32,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QFont, QFontMetrics, QColor, QPalette, QIcon, QPixmap, QImage,
     QTextCursor, QTextCharFormat, QSyntaxHighlighter, QBrush, QPainter,
-    QLinearGradient, QAction as QGuiAction, QAction,
+    QLinearGradient, QAction as QGuiAction, QAction, 
 )
 
 # ══════════════════════════════════════════════════════════════
@@ -2401,7 +2401,9 @@ class HexViewer(QWidget):
 class ContentViewer(QWidget):
     def __init__(self):
         super().__init__()
-        self._current_path = None
+        self._current_path  = None
+        self._current_bytes = b""
+        self._current_name  = ""
         self._setup()
 
     def _setup(self):
@@ -2490,6 +2492,15 @@ class ContentViewer(QWidget):
             btn.setChecked(m == mode)
         if self._current_path:
             self._load_for_mode(self._current_path, mode)
+        elif self._current_bytes:
+            # Bytes mode — serve from stored buffer
+            if mode == "Image":
+                self._load_image_from_bytes(self._current_bytes, self._current_name)
+            elif mode == "Strings":
+                self._load_strings_from_bytes(self._current_bytes)
+            elif mode == "Metadata":
+                self._load_meta_from_bytes(self._current_name, self._current_bytes)
+            # Text and Hex are already loaded in load_bytes()
 
     def load_path(self, path: str):
         self._current_path = path
@@ -2498,14 +2509,42 @@ class ContentViewer(QWidget):
         self._load_for_mode(path, mode)
 
     def load_bytes(self, data: bytes, name: str = ""):
+        """Load raw bytes — supports Text, Hex, Image, Strings modes."""
         self._current_path = None
+        self._current_bytes = data          # keep for Image/Strings modes
+        self._current_name  = name
         self.path_label.setText(name)
+
+        # Always load hex
         self.hex_view.load_data(data)
+
+        # Text decode
         try:
-            txt = data.decode("utf-8","replace")
+            txt = data.decode("utf-8", "replace")
             self.text_view.setPlainText(txt[:200_000])
-        except:
+        except Exception:
             self.text_view.setPlainText("[Binary data]")
+
+        # Image — try immediately so switching to Image tab works
+        self._load_image_from_bytes(data, name)
+
+        # Strings
+        self._load_strings_from_bytes(data)
+
+        # Metadata from bytes (basic)
+        self._load_meta_from_bytes(name, data)
+
+        # Switch to best mode for this content
+        ext = os.path.splitext(name)[1].lower()
+        image_exts = {".jpg",".jpeg",".png",".gif",".bmp",".tiff",".tif",
+                      ".webp",".ico",".svg"}
+        if ext in image_exts:
+            self._switch_mode("Image")
+        elif ext in (".txt",".log",".xml",".json",".csv",".html",".htm",
+                     ".py",".js",".sh",".bat",".ps1",".reg",".ini",".cfg"):
+            self._switch_mode("Text")
+        else:
+            self._switch_mode("Hex")
 
     def clear(self):
         self._current_path = None
@@ -2550,27 +2589,117 @@ class ContentViewer(QWidget):
             self.text_view.setPlainText(f"[Error: {e}]")
 
     def _load_image(self, path):
+        # Load image from a host filesystem path, delegate rendering to _render_pixmap.
         pix = QPixmap(path)
         if pix.isNull():
-            # Try raw bytes
             try:
-                with open(path,"rb") as f:
+                with open(path, "rb") as f:
                     data = f.read()
                 img = QImage.fromData(data)
                 if not img.isNull():
                     pix = QPixmap.fromImage(img)
-            except: pass
-        if pix.isNull():
+            except Exception:
+                pass
+        self._render_pixmap(pix)
+
+    def _render_pixmap(self, pix):
+        # Scale and display a QPixmap, or show error text if null.
+        if pix is None or pix.isNull():
             self.image_label.setText(
-                f'<span style="color:{C["fg2"]}">[ No image preview available ]</span>')
+                '<span style="color:#8b949e">[ No image preview ]</span>')
         else:
+            parent = self.image_label.parent()
+            w = max(parent.width()  - 20, 100) if parent else 600
+            h = max(parent.height() - 20, 100) if parent else 400
             scaled = pix.scaled(
-                self.image_label.parent().width() - 20,
-                self.image_label.parent().height() - 20,
+                w, h,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
             self.image_label.setPixmap(scaled)
+
+    def _load_image_from_bytes(self, data: bytes, name: str = ""):
+        # Load and display an image from raw bytes (forensic image files).
+        pix    = QPixmap()
+        loaded = False
+        if data:
+            try:
+                img = QImage.fromData(data)
+                if not img.isNull():
+                    pix    = QPixmap.fromImage(img)
+                    loaded = True
+            except Exception:
+                pass
+            if not loaded:
+                try:
+                    p2 = QPixmap()
+                    if p2.loadFromData(data):
+                        pix    = p2
+                        loaded = True
+                except Exception:
+                    pass
+            if not loaded:
+                try:
+                    import tempfile
+                    ext = os.path.splitext(name)[1] if name else ".bin"
+                    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tf:
+                        tf.write(data)
+                        tmp_path = tf.name
+                    pix = QPixmap(tmp_path)
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+                except Exception:
+                    pix = QPixmap()
+        self._render_pixmap(pix)
+
+    def _load_strings_from_bytes(self, data: bytes):
+        # Extract printable ASCII strings (>=4 chars) from raw bytes.
+        try:
+            strings = []
+            cur     = []
+            for b in data[:4 * 1024 * 1024]:
+                if 32 <= b < 127:
+                    cur.append(chr(b))
+                else:
+                    if len(cur) >= 4:
+                        strings.append("".join(cur))
+                    cur = []
+            if len(cur) >= 4:
+                strings.append("".join(cur))
+            header = "[%d strings found]\n\n" % len(strings)
+            self.strings_view.setPlainText(header + "\n".join(strings[:5000]))
+        except Exception as e:
+            self.strings_view.setPlainText("[Strings error: %s]" % e)
+
+    def _load_meta_from_bytes(self, name: str, data: bytes):
+        # Show basic metadata for a bytes buffer (no filesystem access needed).
+        self.meta_table.setRowCount(0)
+        self.meta_table.setColumnCount(2)
+        self.meta_table.setHorizontalHeaderLabels(["Property", "Value"])
+        hdr = self.meta_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        rows = [
+            ("Name",   name or "(unknown)"),
+            ("Size",   "%s  (%d bytes)" % (fmt_size(len(data)), len(data))),
+            ("Type",   detect_type_by_name(name) if name else "Unknown"),
+        ]
+        if data:
+            rows.append(("MD5",    hashlib.md5(data).hexdigest()))
+            rows.append(("SHA-256",hashlib.sha256(data).hexdigest()))
+            rows.append(("Header", " ".join("%02X" % b for b in data[:16])))
+        for prop, val in rows:
+            r = self.meta_table.rowCount()
+            self.meta_table.insertRow(r)
+            pi = QTableWidgetItem(str(prop))
+            pi.setForeground(QBrush(QColor(C["fg2"])))
+            vi = QTableWidgetItem(str(val))
+            vi.setForeground(QBrush(QColor(C["fg"])))
+            self.meta_table.setItem(r, 0, pi)
+            self.meta_table.setItem(r, 1, vi)
+
 
     def _load_meta(self, path):
         self.meta_table.setRowCount(0)
@@ -2622,7 +2751,7 @@ class ContentViewer(QWidget):
             if len(cur) >= 4:
                 strings.append("".join(cur))
             self.strings_view.setPlainText(
-                f"[{len(strings)} strings found]\n\n" + "\n".join(strings[:5000]))
+                "[%d strings found]\n\n" % len(strings) + "\n".join(strings[:5000]))
         except Exception as e:
             self.strings_view.setPlainText(f"[Error: {e}]")
 
@@ -3704,24 +3833,14 @@ class EvidenceBrowser(QWidget):
                 menu.addAction("📧 Open in Email Viewer",
                     lambda: self._open_in_email_viewer(d["image_path"], d["inode"], d["name"]))
                 bm_sub2 = menu.addMenu("Add to Bookmark…")
-                # Pre-compute a safe snapshot before building lambdas — same
-                # pattern the host-file branch already uses — prevents KeyError
-                # / crash when any field is absent in item_data.
-                _bm2 = {
-                    "name":       d.get("name", ""),
-                    "image_path": d.get("image_path", ""),
-                    "inode":      str(d.get("inode", "")),
-                    "size":       d.get("size", 0),
-                }
                 for tag in ["Key Finding","File of Interest","Malware Indicator",
                             "Suspicious","IOC"]:
                     bm_sub2.addAction(tag,
-                        lambda t=tag, dd=_bm2: self.main._on_bookmark(
+                        lambda _, t=tag, dd=d: self.main._on_bookmark(
                             "Image Browser",
-                            {"Name":  dd["name"],
-                             "Image": dd["image_path"],
-                             "Inode": dd["inode"],
-                             "Size":  fmt_size(dd["size"])}, t))
+                            {"Name": dd["name"], "Image": dd["image_path"],
+                             "Inode": str(dd["inode"]),
+                             "Size": fmt_size(dd.get("size",0))}, t))
         else:
             name = item_data if isinstance(item_data, str) else name_item.text()
             path = self.current_dir / name
@@ -3756,7 +3875,7 @@ class EvidenceBrowser(QWidget):
             for tag in ["Key Finding","File of Interest","Malware Indicator",
                         "Suspicious","IOC","Cleared"]:
                 bm_sub.addAction(tag,
-                    lambda t=tag, d=_bm_data: self.main._on_bookmark(
+                    lambda _, t=tag, d=_bm_data: self.main._on_bookmark(
                         "File Browser", dict(d), t))
 
         menu.exec(self.file_table.mapToGlobal(pos))
@@ -4346,7 +4465,7 @@ class ResultsTab(QWidget):
         for tag in ["Key Finding","Malware Indicator","Suspicious","Cleared",
                     "IOC","File of Interest","User Activity","Network Activity"]:
             bm.addAction(tag,
-                lambda t=tag: self.bookmark_requested.emit(
+                lambda _, t=tag: self.bookmark_requested.emit(
                     self._current_name, dict(rd), t))
 
         menu.addSeparator()
@@ -5965,77 +6084,98 @@ class BookmarkTab(QWidget):
     # ── Add bookmark ──────────────────────────────────────────────────
     def add_bookmark(self, artifact_name: str, row_data: dict, tag: str):
         """Add a row_data dict as a bookmark under the appropriate sub-tab."""
-        tab_idx = TAG_TO_TAB.get(tag, 0)
-        # Clamp to available tabs
-        tab_idx = min(tab_idx, len(self._tab_tables) - 1)
-        tbl = self._tab_tables[tab_idx]
+        try:
+            tab_idx = TAG_TO_TAB.get(tag, 0)
+            tab_idx = min(tab_idx, len(self._tab_tables) - 1)
+            tbl = self._tab_tables[tab_idx]
 
-        # Build summary from first few fields
-        summary = "  |  ".join(
-            f"{k}: {str(v)[:40]}" for k,v in list(row_data.items())[:4])
-        ts  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        row = tbl.rowCount()
-        tbl.setSortingEnabled(False)
-        tbl.insertRow(row)
+            summary = "  |  ".join(
+                f"{k}: {str(v)[:40]}" for k, v in list(row_data.items())[:4])
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        tag_col  = C['red'] if 'Malware' in tag else \
-                   C['orange'] if 'Suspicious' in tag else \
-                   C['yellow'] if 'Key' in tag else \
-                   C['purple'] if 'IOC' in tag else \
-                   C['green']  if 'User' in tag or 'Cleared' in tag else \
-                   C['accent']
+            tag_col = (C['red']    if 'Malware'   in tag else
+                       C['orange'] if 'Suspicious' in tag else
+                       C['yellow'] if 'Key'        in tag else
+                       C['purple'] if 'IOC'        in tag else
+                       C['green']  if ('User' in tag or 'Cleared' in tag) else
+                       C['accent'])
 
-        for ci, (val, color) in enumerate([
-            (artifact_name, C['accent']),
-            (tag,           tag_col),
-            (ts,            C['fg2']),
-            (summary,       C['fg']),
-            ("",            C['fg']),   # Notes — editable
-        ]):
-            item = QTableWidgetItem(val)
-            item.setForeground(QBrush(QColor(color)))
-            if ci == 4:
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
-                item.setToolTip("Double-click to add notes")
-            else:
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            # Store full row_data in first column for retrieval
-            if ci == 0:
-                item.setData(Qt.ItemDataRole.UserRole, row_data)
-            tbl.setItem(row, ci, item)
+            # Block ALL signals on the table while we insert so that
+            # currentCellChanged / itemSelectionChanged never fire mid-insert.
+            tbl.blockSignals(True)
+            tbl.setSortingEnabled(False)
 
-        tbl.setSortingEnabled(True)
-        self._update_count()
+            row = tbl.rowCount()
+            tbl.insertRow(row)
 
-        # Flash the sub-tab to show where it was added
-        self.sub_tabs.setCurrentIndex(tab_idx)
-        tbl.scrollToBottom()
-        tbl.selectRow(tbl.rowCount() - 1)
+            cells = [
+                (artifact_name, C['accent'], False),
+                (tag,           tag_col,     False),
+                (ts,            C['fg2'],    False),
+                (summary,       C['fg'],     False),
+                ("",            C['fg'],     True),   # Notes — editable
+            ]
+            for ci, (val, color, editable) in enumerate(cells):
+                cell = QTableWidgetItem(str(val))
+                cell.setForeground(QBrush(QColor(color)))
+                if editable:
+                    cell.setFlags(cell.flags() | Qt.ItemFlag.ItemIsEditable)
+                    cell.setToolTip("Double-click to add notes")
+                else:
+                    cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if ci == 0:
+                    # Store the full data dict in column 0 UserRole
+                    cell.setData(Qt.ItemDataRole.UserRole, dict(row_data))
+                tbl.setItem(row, ci, cell)
+
+            # All items set — safe to re-enable signals and sorting
+            tbl.setSortingEnabled(True)
+            tbl.blockSignals(False)
+
+            self._update_count()
+            # Switch to the correct sub-tab and scroll to the new row
+            self.sub_tabs.setCurrentIndex(tab_idx)
+            tbl.scrollToItem(tbl.item(row, 0))
+        except Exception as e:
+            # Never let a bookmark crash the app
+            import traceback
+            print(f"[BookmarkTab] add_bookmark error: {e}\n{traceback.format_exc()}")
 
     def _on_bm_select(self, row, tbl, tab_idx):
-        if row < 0 or not hasattr(tbl, '_detail'): return
-        item = tbl.item(row, 0)
-        if not item: return
-        rd = item.data(Qt.ItemDataRole.UserRole) or {}
-        # Build HTML detail
-        parts = [f"<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"]
-        art_item = tbl.item(row, 0)
-        tag_item = tbl.item(row, 1)
-        ts_item  = tbl.item(row, 2)
-        if art_item: parts.append(
-            f"<p><b style='color:{C['accent']}'>{art_item.text()}</b>"
-            f" &nbsp;<span style='color:{C['orange']}'>{tag_item.text() if tag_item else ''}</span>"
-            f"&nbsp;&nbsp;<span style='color:{C['fg2']};font-size:8pt;'>{ts_item.text() if ts_item else ''}</span></p>")
-        parts.append("<hr style='border-color:#30363d;margin:6px 0;'>")
-        for k, v in rd.items():
-            v2 = str(v)[:500]
+        try:
+            if row < 0 or not hasattr(tbl, '_detail'): return
+            if row >= tbl.rowCount(): return
+            art_item = tbl.item(row, 0)
+            tag_item = tbl.item(row, 1)
+            ts_item  = tbl.item(row, 2)
+            if not art_item: return
+            rd = art_item.data(Qt.ItemDataRole.UserRole) or {}
+
+            def _esc(s):
+                return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+            parts = ["<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"]
             parts.append(
-                f"<div style='margin:2px 0;'>"
-                f"<span style='color:{C['fg2']};min-width:140px;display:inline-block;"
-                f"font-size:8pt;'>{k}:</span>"
-                f"<span style='color:{C['fg']};'>&nbsp;{v2}</span></div>")
-        parts.append("</div>")
-        tbl._detail.setHtml("".join(parts))
+                f"<p><b style='color:{C['accent']}'>{_esc(art_item.text())}</b>"
+                f"&nbsp; <span style='color:{C['orange']}'>"
+                f"{_esc(tag_item.text() if tag_item else '')}</span>"
+                f"&nbsp;&nbsp;<span style='color:{C['fg2']};font-size:8pt;'>"
+                f"{_esc(ts_item.text() if ts_item else '')}</span></p>")
+            parts.append("<hr style='border-color:#30363d;margin:6px 0;'>")
+            for k, v in rd.items():
+                parts.append(
+                    f"<div style='margin:2px 0;'>"
+                    f"<span style='color:{C['fg2']};min-width:140px;display:inline-block;"
+                    f"font-size:8pt;'>{_esc(k)}:</span>"
+                    f"<span style='color:{C['fg']};'>&nbsp;{_esc(str(v)[:500])}</span></div>")
+            parts.append("</div>")
+            tbl._detail.setHtml("".join(parts))
+        except Exception as e:
+            try:
+                if hasattr(tbl, '_detail'):
+                    tbl._detail.setPlainText(f"[Detail error: {e}]")
+            except Exception:
+                pass
 
     def _on_sub_tab_changed(self, idx):
         self._update_count()

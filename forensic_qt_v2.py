@@ -32,7 +32,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QFont, QFontMetrics, QColor, QPalette, QIcon, QPixmap, QImage,
     QTextCursor, QTextCharFormat, QSyntaxHighlighter, QBrush, QPainter,
-    QLinearGradient, QAction as QGuiAction, QAction,
+    QLinearGradient, QAction as QGuiAction,QAction,
 )
 
 # ══════════════════════════════════════════════════════════════
@@ -3703,25 +3703,6 @@ class EvidenceBrowser(QWidget):
                     lambda: self._save_image_file_as(d["image_path"], d["inode"], d["name"]))
                 menu.addAction("📧 Open in Email Viewer",
                     lambda: self._open_in_email_viewer(d["image_path"], d["inode"], d["name"]))
-                bm_sub2 = menu.addMenu("Add to Bookmark…")
-                # Pre-compute a safe snapshot before building lambdas — same
-                # pattern the host-file branch already uses — prevents KeyError
-                # / crash when any field is absent in item_data.
-                _bm2 = {
-                    "name":       d.get("name", ""),
-                    "image_path": d.get("image_path", ""),
-                    "inode":      str(d.get("inode", "")),
-                    "size":       d.get("size", 0),
-                }
-                for tag in ["Key Finding","File of Interest","Malware Indicator",
-                            "Suspicious","IOC"]:
-                    bm_sub2.addAction(tag,
-                        lambda t=tag, dd=_bm2: self.main._on_bookmark(
-                            "Image Browser",
-                            {"Name":  dd["name"],
-                             "Image": dd["image_path"],
-                             "Inode": dd["inode"],
-                             "Size":  fmt_size(dd["size"])}, t))
         else:
             name = item_data if isinstance(item_data, str) else name_item.text()
             path = self.current_dir / name
@@ -3743,21 +3724,6 @@ class EvidenceBrowser(QWidget):
             menu.addAction("Compute Hashes…", lambda: self._hash_file(path))
             menu.addAction("Add to Evidence",
                 lambda: self.main._add_evidence_from_path(str(path)))
-            menu.addSeparator()
-            bm_sub = menu.addMenu("Add to Bookmark…")
-            # Pre-compute safe values NOW (not inside lambda) to avoid crash
-            try:
-                _bm_size = fmt_size(path.stat().st_size) if path.is_file() else ""
-            except Exception:
-                _bm_size = ""
-            _bm_type = detect_type(str(path)) if path.is_file() else "Directory"
-            _bm_data = {"File": path.name, "Path": str(path),
-                        "Size": _bm_size, "Type": _bm_type}
-            for tag in ["Key Finding","File of Interest","Malware Indicator",
-                        "Suspicious","IOC","Cleared"]:
-                bm_sub.addAction(tag,
-                    lambda t=tag, d=_bm_data: self.main._on_bookmark(
-                        "File Browser", dict(d), t))
 
         menu.exec(self.file_table.mapToGlobal(pos))
 
@@ -4037,15 +4003,9 @@ class ArtifactTab(QWidget):
 # ══════════════════════════════════════════════════════════════
 
 class ResultsTab(QWidget):
-    # Emits (artifact_name, row_dict, tag) when user bookmarks a row
-    bookmark_requested = pyqtSignal(str, dict, str)
-
     def __init__(self):
         super().__init__()
-        self.results             = {}
-        self._current_name       = ""
-        self._current_row_data   = {}
-        self._preview_mode       = "Summary"
+        self.results = {}
         self._setup()
 
     def _setup(self):
@@ -4053,22 +4013,26 @@ class ResultsTab(QWidget):
         lay.setContentsMargins(0,0,0,0)
         lay.setSpacing(0)
 
-        outer_split = QSplitter(Qt.Orientation.Horizontal)
-        outer_split.setHandleWidth(2)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.setHandleWidth(2)
 
-        # ── LEFT: artifact list + exports ────────────────────────────
+        # Left: artifact list
         left = QWidget()
         left.setMinimumWidth(180)
         left.setMaximumWidth(260)
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0,0,0,0)
         ll.setSpacing(0)
+
         lh = QLabel("  COLLECTED")
         lh.setObjectName("section_header")
         ll.addWidget(lh)
+
         self.art_list = QListWidget()
         self.art_list.currentRowChanged.connect(self._on_select)
         ll.addWidget(self.art_list)
+
+        # Export buttons
         exp_w = QWidget()
         exp_w.setStyleSheet(f"background:{C['bg3']};border-top:1px solid {C['border']};")
         expl = QVBoxLayout(exp_w)
@@ -4082,9 +4046,9 @@ class ResultsTab(QWidget):
             b.clicked.connect(slot)
             expl.addWidget(b)
         ll.addWidget(exp_w)
-        outer_split.addWidget(left)
+        split.addWidget(left)
 
-        # ── RIGHT: header + toolbar + table + preview ─────────────────
+        # Right: result table
         right = QWidget()
         rl = QVBoxLayout(right)
         rl.setContentsMargins(0,0,0,0)
@@ -4094,10 +4058,11 @@ class ResultsTab(QWidget):
         self.result_header.setObjectName("section_header")
         self.result_header.setStyleSheet(
             f"background:{C['bg3']};color:{C['fg']};font-size:9pt;"
-            f"font-weight:bold;padding:5px 10px;")
+            f"font-weight:bold;padding:5px 10px;"
+        )
         rl.addWidget(self.result_header)
 
-        # Filter / search bar
+        # Search bar
         sb = QWidget()
         sb.setStyleSheet(f"background:{C['bg3']};")
         sbl = QHBoxLayout(sb)
@@ -4110,22 +4075,7 @@ class ResultsTab(QWidget):
         self.row_count_label = QLabel("")
         self.row_count_label.setStyleSheet(f"color:{C['fg2']};")
         sbl.addWidget(self.row_count_label)
-        # Preview toggle button
-        self._prev_toggle = QPushButton("▼ Preview")
-        self._prev_toggle.setCheckable(True)
-        self._prev_toggle.setChecked(True)
-        self._prev_toggle.setFixedWidth(84)
-        self._prev_toggle.setStyleSheet(
-            f"QPushButton{{background:{C['btn']};color:{C['fg2']};"
-            f"border:1px solid {C['border']};border-radius:3px;padding:2px 6px;font-size:8pt;}}"
-            f"QPushButton:checked{{background:{C['sel']};color:{C['accent']};}}")
-        self._prev_toggle.toggled.connect(self._toggle_preview)
-        sbl.addWidget(self._prev_toggle)
         rl.addWidget(sb)
-
-        # Vertical splitter: table top, preview bottom
-        self._v_split = QSplitter(Qt.Orientation.Vertical)
-        self._v_split.setHandleWidth(4)
 
         self.result_table = QTableWidget(0, 1)
         self.result_table.setAlternatingRowColors(True)
@@ -4133,259 +4083,30 @@ class ResultsTab(QWidget):
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.result_table.horizontalHeader().setStretchLastSection(True)
         self.result_table.setSortingEnabled(True)
-        self.result_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.result_table.customContextMenuRequested.connect(self._table_ctx)
-        self.result_table.currentCellChanged.connect(self._on_cell_changed)
-        self._v_split.addWidget(self.result_table)
+        rl.addWidget(self.result_table)
 
-        # Preview panel widget
-        prev_w = QWidget()
-        prev_w.setStyleSheet(f"background:{C['bg2']};")
-        pvl = QVBoxLayout(prev_w)
-        pvl.setContentsMargins(0,0,0,0)
-        pvl.setSpacing(0)
-
-        # Preview toolbar
-        prev_tb = QWidget()
-        prev_tb.setStyleSheet(
-            f"background:{C['bg3']};border-top:2px solid {C['border']};")
-        ptbl = QHBoxLayout(prev_tb)
-        ptbl.setContentsMargins(8,3,8,3)
-        ptbl.setSpacing(4)
-        self._preview_title = QLabel("ITEM PREVIEW")
-        self._preview_title.setStyleSheet(
-            f"color:{C['accent']};font-weight:bold;font-size:8pt;")
-        ptbl.addWidget(self._preview_title)
-        ptbl.addStretch()
-        self._preview_mode_btns = {}
-        for mode in ("Summary","Raw","Hex","Path"):
-            mb = QPushButton(mode)
-            mb.setCheckable(True)
-            mb.setFixedHeight(22)
-            mb.setStyleSheet(
-                f"QPushButton{{background:{C['btn']};color:{C['fg2']};"
-                f"border:1px solid {C['border']};border-radius:3px;"
-                f"padding:1px 10px;font-size:8pt;margin:1px;}}"
-                f"QPushButton:checked{{background:{C['sel']};color:{C['accent']};border-color:{C['accent']};}}")
-            mb.clicked.connect(lambda _, m=mode: self._set_preview_mode(m))
-            ptbl.addWidget(mb)
-            self._preview_mode_btns[mode] = mb
-        pvl.addWidget(prev_tb)
-
-        # Stacked preview pages
-        self._preview_stack = QStackedWidget()
-        mono = f"font-family:'Consolas','Cascadia Code','Courier New',monospace;font-size:9pt;"
-
-        self._preview_summary = QTextEdit()
-        self._preview_summary.setReadOnly(True)
-        self._preview_summary.setStyleSheet(
-            f"background:{C['bg2']};color:{C['fg']};{mono}border:none;padding:8px;")
-        self._preview_stack.addWidget(self._preview_summary)   # 0
-
-        self._preview_raw = QPlainTextEdit()
-        self._preview_raw.setReadOnly(True)
-        self._preview_raw.setStyleSheet(
-            f"background:{C['bg2']};color:{C['green']};{mono}border:none;padding:8px;")
-        self._preview_stack.addWidget(self._preview_raw)       # 1
-
-        self._preview_hex = QPlainTextEdit()
-        self._preview_hex.setReadOnly(True)
-        self._preview_hex.setStyleSheet(
-            f"background:{C['bg2']};color:{C['orange']};{mono}border:none;padding:8px;")
-        self._preview_stack.addWidget(self._preview_hex)       # 2
-
-        self._preview_path = QTextEdit()
-        self._preview_path.setReadOnly(True)
-        self._preview_path.setStyleSheet(
-            f"background:{C['bg2']};color:{C['fg']};font-size:9pt;border:none;padding:8px;")
-        self._preview_stack.addWidget(self._preview_path)      # 3
-
-        pvl.addWidget(self._preview_stack)
-        self._v_split.addWidget(prev_w)
-        self._v_split.setSizes([480, 200])
-        rl.addWidget(self._v_split, 1)
-
+        # Progress
         self.progress = QProgressBar()
         self.progress.setFixedHeight(6)
         self.progress.setTextVisible(False)
         rl.addWidget(self.progress)
 
-        outer_split.addWidget(right)
-        outer_split.setSizes([220, 900])
-        lay.addWidget(outer_split)
+        split.addWidget(right)
+        split.setSizes([220, 900])
+        lay.addWidget(split)
 
-        # Initialise preview mode
-        self._preview_mode_btns["Summary"].setChecked(True)
-
-    # ── Preview toggle ────────────────────────────────────────────────
-    def _toggle_preview(self, checked):
-        self._v_split.widget(1).setVisible(checked)
-
-    def _set_preview_mode(self, mode):
-        self._preview_mode = mode
-        for m, btn in self._preview_mode_btns.items():
-            btn.setChecked(m == mode)
-        self._refresh_preview(self._current_row_data)
-
-    def _on_cell_changed(self, row, col, prow, pcol):
-        if row < 0 or row >= self.result_table.rowCount(): return
-        n = self.result_table.columnCount()
-        hdrs = [self.result_table.horizontalHeaderItem(c).text()
-                if self.result_table.horizontalHeaderItem(c) else str(c)
-                for c in range(n)]
-        rd = {hdrs[c]: (self.result_table.item(row,c).text()
-              if self.result_table.item(row,c) else "") for c in range(n)}
-        self._current_row_data = rd
-        self._refresh_preview(rd)
-
-    def _refresh_preview(self, rd):
-        if not rd: return
-        mode = self._preview_mode
-        idx  = {"Summary":0,"Raw":1,"Hex":2,"Path":3}[mode]
-        self._preview_stack.setCurrentIndex(idx)
-        art = self._current_name
-
-        if mode == "Summary":
-            KEY_C = {
-                C['green']:  ("pid","name","user","status","memory","cpu","process","exe"),
-                C['orange']: ("local","remote","proto","connection","port","ip"),
-                C['accent']: ("file","dir","path","size","modified","accessed","type"),
-                C['purple']: ("subject","sender","from","to","date","email"),
-                C['red']:    ("error","risk","malware","suspicious","warning"),
-            }
-            parts = [f"<div style='font-family:Segoe UI,Arial;font-size:9pt;'>",
-                     f"<p style='margin:0 0 8px;'><b style='color:{C['accent']}'>"
-                     f"{art}</b></p>"]
-            for k, v in rd.items():
-                kl = k.lower()
-                col = C['fg']
-                for c, keys in KEY_C.items():
-                    if any(x in kl for x in keys): col = c; break
-                v2 = str(v)[:300] + ("…" if len(str(v))>300 else "")
-                parts.append(
-                    f"<div style='margin:2px 0;padding:1px 0;'>"
-                    f"<span style='color:{C['fg2']};min-width:120px;"
-                    f"display:inline-block;font-size:8pt;'>{k}</span>"
-                    f"<span style='color:{col};margin-left:8px;'>{v2}</span></div>")
-            parts.append("</div>")
-            self._preview_summary.setHtml("".join(parts))
-
-        elif mode == "Raw":
-            self._preview_raw.setPlainText(json.dumps(rd, indent=2, default=str))
-
-        elif mode == "Hex":
-            p = next((rd[k] for k in ("Path","path","Exe","exe","File","file") if k in rd and rd[k]), "")
-            if p and os.path.isfile(p):
-                try:
-                    with open(p,"rb") as fh: data = fh.read(4096)
-                    lines = []
-                    for i in range(0,len(data),16):
-                        ch = data[i:i+16]
-                        h1 = " ".join("%02X"%b for b in ch[:8])
-                        h2 = " ".join("%02X"%b for b in ch[8:])
-                        ac = "".join(chr(b) if 32<=b<127 else "." for b in ch)
-                        lines.append("%08X  %-23s  %-23s  %s"%(i,h1,h2,ac))
-                    self._preview_hex.setPlainText("[First 4 KB: %s]\n\n"%p+"\n".join(lines))
-                except Exception as e:
-                    self._preview_hex.setPlainText("[Read error: %s]"%e)
-            else:
-                self._preview_hex.setPlainText(
-                    "[Hex preview: no accessible file path in this row]\n\n"
-                    "Switch to Summary or Raw to view fields.")
-
-        elif mode == "Path":
-            p = next((rd[k] for k in ("Path","path","Exe","exe","File","file") if k in rd and rd[k]), "")
-            if p and os.path.exists(p):
-                try:
-                    s = os.stat(p)
-                    info = (f"<div style='font-family:Segoe UI;font-size:9pt;'>"
-                            f"<p><b style='color:{C['accent']}'>{p}</b></p>"
-                            f"<p>Size: {fmt_size(s.st_size)}</p>"
-                            f"<p>Modified:  {fmt_ts(s.st_mtime)}</p>"
-                            f"<p>Created:   {fmt_ts(s.st_ctime)}</p>"
-                            f"<p>Accessed:  {fmt_ts(s.st_atime)}</p>"
-                            f"<p>Mode: {oct(s.st_mode)}</p>")
-                    if os.path.isfile(p):
-                        info += f"<p>Type: {detect_type(p)}</p>"
-                        if s.st_size < 32*1024*1024:
-                            info += f"<p>MD5: {md5_path(p)}</p>"
-                    info += "</div>"
-                    self._preview_path.setHtml(info)
-                except Exception as e:
-                    self._preview_path.setHtml(f"<p style='color:{C['red']}'>{e}</p>")
-            else:
-                fields = "<br>".join(
-                    f"<b>{k}:</b> {v}" for k,v in rd.items()
-                    if any(x in k.lower() for x in ("path","file","exe","dir","loc")))
-                self._preview_path.setHtml(
-                    f"<div style='font-family:Segoe UI;font-size:9pt;color:{C['fg2']};padding:8px;'>"
-                    f"<p>No accessible path in this row.</p>{fields}</div>")
-
-    # ── Table right-click ─────────────────────────────────────────────
-    def _table_ctx(self, pos):
-        row = self.result_table.rowAt(pos.y())
-        if row < 0: return
-        n = self.result_table.columnCount()
-        hdrs = [self.result_table.horizontalHeaderItem(c).text()
-                if self.result_table.horizontalHeaderItem(c) else str(c)
-                for c in range(n)]
-        rd = {hdrs[c]: (self.result_table.item(row,c).text()
-              if self.result_table.item(row,c) else "") for c in range(n)}
-        first_val = next(iter(rd.values()),"")
-
-        menu = QMenu(self)
-        menu.addAction("Copy Row (Tab-separated)",
-            lambda: QApplication.clipboard().setText("\t".join(rd.values())))
-        menu.addAction("Copy Row (JSON)",
-            lambda: QApplication.clipboard().setText(json.dumps(rd,default=str)))
-        menu.addAction(f'Copy First Value  "{first_val[:40]}"',
-            lambda: QApplication.clipboard().setText(first_val))
-        menu.addSeparator()
-
-        bm = menu.addMenu("Add to Bookmark...")
-        for tag in ["Key Finding","Malware Indicator","Suspicious","Cleared",
-                    "IOC","File of Interest","User Activity","Network Activity"]:
-            bm.addAction(tag,
-                lambda t=tag: self.bookmark_requested.emit(
-                    self._current_name, dict(rd), t))
-
-        menu.addSeparator()
-        p = next((rd[k] for k in ("Path","path","Exe","exe","File","file") if k in rd and rd[k]),"")
-        if p and os.path.exists(p):
-            menu.addAction("Open Containing Folder", lambda: self._open_folder(p))
-            if os.path.isfile(p):
-                menu.addAction("Save File As...", lambda: self._save_file(p))
-        menu.addSeparator()
-        menu.addAction("Filter to This Value",
-            lambda: self.filter_edit.setText(first_val[:50]))
-        menu.addAction("Clear Filter", self.filter_edit.clear)
-        menu.exec(self.result_table.mapToGlobal(pos))
-
-    def _open_folder(self, p):
-        d = os.path.dirname(p) if os.path.isfile(p) else p
-        if platform.system()=="Windows": os.startfile(d)
-        elif platform.system()=="Darwin": subprocess.Popen(["open",d])
-        else: subprocess.Popen(["xdg-open",d])
-
-    def _save_file(self, src):
-        dst, _ = QFileDialog.getSaveFileName(self,"Save File As",os.path.basename(src))
-        if dst:
-            try:
-                shutil.copy2(src,dst)
-                QMessageBox.information(self,"Saved",f"Saved to:\n{dst}")
-            except Exception as e:
-                QMessageBox.critical(self,"Error",str(e))
-
-    # ── Data management ───────────────────────────────────────────────
     def add_result(self, name: str, rows: list):
         self.results[name] = rows
         item = QListWidgetItem(f"  {name}")
         item.setForeground(QBrush(QColor(C['green'])))
+        # Store result count as tooltip
         item.setToolTip(f"{len(rows)} record(s)")
         self.art_list.addItem(item)
+        # Select the newly added item to immediately show its data
         self.art_list.blockSignals(True)
         self.art_list.setCurrentRow(self.art_list.count() - 1)
         self.art_list.blockSignals(False)
+        # Manually trigger display so every new result auto-shows
         self._show_result(name, rows)
 
     def set_progress(self, val: int):
@@ -4397,113 +4118,129 @@ class ResultsTab(QWidget):
         self.result_table.setRowCount(0)
         self.result_table.setColumnCount(1)
         self.progress.setValue(0)
-        self._preview_summary.setHtml("")
-        self._preview_raw.setPlainText("")
-        self._preview_hex.setPlainText("")
-        self._current_row_data = {}
 
     def _on_select(self, row):
         if row < 0: return
         name = self.art_list.item(row).text().strip()
-        self._show_result(name, self.results.get(name,[]))
+        rows = self.results.get(name, [])
+        self._show_result(name, rows)
 
     def _show_result(self, name: str, rows: list):
-        self._current_name = name
+        """Display results for the given artifact name."""
         self.result_header.setText(f"  {name}  —  {len(rows)} record(s)")
         self._populate_table(rows)
 
     def _populate_table(self, rows):
+        # Fully disable sorting before ANY structural changes
         self.result_table.setSortingEnabled(False)
         self.result_table.clearContents()
         self.result_table.setRowCount(0)
+
         if not rows:
             self.result_table.setColumnCount(1)
             self.result_table.setHorizontalHeaderLabels(["No data"])
             self.row_count_label.setText("0 rows")
             return
+
+        # Collect all unique columns (some rows may have different keys)
         all_keys = []
         seen = set()
         for row in rows:
             for k in row.keys():
-                if k not in seen: all_keys.append(k); seen.add(k)
+                if k not in seen:
+                    all_keys.append(k)
+                    seen.add(k)
+
         self.result_table.setColumnCount(len(all_keys))
         self.result_table.setHorizontalHeaderLabels(all_keys)
+
+        # Set column resize modes BEFORE inserting rows
         hdr = self.result_table.horizontalHeader()
         for i in range(len(all_keys)):
             hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
         if all_keys:
-            hdr.setSectionResizeMode(len(all_keys)-1, QHeaderView.ResizeMode.Stretch)
+            hdr.setSectionResizeMode(len(all_keys) - 1, QHeaderView.ResizeMode.Stretch)
+
+        # Insert all rows (sorting still OFF — prevents mid-insert scrambling)
         self.result_table.setRowCount(len(rows))
-        for ri, row in enumerate(rows):
-            for ci, col in enumerate(all_keys):
-                cell = QTableWidgetItem(str(row.get(col,"")))
+        for r_idx, row in enumerate(rows):
+            for c_idx, col in enumerate(all_keys):
+                val = str(row.get(col, ""))
+                cell = QTableWidgetItem(val)
                 cell.setForeground(QBrush(QColor(C['fg'])))
-                self.result_table.setItem(ri, ci, cell)
+                self.result_table.setItem(r_idx, c_idx, cell)
+
+        # Re-enable sorting only after all data is in place
         self.result_table.setSortingEnabled(True)
         self.row_count_label.setText(f"{len(rows)} rows")
         self._filter_rows(self.filter_edit.text())
-        if rows:
-            self._current_row_data = rows[0]
-            self._refresh_preview(rows[0])
 
     def _filter_rows(self, text):
         text = text.lower()
-        for r in range(self.result_table.rowCount()):
+        for row in range(self.result_table.rowCount()):
             match = not text or any(
-                text in (self.result_table.item(r,c).text()
-                          if self.result_table.item(r,c) else "").lower()
-                for c in range(self.result_table.columnCount()))
-            self.result_table.setRowHidden(r, not match)
+                text in (self.result_table.item(row,col).text() if self.result_table.item(row,col) else "").lower()
+                for col in range(self.result_table.columnCount())
+            )
+            self.result_table.setRowHidden(row, not match)
         vis = sum(1 for r in range(self.result_table.rowCount())
                   if not self.result_table.isRowHidden(r))
-        self.row_count_label.setText(f"{vis}/{self.result_table.rowCount()} rows")
+        self.row_count_label.setText(f"{vis} / {self.result_table.rowCount()} rows")
 
     def _current_rows(self):
-        nm = self.art_list.currentItem().text().strip() if self.art_list.currentItem() else ""
-        return self.results.get(nm,[]), nm
+        name = ""
+        if self.art_list.currentItem():
+            name = self.art_list.currentItem().text().strip()
+        return self.results.get(name, []), name
 
     def _export_csv(self):
-        rows, _ = self._current_rows()
+        rows, name = self._current_rows()
         if not rows: return
-        p, _ = QFileDialog.getSaveFileName(self,"Export CSV","","CSV (*.csv)")
-        if not p: return
-        with open(p,"w",newline="") as f:
+        path, _ = QFileDialog.getSaveFileName(self,"Export CSV","","CSV (*.csv)")
+        if not path: return
+        with open(path,"w",newline="") as f:
             w = csv.DictWriter(f, fieldnames=rows[0].keys())
             w.writeheader(); w.writerows(rows)
 
     def _export_json(self):
-        p, _ = QFileDialog.getSaveFileName(self,"Export JSON","","JSON (*.json)")
-        if not p: return
-        with open(p,"w") as f: json.dump(self.results, f, indent=2, default=str)
+        path, _ = QFileDialog.getSaveFileName(self,"Export JSON","","JSON (*.json)")
+        if not path: return
+        with open(path,"w") as f:
+            json.dump(self.results, f, indent=2, default=str)
 
     def _export_html(self):
-        p, _ = QFileDialog.getSaveFileName(self,"Export HTML","","HTML (*.html)")
-        if not p: return
+        path, _ = QFileDialog.getSaveFileName(self,"Export HTML Report","","HTML (*.html)")
+        if not path: return
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        css = ("body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;margin:32px}"
-               "h1{color:#58a6ff;border-bottom:2px solid #30363d;padding-bottom:8px}"
-               "h2{color:#3fb950;margin-top:24px;border-left:4px solid #3fb950;padding-left:10px}"
-               "table{border-collapse:collapse;width:100%;margin:8px 0 20px}"
-               "th{background:#21262d;color:#8b949e;padding:6px 10px;text-align:left;font-size:.85em}"
-               "td{padding:5px 10px;border-bottom:1px solid #21262d;font-size:.9em}"
-               "tr:nth-child(even){background:#1a2030}tr:hover td{background:#1f3354}"
-               ".badge{background:#1f3354;color:#58a6ff;border-radius:10px;padding:2px 8px;"
-               "font-size:.8em;margin-left:8px}")
-        html = (f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
-                f"<title>ForensicPro Report</title><style>{css}</style></head><body>"
-                f"<h1>ForensicPro Enterprise Report</h1>"
-                f"<p style='color:#8b949e;'>Generated: {now} | v{APP_VERSION}</p>")
+        html = f"""<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<title>ForensicPro Report — {now}</title>
+<style>
+body{{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;margin:32px}}
+h1{{color:#58a6ff;border-bottom:2px solid #30363d;padding-bottom:8px}}
+h2{{color:#3fb950;margin-top:24px;border-left:4px solid #3fb950;padding-left:10px}}
+table{{border-collapse:collapse;width:100%;margin:8px 0 20px}}
+th{{background:#21262d;color:#8b949e;padding:6px 10px;text-align:left;font-size:0.85em;letter-spacing:.05em}}
+td{{padding:5px 10px;border-bottom:1px solid #21262d;font-size:0.9em}}
+tr:nth-child(even){{background:#1a2030}}
+tr:hover td{{background:#1f3354}}
+.badge{{background:#1f3354;color:#58a6ff;border-radius:10px;padding:2px 8px;font-size:0.8em;margin-left:8px}}
+.meta{{color:#8b949e;font-size:0.85em;margin-bottom:24px}}
+</style></head><body>
+<h1>🔍 ForensicPro Enterprise — Digital Forensic Report</h1>
+<p class="meta">Generated: {now} | ForensicPro v{APP_VERSION}</p>
+"""
         for art, rows in self.results.items():
             html += f'<h2>{art} <span class="badge">{len(rows)}</span></h2>'
             if rows:
                 cols = list(rows[0].keys())
-                html += "<table><tr>"+"".join(f"<th>{c}</th>" for c in cols)+"</tr>"
+                html += "<table><tr>" + "".join(f"<th>{c}</th>" for c in cols) + "</tr>"
                 for row in rows:
-                    html += "<tr>"+"".join(f"<td>{row.get(c,'')}</td>" for c in cols)+"</tr>"
+                    html += "<tr>" + "".join(f"<td>{row.get(c,'')}</td>" for c in cols) + "</tr>"
                 html += "</table>"
         html += "</body></html>"
-        with open(p,"w") as f: f.write(html)
-        QMessageBox.information(self,"Exported",f"Report saved:\n{p}")
+        with open(path,"w") as f: f.write(html)
+        QMessageBox.information(self,"Exported", f"Report saved:\n{path}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -4993,8 +4730,12 @@ class EmailViewerTab(QWidget):
 
         # ── Top toolbar ──────────────────────────────────────────────
         tb = QWidget()
+        tb.setMaximumHeight(60)
+     
         tb.setStyleSheet(f"background:{C['bg3']};border-bottom:1px solid {C['border']};")
         tbl = QHBoxLayout(tb)
+
+
         tbl.setContentsMargins(8,4,8,4)
         tbl.setSpacing(6)
 
@@ -5291,132 +5032,74 @@ class EmailViewerTab(QWidget):
         self._messages = messages
 
     def _display_message(self, m):
-        """Display a pypff message object safely — every call wrapped in try/except."""
         self._current_msg = m
         msg = m.get("msg_obj")
         if not msg: return
 
-        def _s(fn, *args):
-            """Call a pypff method safely, return empty string on any error."""
-            try:
-                v = fn(*args)
-                return self._safe_str(v)
-            except Exception:
-                return ""
-
-        def _esc(s):
-            """HTML-escape a string for safe insertion into HTML."""
-            return (str(s).replace("&","&amp;").replace("<","&lt;")
-                          .replace(">","&gt;").replace('"',"&quot;"))
-
-        # ── Headers ──────────────────────────────────────────────────
-        sender_name  = _s(msg.get_sender_name)
-        sender_email = ""
-        try:   sender_email = _s(msg.get_sender_email_address)
-        except Exception: pass  # some pypff builds lack this method
-
-        from_str = _esc(sender_name)
-        if sender_email:
-            from_str += f" &lt;{_esc(sender_email)}&gt;"
-
-        hdr_lines = [f"<b>From:</b>&nbsp;&nbsp;&nbsp;{from_str}"]
-
+        # Headers
+        hdr_lines = [
+            f"<b>From:</b>    {self._safe_str(msg.get_sender_name())} "
+            f"&lt;{self._safe_str(msg.get_sender_email_address())}&gt;",
+        ]
         try:
             to_list = []
             for i in range(msg.get_number_of_recipients()):
-                try:
-                    r = msg.get_recipient(i)
-                    dn = _s(r.get_display_name)
-                    em = ""
-                    try: em = _s(r.get_email_address)
-                    except Exception: pass
-                    to_list.append(_esc(dn or em))
-                except Exception:
-                    pass
+                r = msg.get_recipient(i)
+                try: to_list.append(self._safe_str(r.get_display_name()) or
+                                    self._safe_str(r.get_email_address()))
+                except Exception: pass
             if to_list:
-                hdr_lines.append(f"<b>To:</b>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{'; '.join(to_list[:5])}")
-        except Exception:
-            pass
-
-        hdr_lines.append(f"<b>Subject:</b> {_esc(m.get('subject',''))}")
-        hdr_lines.append(f"<b>Date:</b>&nbsp;&nbsp;&nbsp;&nbsp;{_esc(str(m.get('date',''))[:24])}")
-
+                hdr_lines.append(f"<b>To:</b>       {'; '.join(to_list[:5])}")
+        except Exception: pass
+        hdr_lines.append(f"<b>Subject:</b>  {m['subject']}")
+        hdr_lines.append(f"<b>Date:</b>     {m['date'][:24] if m['date'] else ''}")
         self.header_box.setHtml(
-            "<div style='font-family:Segoe UI,Arial;font-size:9pt;line-height:1.5;'>"
+            f"<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"
             + "<br>".join(hdr_lines) + "</div>")
 
-        # ── Body ─────────────────────────────────────────────────────
-        displayed = False
-        # Try HTML body first
+        # Body
+        body = ""
         try:
             html_body = msg.get_html_body()
             if html_body:
-                decoded = (html_body.decode(errors='replace')
-                           if isinstance(html_body, bytes) else str(html_body))
-                if decoded.strip():
-                    self.body_view.setHtml(decoded)
-                    displayed = True
+                body = html_body.decode(errors='replace') if isinstance(html_body, bytes) else html_body
+                self.body_view.setHtml(body)
+            else:
+                raise ValueError("no html")
         except Exception:
-            pass
-
-        if not displayed:
-            # Try RTF body
-            try:
-                rtf = msg.get_rtf_body()
-                if rtf:
-                    decoded = (rtf.decode(errors='replace')
-                               if isinstance(rtf, bytes) else str(rtf))
-                    # Strip RTF tags crudely for plain display
-                    import re as _re
-                    text = _re.sub(r'\[a-z]+\d*\s?|[{}]', '', decoded)
-                    self.body_view.setPlainText(text[:50000])
-                    displayed = True
-            except Exception:
-                pass
-
-        if not displayed:
-            # Plain text body
             try:
                 plain = msg.get_plain_text_body()
                 if plain:
-                    decoded = (plain.decode(errors='replace')
-                               if isinstance(plain, bytes) else str(plain))
-                    self.body_view.setPlainText(decoded or "(empty body)")
-                    displayed = True
+                    body = plain.decode(errors='replace') if isinstance(plain, bytes) else str(plain)
+                self.body_view.setPlainText(body or "(empty body)")
             except Exception:
-                pass
+                self.body_view.setPlainText("(could not decode body)")
 
-        if not displayed:
-            self.body_view.setPlainText("(Could not decode message body)")
-
-        # ── Attachments ───────────────────────────────────────────────
+        # Attachments
         n_att = m.get("n_att", 0)
         self.attach_bar.setVisible(n_att > 0)
+        # Clear old attachment buttons
         while self._attach_lay.count():
             item = self._attach_lay.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            if item.widget(): item.widget().deleteLater()
         if n_att > 0:
             self.attach_label.setText(f"Attachments ({n_att}):")
             for i in range(n_att):
                 try:
-                    att   = msg.get_attachment(i)
-                    aname = _s(att.get_name) or f"attachment_{i}"
+                    att  = msg.get_attachment(i)
+                    aname = self._safe_str(att.get_name()) or f"attachment_{i}"
                     asize = 0
                     try: asize = att.get_size()
                     except Exception: pass
-                    btn = QPushButton(f"📎 {aname}  ({fmt_size(asize)})")
+                    btn = QPushButton(f"📎 {aname} ({fmt_size(asize)})")
                     btn.setFixedHeight(26)
                     btn.setStyleSheet(
                         f"QPushButton{{background:{C['bg3']};color:{C['fg']};"
                         f"border:1px solid {C['border']};border-radius:3px;"
                         f"padding:2px 8px;font-size:8pt;}}"
-                        f"QPushButton:hover{{background:{C['btn_hover']};"
-                        f"color:{C['accent']};}}")
-                    # Capture att by value at loop time
+                        f"QPushButton:hover{{background:{C['btn_hover']};color:{C['accent']};}}")
                     btn.clicked.connect(
-                        lambda _chk=False, a=att, n=aname:
-                            self._save_attachment(a, n))
+                        lambda _, a=att, n=aname: self._save_attachment(a, n))
                     self._attach_lay.addWidget(btn)
                 except Exception:
                     pass
@@ -5456,86 +5139,36 @@ class EmailViewerTab(QWidget):
             "_path":   path,
         }]
         self._render_msg_table(self._all_messages)
-        # Display immediately — keep msg open, store path for re-open on select
-        try:
-            self._display_msg_raw(msg)
-        except Exception as e:
-            self.body_view.setPlainText(f"[Preview error: {e}]")
-        finally:
-            try: msg.close()
-            except Exception: pass
+        # Display immediately
+        self._display_msg_raw(msg)
+        msg.close()
 
     def _display_msg_raw(self, msg):
-        """Display an extract_msg message object safely."""
-        def _esc(v):
-            s = str(v or "")
-            return (s.replace("&","&amp;").replace("<","&lt;")
-                     .replace(">","&gt;").replace('"',"&quot;"))
-        try:
-            self.header_box.setHtml(
-                "<div style='font-family:Segoe UI,Arial;font-size:9pt;line-height:1.5;'>"
-                f"<b>From:</b>&nbsp;&nbsp;&nbsp;{_esc(msg.sender)}<br>"
-                f"<b>To:</b>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{_esc(msg.to)}<br>"
-                f"<b>Subject:</b> {_esc(msg.subject)}<br>"
-                f"<b>Date:</b>&nbsp;&nbsp;&nbsp;&nbsp;{_esc(msg.date)}"
-                "</div>")
-        except Exception as e:
-            self.header_box.setPlainText(f"[Header error: {e}]")
-
-        try:
-            body = None
-            # Prefer HTML body
-            try:
-                hb = msg.htmlBody
-                if hb:
-                    body = hb.decode(errors='replace') if isinstance(hb, bytes) else str(hb)
-                    self.body_view.setHtml(body)
-            except Exception:
-                hb = None
-            if not hb:
-                # Plain text fallback
-                pb = msg.body
-                if pb:
-                    body = pb.decode(errors='replace') if isinstance(pb, bytes) else str(pb)
-                self.body_view.setPlainText(body or "(empty body)")
-        except Exception as e:
-            self.body_view.setPlainText(f"[Body error: {e}]")
-
-        try:
-            atts = msg.attachments
-            self.attach_bar.setVisible(bool(atts))
-            while self._attach_lay.count():
-                item = self._attach_lay.takeAt(0)
-                if item.widget(): item.widget().deleteLater()
-            for att in atts:
-                try:
-                    aname = att.longFilename or att.shortFilename or "attachment"
-                    btn   = QPushButton(f"📎 {aname}")
-                    btn.setFixedHeight(26)
-                    btn.clicked.connect(
-                        lambda _chk=False, a=att, n=aname:
-                            self._save_att_raw(a, n))
-                    self._attach_lay.addWidget(btn)
-                except Exception:
-                    pass
-            if atts:
-                self._attach_lay.addStretch()
-        except Exception:
-            self.attach_bar.setVisible(False)
-
-    def _display_msg_from_path(self, path):
-        """Safely re-open and display a .msg file by path (handle may be closed)."""
-        if not path or not os.path.isfile(path):
-            self.body_view.setPlainText("(MSG file not found)")
-            return
-        try:
-            import extract_msg
-            msg = extract_msg.openMsg(path)
-            self._display_msg_raw(msg)
-            try: msg.close()
-            except Exception: pass
-        except Exception as e:
-            self.body_view.setPlainText(f"[Cannot re-open MSG: {e}]")
+        """Display an extract_msg message object."""
+        self.header_box.setHtml(
+            f"<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"
+            f"<b>From:</b>    {msg.sender or ''}<br>"
+            f"<b>To:</b>      {msg.to or ''}<br>"
+            f"<b>Subject:</b> {msg.subject or ''}<br>"
+            f"<b>Date:</b>    {msg.date or ''}"
+            "</div>")
+        body = msg.htmlBody or msg.body or "(empty)"
+        if isinstance(body, bytes): body = body.decode(errors='replace')
+        if msg.htmlBody:
+            self.body_view.setHtml(body)
+        else:
+            self.body_view.setPlainText(body)
+        self.attach_bar.setVisible(len(msg.attachments) > 0)
+        while self._attach_lay.count():
+            item = self._attach_lay.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        for att in msg.attachments:
+            aname = att.longFilename or att.shortFilename or "attachment"
+            btn = QPushButton(f"📎 {aname}")
+            btn.setFixedHeight(26)
+            btn.clicked.connect(lambda _, a=att, n=aname: self._save_att_raw(a, n))
+            self._attach_lay.addWidget(btn)
+        if msg.attachments: self._attach_lay.addStretch()
 
     def _save_att_raw(self, att, name):
         dst, _ = QFileDialog.getSaveFileName(self, "Save Attachment", name)
@@ -5578,117 +5211,56 @@ class EmailViewerTab(QWidget):
         self._render_msg_table(self._all_messages)
 
     def _on_message_select(self, row, _col, _pr, _pc):
-        if row < 0: return
-        try:
-            # Use the UserRole index stored in col-0, not the visual row number.
-            # Visual row changes when the table is sorted; UserRole stays stable.
-            item0 = self.msg_table.item(row, 0)
-            if not item0: return
-            msg_idx = item0.data(Qt.ItemDataRole.UserRole)
-            # Locate the message dict by its stored index
-            m = next((x for x in self._all_messages if x.get("index") == msg_idx), None)
-            if m is None:
-                # Fallback: try direct list lookup
-                if row < len(self._messages):
-                    m = self._messages[row]
-                else:
-                    return
-            self._current_msg = m
-            if "_mbox_msg" in m:
-                self._display_mbox_msg(m["_mbox_msg"])
-            elif "_msg_raw" in m:
-                # Re-open the MSG file safely instead of using closed handle
-                self._display_msg_from_path(m.get("_path",""))
-            elif m.get("msg_obj"):
-                self._display_message(m)
-        except Exception as e:
-            self.body_view.setPlainText(f"[Display error: {e}]")
+        if row < 0 or row >= len(self._messages): return
+        m = self._messages[row]
+        self._current_msg = m
+        if "_mbox_msg" in m:
+            self._display_mbox_msg(m["_mbox_msg"])
+        elif "_msg_raw" in m:
+            self._display_msg_raw(m["_msg_raw"])
+        elif m.get("msg_obj"):
+            self._display_message(m)
 
     def _display_mbox_msg(self, msg):
-        """Display a mailbox.Message (MBOX/EML) safely with HTML escaping."""
-        def _hdr(key):
-            try:
-                v = msg.get(key, "") or ""
-                # Decode encoded header (e.g. =?utf-8?b?...?=)
-                import email.header as _eh
-                parts = _eh.decode_header(str(v))
-                decoded = ""
-                for part, enc in parts:
-                    if isinstance(part, bytes):
-                        decoded += part.decode(enc or "utf-8", errors="replace")
-                    else:
-                        decoded += str(part)
-                # HTML-escape for safe rendering
-                return (decoded.replace("&","&amp;").replace("<","&lt;")
-                                .replace(">","&gt;").replace('"',"&quot;"))
-            except Exception:
-                return ""
-
-        try:
-            self.header_box.setHtml(
-                "<div style='font-family:Segoe UI,Arial;font-size:9pt;line-height:1.5;'>"
-                f"<b>From:</b>&nbsp;&nbsp;&nbsp;{_hdr('From')}<br>"
-                f"<b>To:</b>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{_hdr('To')}<br>"
-                f"<b>Subject:</b> {_hdr('Subject')}<br>"
-                f"<b>Date:</b>&nbsp;&nbsp;&nbsp;&nbsp;{_hdr('Date')}"
-                "</div>")
-        except Exception as e:
-            self.header_box.setPlainText(f"[Header error: {e}]")
-
-        # Walk MIME parts for body and attachments
-        body      = ""
+        self.header_box.setHtml(
+            f"<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"
+            f"<b>From:</b>    {msg.get('From','')}<br>"
+            f"<b>To:</b>      {msg.get('To','')}<br>"
+            f"<b>Subject:</b> {msg.get('Subject','')}<br>"
+            f"<b>Date:</b>    {msg.get('Date','')}"
+            "</div>")
+        # Find body parts
+        body = ""
         html_body = ""
         attachments = []
-        try:
-            for part in msg.walk():
-                try:
-                    ct   = part.get_content_type()
-                    disp = part.get_content_disposition() or ""
-                    if "attachment" in disp:
-                        attachments.append(part)
-                        continue
-                    if ct == "text/html" and not html_body:
-                        raw = part.get_payload(decode=True)
-                        if raw:
-                            enc = part.get_content_charset() or "utf-8"
-                            html_body = raw.decode(enc, errors="replace")
-                    elif ct == "text/plain" and not body:
-                        raw = part.get_payload(decode=True)
-                        if raw:
-                            enc = part.get_content_charset() or "utf-8"
-                            body = raw.decode(enc, errors="replace")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        try:
-            if html_body:
-                self.body_view.setHtml(html_body)
-            else:
-                self.body_view.setPlainText(body or "(empty body)")
-        except Exception as e:
-            self.body_view.setPlainText(f"[Body render error: {e}]")
-
-        # Attachments bar
+        for part in msg.walk():
+            ct  = part.get_content_type()
+            disp = part.get_content_disposition() or ""
+            if "attachment" in disp:
+                attachments.append(part)
+                continue
+            if ct == "text/html" and not html_body:
+                try: html_body = part.get_payload(decode=True).decode(errors='replace')
+                except Exception: pass
+            elif ct == "text/plain" and not body:
+                try: body = part.get_payload(decode=True).decode(errors='replace')
+                except Exception: pass
+        if html_body:
+            self.body_view.setHtml(html_body)
+        else:
+            self.body_view.setPlainText(body or "(empty)")
         self.attach_bar.setVisible(bool(attachments))
         while self._attach_lay.count():
             item = self._attach_lay.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            if item.widget(): item.widget().deleteLater()
         for att in attachments:
-            try:
-                aname = att.get_filename() or "attachment"
-                btn   = QPushButton(f"📎 {aname}")
-                btn.setFixedHeight(26)
-                btn.clicked.connect(
-                    lambda _chk=False, a=att, n=aname:
-                        self._save_mbox_att(a, n))
-                self._attach_lay.addWidget(btn)
-            except Exception:
-                pass
-        if attachments:
-            self._attach_lay.addStretch()
+            aname = att.get_filename() or "attachment"
+            btn = QPushButton(f"📎 {aname}")
+            btn.setFixedHeight(26)
+            btn.clicked.connect(
+                lambda _, a=att, n=aname: self._save_mbox_att(a, n))
+            self._attach_lay.addWidget(btn)
+        if attachments: self._attach_lay.addStretch()
 
     def _save_mbox_att(self, part, name):
         dst, _ = QFileDialog.getSaveFileName(self,"Save Attachment",name)
@@ -5801,385 +5373,6 @@ class EmailViewerTab(QWidget):
         self._folder_map = {}
 
 
-
-# ══════════════════════════════════════════════════════════════
-#  BOOKMARK TAB
-# ══════════════════════════════════════════════════════════════
-
-# Default bookmark categories with icons and colours
-BOOKMARK_TABS_DEF = [
-    ("⭐ Key Findings",        C['yellow'],  "Top-level findings worth highlighting in the report."),
-    ("🔴 Malware Indicators",  C['red'],     "Files, processes or registry keys linked to malware."),
-    ("🟡 Suspicious Items",    C['orange'],  "Items that need further investigation."),
-    ("📌 IOCs",                C['purple'],  "Indicators of Compromise: hashes, IPs, domains, paths."),
-    ("👤 User Activity",       C['green'],   "Logon events, file access, browser history."),
-    ("🌐 Network Artifacts",   C['accent'],  "Connections, DNS, cookies, Wi-Fi profiles."),
-    ("📁 Files of Interest",   C['fg'],      "Files extracted or flagged during analysis."),
-    ("🟢 Cleared",             C['fg2'],     "Items reviewed and considered benign."),
-]
-
-# Map tag strings → tab index
-TAG_TO_TAB = {
-    "Key Finding":       0, "Malware Indicator": 1, "Suspicious":    2,
-    "IOC":               3, "User Activity":     4, "Network Activity": 5,
-    "File of Interest":  6, "Cleared":           7,
-}
-
-
-class BookmarkTab(QWidget):
-    """
-    Bookmark manager with labelled sub-tabs (default categories).
-    Each sub-tab shows a table of bookmarked rows with notes,
-    source artifact name, timestamp, and tag.
-    Double-click a bookmark row to jump back to the artifact in Results tab.
-    """
-    # Emits artifact_name when user wants to navigate to it in results
-    navigate_to = pyqtSignal(str)
-
-    def __init__(self):
-        super().__init__()
-        self._tab_tables = []   # list of QTableWidget, one per sub-tab
-        self._setup()
-
-    def _setup(self):
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0,0,0,0)
-        lay.setSpacing(0)
-
-        # Toolbar
-        tb = QWidget()
-        tb.setStyleSheet(f"background:{C['bg3']};border-bottom:1px solid {C['border']};")
-        tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(8,4,8,4)
-        tbl.setSpacing(6)
-
-        title = QLabel("🔖  BOOKMARKS")
-        title.setStyleSheet(f"color:{C['accent']};font-weight:bold;font-size:10pt;")
-        tbl.addWidget(title)
-        tbl.addStretch()
-
-        for label, slot in [
-            ("Export All…",     self._export_all),
-            ("Clear Tab",       self._clear_current_tab),
-            ("Clear All",       self._clear_all),
-        ]:
-            btn = QPushButton(label)
-            btn.setFixedHeight(26)
-            btn.clicked.connect(slot)
-            tbl.addWidget(btn)
-
-        self.bm_count = QLabel("0 bookmarks")
-        self.bm_count.setStyleSheet(f"color:{C['fg2']};font-size:9pt;padding:0 8px;")
-        tbl.addWidget(self.bm_count)
-        lay.addWidget(tb)
-
-        # Sub-tabs — one per default category
-        self.sub_tabs = QTabWidget()
-        self.sub_tabs.setTabPosition(QTabWidget.TabPosition.North)
-        self.sub_tabs.setStyleSheet(
-            f"QTabWidget::pane{{border:none;background:{C['bg']}}}"
-            f"QTabBar::tab{{background:{C['bg3']};color:{C['fg2']};"
-            f"border:1px solid {C['border']};border-bottom:none;"
-            f"padding:5px 14px;margin-right:1px;font-size:9pt;}}"
-            f"QTabBar::tab:selected{{background:{C['bg']};color:{C['accent']};"
-            f"border-bottom:2px solid {C['accent']};}}"
-            f"QTabBar::tab:hover:!selected{{background:{C['btn_hover']};}}")
-        lay.addWidget(self.sub_tabs)
-
-        # Build each sub-tab
-        COLS = ["Artifact","Tag","Timestamp","Summary","Notes"]
-        for tab_label, col, desc in BOOKMARK_TABS_DEF:
-            page = QWidget()
-            page.setStyleSheet(f"background:{C['bg']};")
-            pl = QVBoxLayout(page)
-            pl.setContentsMargins(0,0,0,0)
-            pl.setSpacing(0)
-
-            # Description bar
-            desc_bar = QLabel(f"  {desc}")
-            desc_bar.setStyleSheet(
-                f"background:{C['bg2']};color:{C['fg2']};font-size:8pt;"
-                f"padding:4px 8px;border-bottom:1px solid {C['border']};")
-            pl.addWidget(desc_bar)
-
-            # Splitter: table top, detail bottom
-            vs = QSplitter(Qt.Orientation.Vertical)
-            vs.setHandleWidth(3)
-
-            tbl_w = QTableWidget(0, len(COLS))
-            tbl_w.setHorizontalHeaderLabels(COLS)
-            tbl_w.horizontalHeader().setSectionResizeMode(
-                3, QHeaderView.ResizeMode.Stretch)   # Summary stretches
-            tbl_w.horizontalHeader().setSectionResizeMode(
-                4, QHeaderView.ResizeMode.Stretch)   # Notes stretches
-            for ci in (0,1,2):
-                tbl_w.horizontalHeader().setSectionResizeMode(
-                    ci, QHeaderView.ResizeMode.ResizeToContents)
-            tbl_w.verticalHeader().setVisible(False)
-            tbl_w.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-            tbl_w.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
-            tbl_w.setAlternatingRowColors(True)
-            tbl_w.setSortingEnabled(True)
-            tbl_w.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            tbl_w.customContextMenuRequested.connect(
-                lambda pos, t=tbl_w: self._bm_ctx(pos, t))
-            tbl_w.currentCellChanged.connect(
-                lambda r,c,pr,pc, t=tbl_w, ti=len(self._tab_tables):
-                    self._on_bm_select(r, t, ti))
-            tbl_w.setStyleSheet(
-                f"QTableWidget{{background:{C['panel']};color:{C['fg']};"
-                f"border:none;gridline-color:{C['border']};}}"
-                f"QTableWidget::item:selected{{background:{C['sel']};color:{C['accent']};}}")
-            vs.addWidget(tbl_w)
-            self._tab_tables.append(tbl_w)
-
-            # Detail panel
-            detail_w = QWidget()
-            detail_w.setStyleSheet(f"background:{C['bg2']};")
-            dl = QVBoxLayout(detail_w)
-            dl.setContentsMargins(0,0,0,0)
-            dl.setSpacing(0)
-            dh = QLabel("  ITEM DETAIL")
-            dh.setStyleSheet(
-                f"background:{C['bg3']};color:{C['fg2']};font-size:8pt;"
-                f"font-weight:bold;padding:3px 8px;"
-                f"border-top:1px solid {C['border']};")
-            dl.addWidget(dh)
-            detail_txt = QTextEdit()
-            detail_txt.setReadOnly(True)
-            detail_txt.setStyleSheet(
-                f"background:{C['bg2']};color:{C['fg']};"
-                f"font-family:'Consolas','Courier New',monospace;"
-                f"font-size:9pt;border:none;padding:6px;")
-            dl.addWidget(detail_txt)
-            # Store detail widget reference on the table
-            tbl_w._detail = detail_txt
-            vs.addWidget(detail_w)
-            vs.setSizes([300, 160])
-
-            pl.addWidget(vs)
-            self.sub_tabs.addTab(page, tab_label)
-
-        self.sub_tabs.currentChanged.connect(self._on_sub_tab_changed)
-
-    # ── Add bookmark ──────────────────────────────────────────────────
-    def add_bookmark(self, artifact_name: str, row_data: dict, tag: str):
-        """Add a row_data dict as a bookmark under the appropriate sub-tab."""
-        tab_idx = TAG_TO_TAB.get(tag, 0)
-        # Clamp to available tabs
-        tab_idx = min(tab_idx, len(self._tab_tables) - 1)
-        tbl = self._tab_tables[tab_idx]
-
-        # Build summary from first few fields
-        summary = "  |  ".join(
-            f"{k}: {str(v)[:40]}" for k,v in list(row_data.items())[:4])
-        ts  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        row = tbl.rowCount()
-        tbl.setSortingEnabled(False)
-        tbl.insertRow(row)
-
-        tag_col  = C['red'] if 'Malware' in tag else \
-                   C['orange'] if 'Suspicious' in tag else \
-                   C['yellow'] if 'Key' in tag else \
-                   C['purple'] if 'IOC' in tag else \
-                   C['green']  if 'User' in tag or 'Cleared' in tag else \
-                   C['accent']
-
-        for ci, (val, color) in enumerate([
-            (artifact_name, C['accent']),
-            (tag,           tag_col),
-            (ts,            C['fg2']),
-            (summary,       C['fg']),
-            ("",            C['fg']),   # Notes — editable
-        ]):
-            item = QTableWidgetItem(val)
-            item.setForeground(QBrush(QColor(color)))
-            if ci == 4:
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
-                item.setToolTip("Double-click to add notes")
-            else:
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            # Store full row_data in first column for retrieval
-            if ci == 0:
-                item.setData(Qt.ItemDataRole.UserRole, row_data)
-            tbl.setItem(row, ci, item)
-
-        tbl.setSortingEnabled(True)
-        self._update_count()
-
-        # Flash the sub-tab to show where it was added
-        self.sub_tabs.setCurrentIndex(tab_idx)
-        tbl.scrollToBottom()
-        tbl.selectRow(tbl.rowCount() - 1)
-
-    def _on_bm_select(self, row, tbl, tab_idx):
-        if row < 0 or not hasattr(tbl, '_detail'): return
-        item = tbl.item(row, 0)
-        if not item: return
-        rd = item.data(Qt.ItemDataRole.UserRole) or {}
-        # Build HTML detail
-        parts = [f"<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"]
-        art_item = tbl.item(row, 0)
-        tag_item = tbl.item(row, 1)
-        ts_item  = tbl.item(row, 2)
-        if art_item: parts.append(
-            f"<p><b style='color:{C['accent']}'>{art_item.text()}</b>"
-            f" &nbsp;<span style='color:{C['orange']}'>{tag_item.text() if tag_item else ''}</span>"
-            f"&nbsp;&nbsp;<span style='color:{C['fg2']};font-size:8pt;'>{ts_item.text() if ts_item else ''}</span></p>")
-        parts.append("<hr style='border-color:#30363d;margin:6px 0;'>")
-        for k, v in rd.items():
-            v2 = str(v)[:500]
-            parts.append(
-                f"<div style='margin:2px 0;'>"
-                f"<span style='color:{C['fg2']};min-width:140px;display:inline-block;"
-                f"font-size:8pt;'>{k}:</span>"
-                f"<span style='color:{C['fg']};'>&nbsp;{v2}</span></div>")
-        parts.append("</div>")
-        tbl._detail.setHtml("".join(parts))
-
-    def _on_sub_tab_changed(self, idx):
-        self._update_count()
-
-    # ── Context menu ──────────────────────────────────────────────────
-    def _bm_ctx(self, pos, tbl):
-        row = tbl.rowAt(pos.y())
-        if row < 0: return
-        item = tbl.item(row, 0)
-        rd   = item.data(Qt.ItemDataRole.UserRole) if item else {}
-        art  = item.text() if item else ""
-
-        menu = QMenu(self)
-        menu.addAction("🔍 Go to Artifact in Results",
-            lambda: self.navigate_to.emit(art))
-        menu.addAction("📋 Copy Summary",
-            lambda: QApplication.clipboard().setText(
-                tbl.item(row,3).text() if tbl.item(row,3) else ""))
-        menu.addAction("📋 Copy as JSON",
-            lambda: QApplication.clipboard().setText(
-                json.dumps(rd, default=str)))
-        menu.addSeparator()
-
-        # Move to different tab
-        move_m = menu.addMenu("Move to Tab…")
-        for i, (lbl, _, _d) in enumerate(BOOKMARK_TABS_DEF):
-            move_m.addAction(lbl, lambda _, ti=i, r=row, t=tbl: self._move_row(t, r, ti))
-
-        menu.addSeparator()
-        menu.addAction("🗑 Remove Bookmark", lambda: (tbl.removeRow(row),
-                                                       self._update_count()))
-        menu.exec(tbl.mapToGlobal(pos))
-
-    def _move_row(self, src_tbl, row, dest_idx):
-        """Move a bookmark row to a different sub-tab."""
-        if dest_idx >= len(self._tab_tables): return
-        dest_tbl = self._tab_tables[dest_idx]
-        item0 = src_tbl.item(row, 0)
-        if not item0: return
-        rd  = item0.data(Qt.ItemDataRole.UserRole) or {}
-        art = item0.text()
-        tag = BOOKMARK_TABS_DEF[dest_idx][0]
-        src_tbl.removeRow(row)
-        self.add_bookmark(art, rd, tag.split()[-1])   # strip emoji
-        self.sub_tabs.setCurrentIndex(dest_idx)
-        self._update_count()
-
-    # ── Utilities ─────────────────────────────────────────────────────
-    def _update_count(self):
-        total = sum(t.rowCount() for t in self._tab_tables)
-        cur   = self._tab_tables[self.sub_tabs.currentIndex()].rowCount() \
-                if self.sub_tabs.currentIndex() < len(self._tab_tables) else 0
-        self.bm_count.setText(
-            f"{total} total  |  {cur} in this tab")
-
-    def _clear_current_tab(self):
-        idx = self.sub_tabs.currentIndex()
-        if idx < 0 or idx >= len(self._tab_tables): return
-        tbl = self._tab_tables[idx]
-        if tbl.rowCount() == 0: return
-        if QMessageBox.question(
-                self, "Clear Tab",
-                f"Remove all {tbl.rowCount()} bookmark(s) from this tab?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        ) == QMessageBox.StandardButton.Yes:
-            tbl.setRowCount(0)
-            self._update_count()
-
-    def _clear_all(self):
-        total = sum(t.rowCount() for t in self._tab_tables)
-        if total == 0: return
-        if QMessageBox.question(
-                self, "Clear All Bookmarks",
-                f"Remove all {total} bookmarks across all tabs?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        ) == QMessageBox.StandardButton.Yes:
-            for t in self._tab_tables: t.setRowCount(0)
-            self._update_count()
-
-    def _export_all(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Bookmarks", "bookmarks",
-            "JSON (*.json);;CSV (*.csv);;HTML (*.html)")
-        if not path: return
-        all_bm = []
-        for ti, (tab_label, _, _d) in enumerate(BOOKMARK_TABS_DEF):
-            tbl = self._tab_tables[ti]
-            for r in range(tbl.rowCount()):
-                item0 = tbl.item(r, 0)
-                rd    = item0.data(Qt.ItemDataRole.UserRole) if item0 else {}
-                note  = tbl.item(r, 4).text() if tbl.item(r, 4) else ""
-                ts    = tbl.item(r, 2).text() if tbl.item(r, 2) else ""
-                all_bm.append({
-                    "tab":      tab_label,
-                    "artifact": item0.text() if item0 else "",
-                    "tag":      tbl.item(r,1).text() if tbl.item(r,1) else "",
-                    "timestamp":ts,
-                    "notes":    note,
-                    "data":     rd,
-                })
-        if path.endswith(".json"):
-            with open(path,"w") as f: json.dump(all_bm, f, indent=2, default=str)
-        elif path.endswith(".csv"):
-            import csv as _csv
-            with open(path,"w",newline="") as f:
-                w = _csv.writer(f)
-                w.writerow(["Tab","Artifact","Tag","Timestamp","Notes","Summary"])
-                for bm in all_bm:
-                    summary = "  |  ".join(f"{k}: {v}" for k,v in list(bm["data"].items())[:4])
-                    w.writerow([bm["tab"],bm["artifact"],bm["tag"],
-                                bm["timestamp"],bm["notes"],summary])
-        else:  # HTML
-            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            html = (f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
-                    f"<title>Bookmarks Export</title>"
-                    f"<style>body{{background:#0d1117;color:#e6edf3;"
-                    f"font-family:'Segoe UI',sans-serif;margin:32px}}"
-                    f"h1{{color:#58a6ff}}h2{{color:#d29922;margin-top:20px}}"
-                    f"table{{border-collapse:collapse;width:100%;margin:8px 0}}"
-                    f"th{{background:#21262d;color:#8b949e;padding:6px 10px;text-align:left}}"
-                    f"td{{padding:5px 10px;border-bottom:1px solid #21262d}}"
-                    f"tr:nth-child(even){{background:#1a2030}}</style></head><body>"
-                    f"<h1>ForensicPro Bookmarks</h1>"
-                    f"<p style='color:#8b949e'>Exported: {now}</p>")
-            for tab_label, _, _d in BOOKMARK_TABS_DEF:
-                tab_bms = [b for b in all_bm if b["tab"] == tab_label]
-                if not tab_bms: continue
-                html += f"<h2>{tab_label} ({len(tab_bms)})</h2>"
-                html += ("<table><tr><th>Artifact</th><th>Timestamp</th>"
-                         "<th>Summary</th><th>Notes</th></tr>")
-                for bm in tab_bms:
-                    summary = "  |  ".join(
-                        f"{k}: {v}" for k,v in list(bm["data"].items())[:4])
-                    html += (f"<tr><td>{bm['artifact']}</td>"
-                             f"<td>{bm['timestamp']}</td>"
-                             f"<td>{summary}</td>"
-                             f"<td>{bm['notes']}</td></tr>")
-                html += "</table>"
-            html += "</body></html>"
-            with open(path,"w") as f: f.write(html)
-        QMessageBox.information(self, "Exported",
-            f"Exported {len(all_bm)} bookmark(s) to:\n{path}")
-
-
 # ══════════════════════════════════════════════════════════════
 #  MAIN WINDOW
 # ══════════════════════════════════════════════════════════════
@@ -6254,7 +5447,6 @@ class MainWindow(QMainWindow):
             ("Timeline",          lambda: self.tabs.setCurrentIndex(3)),
             ("Remote Agent",      lambda: self.tabs.setCurrentIndex(4)),
             ("Email Viewer",      lambda: self.tabs.setCurrentIndex(5)),
-            ("Bookmarks",         lambda: self.tabs.setCurrentIndex(6)),
         ])
         menu("&Help", [
             ("About", self._about),
@@ -6338,14 +5530,6 @@ class MainWindow(QMainWindow):
         # Tab 5: Email Viewer
         self.email_tab = EmailViewerTab()
         self.tabs.addTab(self.email_tab, "📧  Email Viewer")
-
-        # Tab 6: Bookmarks
-        self.bookmark_tab = BookmarkTab()
-        self.bookmark_tab.navigate_to.connect(self._navigate_to_artifact)
-        self.tabs.addTab(self.bookmark_tab, "🔖  Bookmarks")
-
-        # Wire results tab bookmark signal → bookmark tab
-        self.results_tab.bookmark_requested.connect(self._on_bookmark)
 
         lay.addWidget(self.tabs)
 
@@ -6521,24 +5705,6 @@ class MainWindow(QMainWindow):
         if idx == 1:  # Artifact Selection tab
             items = getattr(self, '_evidence_items_cache', [])
             self.art_tab.refresh_evidence_list(items)
-
-    def _on_bookmark(self, artifact_name: str, row_data: dict, tag: str):
-        """Receive bookmark signal from ResultsTab and add to BookmarkTab."""
-        self.bookmark_tab.add_bookmark(artifact_name, row_data, tag)
-        # Brief flash on the bookmark tab label
-        self.tabs.setTabText(6, "🔖  Bookmarks ✦")
-        QTimer.singleShot(1500, lambda: self.tabs.setTabText(6, "🔖  Bookmarks"))
-        self.set_status(f"  Bookmarked: {tag}  ←  {artifact_name}")
-
-    def _navigate_to_artifact(self, artifact_name: str):
-        """Jump to Results tab and highlight the given artifact."""
-        self.tabs.setCurrentIndex(2)   # Results tab
-        art_list = self.results_tab.art_list
-        for i in range(art_list.count()):
-            if art_list.item(i).text().strip() == artifact_name:
-                art_list.setCurrentRow(i)
-                break
-        self.set_status(f"  Navigated to: {artifact_name}")
 
     # ── Timeline ─────────────────────────────
     def _build_timeline(self):

@@ -3704,24 +3704,14 @@ class EvidenceBrowser(QWidget):
                 menu.addAction("📧 Open in Email Viewer",
                     lambda: self._open_in_email_viewer(d["image_path"], d["inode"], d["name"]))
                 bm_sub2 = menu.addMenu("Add to Bookmark…")
-                # Pre-compute a safe snapshot before building lambdas — same
-                # pattern the host-file branch already uses — prevents KeyError
-                # / crash when any field is absent in item_data.
-                _bm2 = {
-                    "name":       d.get("name", ""),
-                    "image_path": d.get("image_path", ""),
-                    "inode":      str(d.get("inode", "")),
-                    "size":       d.get("size", 0),
-                }
                 for tag in ["Key Finding","File of Interest","Malware Indicator",
                             "Suspicious","IOC"]:
                     bm_sub2.addAction(tag,
-                        lambda t=tag, dd=_bm2: self.main._on_bookmark(
+                        lambda _, t=tag, dd=d: self.main._on_bookmark(
                             "Image Browser",
-                            {"Name":  dd["name"],
-                             "Image": dd["image_path"],
-                             "Inode": dd["inode"],
-                             "Size":  fmt_size(dd["size"])}, t))
+                            {"Name": dd["name"], "Image": dd["image_path"],
+                             "Inode": str(dd["inode"]),
+                             "Size": fmt_size(dd.get("size",0))}, t))
         else:
             name = item_data if isinstance(item_data, str) else name_item.text()
             path = self.current_dir / name
@@ -3745,19 +3735,15 @@ class EvidenceBrowser(QWidget):
                 lambda: self.main._add_evidence_from_path(str(path)))
             menu.addSeparator()
             bm_sub = menu.addMenu("Add to Bookmark…")
-            # Pre-compute safe values NOW (not inside lambda) to avoid crash
-            try:
-                _bm_size = fmt_size(path.stat().st_size) if path.is_file() else ""
-            except Exception:
-                _bm_size = ""
-            _bm_type = detect_type(str(path)) if path.is_file() else "Directory"
-            _bm_data = {"File": path.name, "Path": str(path),
-                        "Size": _bm_size, "Type": _bm_type}
             for tag in ["Key Finding","File of Interest","Malware Indicator",
                         "Suspicious","IOC","Cleared"]:
                 bm_sub.addAction(tag,
-                    lambda t=tag, d=_bm_data: self.main._on_bookmark(
-                        "File Browser", dict(d), t))
+                    lambda _, t=tag, p2=path: self.main._on_bookmark(
+                        "File Browser",
+                        {"File": p2.name, "Path": str(p2),
+                         "Size": fmt_size(p2.stat().st_size) if p2.is_file() else "",
+                         "Type": detect_type(str(p2)) if p2.is_file() else "Directory"},
+                        t))
 
         menu.exec(self.file_table.mapToGlobal(pos))
 
@@ -4346,7 +4332,7 @@ class ResultsTab(QWidget):
         for tag in ["Key Finding","Malware Indicator","Suspicious","Cleared",
                     "IOC","File of Interest","User Activity","Network Activity"]:
             bm.addAction(tag,
-                lambda t=tag: self.bookmark_requested.emit(
+                lambda _, t=tag: self.bookmark_requested.emit(
                     self._current_name, dict(rd), t))
 
         menu.addSeparator()
@@ -5291,132 +5277,74 @@ class EmailViewerTab(QWidget):
         self._messages = messages
 
     def _display_message(self, m):
-        """Display a pypff message object safely — every call wrapped in try/except."""
         self._current_msg = m
         msg = m.get("msg_obj")
         if not msg: return
 
-        def _s(fn, *args):
-            """Call a pypff method safely, return empty string on any error."""
-            try:
-                v = fn(*args)
-                return self._safe_str(v)
-            except Exception:
-                return ""
-
-        def _esc(s):
-            """HTML-escape a string for safe insertion into HTML."""
-            return (str(s).replace("&","&amp;").replace("<","&lt;")
-                          .replace(">","&gt;").replace('"',"&quot;"))
-
-        # ── Headers ──────────────────────────────────────────────────
-        sender_name  = _s(msg.get_sender_name)
-        sender_email = ""
-        try:   sender_email = _s(msg.get_sender_email_address)
-        except Exception: pass  # some pypff builds lack this method
-
-        from_str = _esc(sender_name)
-        if sender_email:
-            from_str += f" &lt;{_esc(sender_email)}&gt;"
-
-        hdr_lines = [f"<b>From:</b>&nbsp;&nbsp;&nbsp;{from_str}"]
-
+        # Headers
+        hdr_lines = [
+            f"<b>From:</b>    {self._safe_str(msg.get_sender_name())} "
+            f"&lt;{self._safe_str(msg.get_sender_email_address())}&gt;",
+        ]
         try:
             to_list = []
             for i in range(msg.get_number_of_recipients()):
-                try:
-                    r = msg.get_recipient(i)
-                    dn = _s(r.get_display_name)
-                    em = ""
-                    try: em = _s(r.get_email_address)
-                    except Exception: pass
-                    to_list.append(_esc(dn or em))
-                except Exception:
-                    pass
+                r = msg.get_recipient(i)
+                try: to_list.append(self._safe_str(r.get_display_name()) or
+                                    self._safe_str(r.get_email_address()))
+                except Exception: pass
             if to_list:
-                hdr_lines.append(f"<b>To:</b>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{'; '.join(to_list[:5])}")
-        except Exception:
-            pass
-
-        hdr_lines.append(f"<b>Subject:</b> {_esc(m.get('subject',''))}")
-        hdr_lines.append(f"<b>Date:</b>&nbsp;&nbsp;&nbsp;&nbsp;{_esc(str(m.get('date',''))[:24])}")
-
+                hdr_lines.append(f"<b>To:</b>       {'; '.join(to_list[:5])}")
+        except Exception: pass
+        hdr_lines.append(f"<b>Subject:</b>  {m['subject']}")
+        hdr_lines.append(f"<b>Date:</b>     {m['date'][:24] if m['date'] else ''}")
         self.header_box.setHtml(
-            "<div style='font-family:Segoe UI,Arial;font-size:9pt;line-height:1.5;'>"
+            f"<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"
             + "<br>".join(hdr_lines) + "</div>")
 
-        # ── Body ─────────────────────────────────────────────────────
-        displayed = False
-        # Try HTML body first
+        # Body
+        body = ""
         try:
             html_body = msg.get_html_body()
             if html_body:
-                decoded = (html_body.decode(errors='replace')
-                           if isinstance(html_body, bytes) else str(html_body))
-                if decoded.strip():
-                    self.body_view.setHtml(decoded)
-                    displayed = True
+                body = html_body.decode(errors='replace') if isinstance(html_body, bytes) else html_body
+                self.body_view.setHtml(body)
+            else:
+                raise ValueError("no html")
         except Exception:
-            pass
-
-        if not displayed:
-            # Try RTF body
-            try:
-                rtf = msg.get_rtf_body()
-                if rtf:
-                    decoded = (rtf.decode(errors='replace')
-                               if isinstance(rtf, bytes) else str(rtf))
-                    # Strip RTF tags crudely for plain display
-                    import re as _re
-                    text = _re.sub(r'\[a-z]+\d*\s?|[{}]', '', decoded)
-                    self.body_view.setPlainText(text[:50000])
-                    displayed = True
-            except Exception:
-                pass
-
-        if not displayed:
-            # Plain text body
             try:
                 plain = msg.get_plain_text_body()
                 if plain:
-                    decoded = (plain.decode(errors='replace')
-                               if isinstance(plain, bytes) else str(plain))
-                    self.body_view.setPlainText(decoded or "(empty body)")
-                    displayed = True
+                    body = plain.decode(errors='replace') if isinstance(plain, bytes) else str(plain)
+                self.body_view.setPlainText(body or "(empty body)")
             except Exception:
-                pass
+                self.body_view.setPlainText("(could not decode body)")
 
-        if not displayed:
-            self.body_view.setPlainText("(Could not decode message body)")
-
-        # ── Attachments ───────────────────────────────────────────────
+        # Attachments
         n_att = m.get("n_att", 0)
         self.attach_bar.setVisible(n_att > 0)
+        # Clear old attachment buttons
         while self._attach_lay.count():
             item = self._attach_lay.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            if item.widget(): item.widget().deleteLater()
         if n_att > 0:
             self.attach_label.setText(f"Attachments ({n_att}):")
             for i in range(n_att):
                 try:
-                    att   = msg.get_attachment(i)
-                    aname = _s(att.get_name) or f"attachment_{i}"
+                    att  = msg.get_attachment(i)
+                    aname = self._safe_str(att.get_name()) or f"attachment_{i}"
                     asize = 0
                     try: asize = att.get_size()
                     except Exception: pass
-                    btn = QPushButton(f"📎 {aname}  ({fmt_size(asize)})")
+                    btn = QPushButton(f"📎 {aname} ({fmt_size(asize)})")
                     btn.setFixedHeight(26)
                     btn.setStyleSheet(
                         f"QPushButton{{background:{C['bg3']};color:{C['fg']};"
                         f"border:1px solid {C['border']};border-radius:3px;"
                         f"padding:2px 8px;font-size:8pt;}}"
-                        f"QPushButton:hover{{background:{C['btn_hover']};"
-                        f"color:{C['accent']};}}")
-                    # Capture att by value at loop time
+                        f"QPushButton:hover{{background:{C['btn_hover']};color:{C['accent']};}}")
                     btn.clicked.connect(
-                        lambda _chk=False, a=att, n=aname:
-                            self._save_attachment(a, n))
+                        lambda _, a=att, n=aname: self._save_attachment(a, n))
                     self._attach_lay.addWidget(btn)
                 except Exception:
                     pass
@@ -5456,86 +5384,36 @@ class EmailViewerTab(QWidget):
             "_path":   path,
         }]
         self._render_msg_table(self._all_messages)
-        # Display immediately — keep msg open, store path for re-open on select
-        try:
-            self._display_msg_raw(msg)
-        except Exception as e:
-            self.body_view.setPlainText(f"[Preview error: {e}]")
-        finally:
-            try: msg.close()
-            except Exception: pass
+        # Display immediately
+        self._display_msg_raw(msg)
+        msg.close()
 
     def _display_msg_raw(self, msg):
-        """Display an extract_msg message object safely."""
-        def _esc(v):
-            s = str(v or "")
-            return (s.replace("&","&amp;").replace("<","&lt;")
-                     .replace(">","&gt;").replace('"',"&quot;"))
-        try:
-            self.header_box.setHtml(
-                "<div style='font-family:Segoe UI,Arial;font-size:9pt;line-height:1.5;'>"
-                f"<b>From:</b>&nbsp;&nbsp;&nbsp;{_esc(msg.sender)}<br>"
-                f"<b>To:</b>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{_esc(msg.to)}<br>"
-                f"<b>Subject:</b> {_esc(msg.subject)}<br>"
-                f"<b>Date:</b>&nbsp;&nbsp;&nbsp;&nbsp;{_esc(msg.date)}"
-                "</div>")
-        except Exception as e:
-            self.header_box.setPlainText(f"[Header error: {e}]")
-
-        try:
-            body = None
-            # Prefer HTML body
-            try:
-                hb = msg.htmlBody
-                if hb:
-                    body = hb.decode(errors='replace') if isinstance(hb, bytes) else str(hb)
-                    self.body_view.setHtml(body)
-            except Exception:
-                hb = None
-            if not hb:
-                # Plain text fallback
-                pb = msg.body
-                if pb:
-                    body = pb.decode(errors='replace') if isinstance(pb, bytes) else str(pb)
-                self.body_view.setPlainText(body or "(empty body)")
-        except Exception as e:
-            self.body_view.setPlainText(f"[Body error: {e}]")
-
-        try:
-            atts = msg.attachments
-            self.attach_bar.setVisible(bool(atts))
-            while self._attach_lay.count():
-                item = self._attach_lay.takeAt(0)
-                if item.widget(): item.widget().deleteLater()
-            for att in atts:
-                try:
-                    aname = att.longFilename or att.shortFilename or "attachment"
-                    btn   = QPushButton(f"📎 {aname}")
-                    btn.setFixedHeight(26)
-                    btn.clicked.connect(
-                        lambda _chk=False, a=att, n=aname:
-                            self._save_att_raw(a, n))
-                    self._attach_lay.addWidget(btn)
-                except Exception:
-                    pass
-            if atts:
-                self._attach_lay.addStretch()
-        except Exception:
-            self.attach_bar.setVisible(False)
-
-    def _display_msg_from_path(self, path):
-        """Safely re-open and display a .msg file by path (handle may be closed)."""
-        if not path or not os.path.isfile(path):
-            self.body_view.setPlainText("(MSG file not found)")
-            return
-        try:
-            import extract_msg
-            msg = extract_msg.openMsg(path)
-            self._display_msg_raw(msg)
-            try: msg.close()
-            except Exception: pass
-        except Exception as e:
-            self.body_view.setPlainText(f"[Cannot re-open MSG: {e}]")
+        """Display an extract_msg message object."""
+        self.header_box.setHtml(
+            f"<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"
+            f"<b>From:</b>    {msg.sender or ''}<br>"
+            f"<b>To:</b>      {msg.to or ''}<br>"
+            f"<b>Subject:</b> {msg.subject or ''}<br>"
+            f"<b>Date:</b>    {msg.date or ''}"
+            "</div>")
+        body = msg.htmlBody or msg.body or "(empty)"
+        if isinstance(body, bytes): body = body.decode(errors='replace')
+        if msg.htmlBody:
+            self.body_view.setHtml(body)
+        else:
+            self.body_view.setPlainText(body)
+        self.attach_bar.setVisible(len(msg.attachments) > 0)
+        while self._attach_lay.count():
+            item = self._attach_lay.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        for att in msg.attachments:
+            aname = att.longFilename or att.shortFilename or "attachment"
+            btn = QPushButton(f"📎 {aname}")
+            btn.setFixedHeight(26)
+            btn.clicked.connect(lambda _, a=att, n=aname: self._save_att_raw(a, n))
+            self._attach_lay.addWidget(btn)
+        if msg.attachments: self._attach_lay.addStretch()
 
     def _save_att_raw(self, att, name):
         dst, _ = QFileDialog.getSaveFileName(self, "Save Attachment", name)
@@ -5578,117 +5456,56 @@ class EmailViewerTab(QWidget):
         self._render_msg_table(self._all_messages)
 
     def _on_message_select(self, row, _col, _pr, _pc):
-        if row < 0: return
-        try:
-            # Use the UserRole index stored in col-0, not the visual row number.
-            # Visual row changes when the table is sorted; UserRole stays stable.
-            item0 = self.msg_table.item(row, 0)
-            if not item0: return
-            msg_idx = item0.data(Qt.ItemDataRole.UserRole)
-            # Locate the message dict by its stored index
-            m = next((x for x in self._all_messages if x.get("index") == msg_idx), None)
-            if m is None:
-                # Fallback: try direct list lookup
-                if row < len(self._messages):
-                    m = self._messages[row]
-                else:
-                    return
-            self._current_msg = m
-            if "_mbox_msg" in m:
-                self._display_mbox_msg(m["_mbox_msg"])
-            elif "_msg_raw" in m:
-                # Re-open the MSG file safely instead of using closed handle
-                self._display_msg_from_path(m.get("_path",""))
-            elif m.get("msg_obj"):
-                self._display_message(m)
-        except Exception as e:
-            self.body_view.setPlainText(f"[Display error: {e}]")
+        if row < 0 or row >= len(self._messages): return
+        m = self._messages[row]
+        self._current_msg = m
+        if "_mbox_msg" in m:
+            self._display_mbox_msg(m["_mbox_msg"])
+        elif "_msg_raw" in m:
+            self._display_msg_raw(m["_msg_raw"])
+        elif m.get("msg_obj"):
+            self._display_message(m)
 
     def _display_mbox_msg(self, msg):
-        """Display a mailbox.Message (MBOX/EML) safely with HTML escaping."""
-        def _hdr(key):
-            try:
-                v = msg.get(key, "") or ""
-                # Decode encoded header (e.g. =?utf-8?b?...?=)
-                import email.header as _eh
-                parts = _eh.decode_header(str(v))
-                decoded = ""
-                for part, enc in parts:
-                    if isinstance(part, bytes):
-                        decoded += part.decode(enc or "utf-8", errors="replace")
-                    else:
-                        decoded += str(part)
-                # HTML-escape for safe rendering
-                return (decoded.replace("&","&amp;").replace("<","&lt;")
-                                .replace(">","&gt;").replace('"',"&quot;"))
-            except Exception:
-                return ""
-
-        try:
-            self.header_box.setHtml(
-                "<div style='font-family:Segoe UI,Arial;font-size:9pt;line-height:1.5;'>"
-                f"<b>From:</b>&nbsp;&nbsp;&nbsp;{_hdr('From')}<br>"
-                f"<b>To:</b>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{_hdr('To')}<br>"
-                f"<b>Subject:</b> {_hdr('Subject')}<br>"
-                f"<b>Date:</b>&nbsp;&nbsp;&nbsp;&nbsp;{_hdr('Date')}"
-                "</div>")
-        except Exception as e:
-            self.header_box.setPlainText(f"[Header error: {e}]")
-
-        # Walk MIME parts for body and attachments
-        body      = ""
+        self.header_box.setHtml(
+            f"<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"
+            f"<b>From:</b>    {msg.get('From','')}<br>"
+            f"<b>To:</b>      {msg.get('To','')}<br>"
+            f"<b>Subject:</b> {msg.get('Subject','')}<br>"
+            f"<b>Date:</b>    {msg.get('Date','')}"
+            "</div>")
+        # Find body parts
+        body = ""
         html_body = ""
         attachments = []
-        try:
-            for part in msg.walk():
-                try:
-                    ct   = part.get_content_type()
-                    disp = part.get_content_disposition() or ""
-                    if "attachment" in disp:
-                        attachments.append(part)
-                        continue
-                    if ct == "text/html" and not html_body:
-                        raw = part.get_payload(decode=True)
-                        if raw:
-                            enc = part.get_content_charset() or "utf-8"
-                            html_body = raw.decode(enc, errors="replace")
-                    elif ct == "text/plain" and not body:
-                        raw = part.get_payload(decode=True)
-                        if raw:
-                            enc = part.get_content_charset() or "utf-8"
-                            body = raw.decode(enc, errors="replace")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        try:
-            if html_body:
-                self.body_view.setHtml(html_body)
-            else:
-                self.body_view.setPlainText(body or "(empty body)")
-        except Exception as e:
-            self.body_view.setPlainText(f"[Body render error: {e}]")
-
-        # Attachments bar
+        for part in msg.walk():
+            ct  = part.get_content_type()
+            disp = part.get_content_disposition() or ""
+            if "attachment" in disp:
+                attachments.append(part)
+                continue
+            if ct == "text/html" and not html_body:
+                try: html_body = part.get_payload(decode=True).decode(errors='replace')
+                except Exception: pass
+            elif ct == "text/plain" and not body:
+                try: body = part.get_payload(decode=True).decode(errors='replace')
+                except Exception: pass
+        if html_body:
+            self.body_view.setHtml(html_body)
+        else:
+            self.body_view.setPlainText(body or "(empty)")
         self.attach_bar.setVisible(bool(attachments))
         while self._attach_lay.count():
             item = self._attach_lay.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            if item.widget(): item.widget().deleteLater()
         for att in attachments:
-            try:
-                aname = att.get_filename() or "attachment"
-                btn   = QPushButton(f"📎 {aname}")
-                btn.setFixedHeight(26)
-                btn.clicked.connect(
-                    lambda _chk=False, a=att, n=aname:
-                        self._save_mbox_att(a, n))
-                self._attach_lay.addWidget(btn)
-            except Exception:
-                pass
-        if attachments:
-            self._attach_lay.addStretch()
+            aname = att.get_filename() or "attachment"
+            btn = QPushButton(f"📎 {aname}")
+            btn.setFixedHeight(26)
+            btn.clicked.connect(
+                lambda _, a=att, n=aname: self._save_mbox_att(a, n))
+            self._attach_lay.addWidget(btn)
+        if attachments: self._attach_lay.addStretch()
 
     def _save_mbox_att(self, part, name):
         dst, _ = QFileDialog.getSaveFileName(self,"Save Attachment",name)

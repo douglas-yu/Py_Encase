@@ -3716,7 +3716,7 @@ class EvidenceBrowser(QWidget):
                 for tag in ["Key Finding","File of Interest","Malware Indicator",
                             "Suspicious","IOC"]:
                     bm_sub2.addAction(tag,
-                        lambda t=tag, dd=_bm2: self.main._on_bookmark(
+                        lambda _, t=tag, dd=_bm2: self.main._on_bookmark(
                             "Image Browser",
                             {"Name":  dd["name"],
                              "Image": dd["image_path"],
@@ -3756,7 +3756,7 @@ class EvidenceBrowser(QWidget):
             for tag in ["Key Finding","File of Interest","Malware Indicator",
                         "Suspicious","IOC","Cleared"]:
                 bm_sub.addAction(tag,
-                    lambda t=tag, d=_bm_data: self.main._on_bookmark(
+                    lambda _, t=tag, d=_bm_data: self.main._on_bookmark(
                         "File Browser", dict(d), t))
 
         menu.exec(self.file_table.mapToGlobal(pos))
@@ -4346,7 +4346,7 @@ class ResultsTab(QWidget):
         for tag in ["Key Finding","Malware Indicator","Suspicious","Cleared",
                     "IOC","File of Interest","User Activity","Network Activity"]:
             bm.addAction(tag,
-                lambda t=tag: self.bookmark_requested.emit(
+                lambda _, t=tag: self.bookmark_requested.emit(
                     self._current_name, dict(rd), t))
 
         menu.addSeparator()

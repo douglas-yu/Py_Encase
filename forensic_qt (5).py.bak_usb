@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QMenuBar, QMenu, QFileDialog, QMessageBox, QDialog, QDialogButtonBox,
     QVBoxLayout, QHBoxLayout, QGridLayout, QScrollArea, QFrame, QProgressBar,
     QCheckBox, QComboBox, QGroupBox, QListWidget, QListWidgetItem, QSizePolicy,
-    QStackedWidget, QFormLayout, QSpinBox,  QToolButton, QAbstractItemView,
+    QStackedWidget, QFormLayout, QSpinBox, QToolButton, QAbstractItemView,
     QScrollBar,
 )
 from PyQt6.QtCore import (
@@ -2401,7 +2401,9 @@ class HexViewer(QWidget):
 class ContentViewer(QWidget):
     def __init__(self):
         super().__init__()
-        self._current_path = None
+        self._current_path  = None
+        self._current_bytes = b""
+        self._current_name  = ""
         self._setup()
 
     def _setup(self):
@@ -2490,6 +2492,15 @@ class ContentViewer(QWidget):
             btn.setChecked(m == mode)
         if self._current_path:
             self._load_for_mode(self._current_path, mode)
+        elif self._current_bytes:
+            # Bytes mode — serve from stored buffer
+            if mode == "Image":
+                self._load_image_from_bytes(self._current_bytes, self._current_name)
+            elif mode == "Strings":
+                self._load_strings_from_bytes(self._current_bytes)
+            elif mode == "Metadata":
+                self._load_meta_from_bytes(self._current_name, self._current_bytes)
+            # Text and Hex are already loaded in load_bytes()
 
     def load_path(self, path: str):
         self._current_path = path
@@ -2498,14 +2509,42 @@ class ContentViewer(QWidget):
         self._load_for_mode(path, mode)
 
     def load_bytes(self, data: bytes, name: str = ""):
+        """Load raw bytes — supports Text, Hex, Image, Strings modes."""
         self._current_path = None
+        self._current_bytes = data          # keep for Image/Strings modes
+        self._current_name  = name
         self.path_label.setText(name)
+
+        # Always load hex
         self.hex_view.load_data(data)
+
+        # Text decode
         try:
-            txt = data.decode("utf-8","replace")
+            txt = data.decode("utf-8", "replace")
             self.text_view.setPlainText(txt[:200_000])
-        except:
+        except Exception:
             self.text_view.setPlainText("[Binary data]")
+
+        # Image — try immediately so switching to Image tab works
+        self._load_image_from_bytes(data, name)
+
+        # Strings
+        self._load_strings_from_bytes(data)
+
+        # Metadata from bytes (basic)
+        self._load_meta_from_bytes(name, data)
+
+        # Switch to best mode for this content
+        ext = os.path.splitext(name)[1].lower()
+        image_exts = {".jpg",".jpeg",".png",".gif",".bmp",".tiff",".tif",
+                      ".webp",".ico",".svg"}
+        if ext in image_exts:
+            self._switch_mode("Image")
+        elif ext in (".txt",".log",".xml",".json",".csv",".html",".htm",
+                     ".py",".js",".sh",".bat",".ps1",".reg",".ini",".cfg"):
+            self._switch_mode("Text")
+        else:
+            self._switch_mode("Hex")
 
     def clear(self):
         self._current_path = None
@@ -2550,27 +2589,117 @@ class ContentViewer(QWidget):
             self.text_view.setPlainText(f"[Error: {e}]")
 
     def _load_image(self, path):
+        # Load image from a host filesystem path, delegate rendering to _render_pixmap.
         pix = QPixmap(path)
         if pix.isNull():
-            # Try raw bytes
             try:
-                with open(path,"rb") as f:
+                with open(path, "rb") as f:
                     data = f.read()
                 img = QImage.fromData(data)
                 if not img.isNull():
                     pix = QPixmap.fromImage(img)
-            except: pass
-        if pix.isNull():
+            except Exception:
+                pass
+        self._render_pixmap(pix)
+
+    def _render_pixmap(self, pix):
+        # Scale and display a QPixmap, or show error text if null.
+        if pix is None or pix.isNull():
             self.image_label.setText(
-                f'<span style="color:{C["fg2"]}">[ No image preview available ]</span>')
+                '<span style="color:#8b949e">[ No image preview ]</span>')
         else:
+            parent = self.image_label.parent()
+            w = max(parent.width()  - 20, 100) if parent else 600
+            h = max(parent.height() - 20, 100) if parent else 400
             scaled = pix.scaled(
-                self.image_label.parent().width() - 20,
-                self.image_label.parent().height() - 20,
+                w, h,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
             self.image_label.setPixmap(scaled)
+
+    def _load_image_from_bytes(self, data: bytes, name: str = ""):
+        # Load and display an image from raw bytes (forensic image files).
+        pix    = QPixmap()
+        loaded = False
+        if data:
+            try:
+                img = QImage.fromData(data)
+                if not img.isNull():
+                    pix    = QPixmap.fromImage(img)
+                    loaded = True
+            except Exception:
+                pass
+            if not loaded:
+                try:
+                    p2 = QPixmap()
+                    if p2.loadFromData(data):
+                        pix    = p2
+                        loaded = True
+                except Exception:
+                    pass
+            if not loaded:
+                try:
+                    import tempfile
+                    ext = os.path.splitext(name)[1] if name else ".bin"
+                    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tf:
+                        tf.write(data)
+                        tmp_path = tf.name
+                    pix = QPixmap(tmp_path)
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+                except Exception:
+                    pix = QPixmap()
+        self._render_pixmap(pix)
+
+    def _load_strings_from_bytes(self, data: bytes):
+        # Extract printable ASCII strings (>=4 chars) from raw bytes.
+        try:
+            strings = []
+            cur     = []
+            for b in data[:4 * 1024 * 1024]:
+                if 32 <= b < 127:
+                    cur.append(chr(b))
+                else:
+                    if len(cur) >= 4:
+                        strings.append("".join(cur))
+                    cur = []
+            if len(cur) >= 4:
+                strings.append("".join(cur))
+            header = "[%d strings found]\n\n" % len(strings)
+            self.strings_view.setPlainText(header + "\n".join(strings[:5000]))
+        except Exception as e:
+            self.strings_view.setPlainText("[Strings error: %s]" % e)
+
+    def _load_meta_from_bytes(self, name: str, data: bytes):
+        # Show basic metadata for a bytes buffer (no filesystem access needed).
+        self.meta_table.setRowCount(0)
+        self.meta_table.setColumnCount(2)
+        self.meta_table.setHorizontalHeaderLabels(["Property", "Value"])
+        hdr = self.meta_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        rows = [
+            ("Name",   name or "(unknown)"),
+            ("Size",   "%s  (%d bytes)" % (fmt_size(len(data)), len(data))),
+            ("Type",   detect_type_by_name(name) if name else "Unknown"),
+        ]
+        if data:
+            rows.append(("MD5",    hashlib.md5(data).hexdigest()))
+            rows.append(("SHA-256",hashlib.sha256(data).hexdigest()))
+            rows.append(("Header", " ".join("%02X" % b for b in data[:16])))
+        for prop, val in rows:
+            r = self.meta_table.rowCount()
+            self.meta_table.insertRow(r)
+            pi = QTableWidgetItem(str(prop))
+            pi.setForeground(QBrush(QColor(C["fg2"])))
+            vi = QTableWidgetItem(str(val))
+            vi.setForeground(QBrush(QColor(C["fg"])))
+            self.meta_table.setItem(r, 0, pi)
+            self.meta_table.setItem(r, 1, vi)
+
 
     def _load_meta(self, path):
         self.meta_table.setRowCount(0)
@@ -2622,7 +2751,7 @@ class ContentViewer(QWidget):
             if len(cur) >= 4:
                 strings.append("".join(cur))
             self.strings_view.setPlainText(
-                f"[{len(strings)} strings found]\n\n" + "\n".join(strings[:5000]))
+                "[%d strings found]\n\n" % len(strings) + "\n".join(strings[:5000]))
         except Exception as e:
             self.strings_view.setPlainText(f"[Error: {e}]")
 
@@ -3167,11 +3296,15 @@ class EvidenceBrowser(QWidget):
         # File list table
         self.file_table = QTableWidget(0, 6)
         self.file_table.setHorizontalHeaderLabels(
-            ["Name","Size","Type","Modified","Created","Permissions"])
+            ["Name","Size","Type","Modified","Created","Permissions",
+             "Path","Inode","MD5","SHA-256"])
         self.file_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for i in range(1,6):
+        for i in range(1, 10):
             self.file_table.horizontalHeader().setSectionResizeMode(
                 i, QHeaderView.ResizeMode.ResizeToContents)
+        # Hide hash columns by default — computed on demand
+        for col in (8, 9):
+            self.file_table.setColumnHidden(col, True)
         self.file_table.verticalHeader().setVisible(False)
         self.file_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.file_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -3601,41 +3734,63 @@ class EvidenceBrowser(QWidget):
         self.file_table.insertRow(row)
 
         icon = "📁" if is_dir else self._file_icon(name)
-        display = f"{icon}  {name}"
-        name_item = QTableWidgetItem(display)
+        name_item = QTableWidgetItem(f"{icon}  {name}")
         name_item.setData(Qt.ItemDataRole.UserRole, name)
         if is_dir:
             name_item.setForeground(QBrush(QColor(C['orange'])))
-
         self.file_table.setItem(row, 0, name_item)
 
         if entry and entry.exists():
             try:
                 s = entry.stat()
-                size_val = s.st_size if entry.is_file() else -1
-                size_item = QTableWidgetItem(fmt_size(s.st_size) if entry.is_file() else "")
-                size_item.setData(Qt.ItemDataRole.UserRole, size_val)
-                size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+                # Size
+                size_item = QTableWidgetItem(
+                    fmt_size(s.st_size) if entry.is_file() else "")
+                size_item.setData(Qt.ItemDataRole.UserRole,
+                                  s.st_size if entry.is_file() else -1)
+                size_item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 size_item.setForeground(QBrush(QColor(C['fg2'])))
                 self.file_table.setItem(row, 1, size_item)
 
+                # Type
                 ftype = "Directory" if entry.is_dir() else detect_type(str(entry))
                 t_item = QTableWidgetItem(ftype)
                 t_item.setForeground(QBrush(QColor(C['fg2'])))
                 self.file_table.setItem(row, 2, t_item)
 
+                # Modified
                 mod_item = QTableWidgetItem(fmt_ts(s.st_mtime))
                 mod_item.setForeground(QBrush(QColor(C['fg2'])))
                 self.file_table.setItem(row, 3, mod_item)
 
+                # Created
                 cre_item = QTableWidgetItem(fmt_ts(s.st_ctime))
                 cre_item.setForeground(QBrush(QColor(C['fg2'])))
                 self.file_table.setItem(row, 4, cre_item)
 
+                # Permissions
                 perm_item = QTableWidgetItem(oct(stat.S_IMODE(s.st_mode)))
                 perm_item.setForeground(QBrush(QColor(C['fg2'])))
                 self.file_table.setItem(row, 5, perm_item)
-            except: pass
+
+                # Full path
+                path_item = QTableWidgetItem(str(entry))
+                path_item.setForeground(QBrush(QColor(C['fg2'])))
+                self.file_table.setItem(row, 6, path_item)
+
+                # Inode
+                ino_item = QTableWidgetItem(str(s.st_ino))
+                ino_item.setForeground(QBrush(QColor(C['fg2'])))
+                self.file_table.setItem(row, 7, ino_item)
+
+                # MD5 / SHA-256 — empty placeholders, filled by Hash DB
+                self.file_table.setItem(row, 8, QTableWidgetItem(""))
+                self.file_table.setItem(row, 9, QTableWidgetItem(""))
+
+            except Exception:
+                pass
 
     def _file_icon(self, name):
         ext = Path(name).suffix.lower()
@@ -4724,118 +4879,122 @@ if __name__ == "__main__":
 '''
 
 class AgentTab(QWidget):
-    def __init__(self, art_tab: ArtifactTab):
+    def __init__(self, art_tab):
         super().__init__()
         self.art_tab = art_tab
-        self._code = ""
+        self._code   = ""
         self._setup()
 
     def _setup(self):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0,0,0,0)
-
         split = QSplitter(Qt.Orientation.Horizontal)
         split.setHandleWidth(2)
 
-        # ── Left config panel ──────────────────
+        # Left config panel
         cfg_scroll = QScrollArea()
         cfg_scroll.setWidgetResizable(True)
-        cfg_scroll.setMinimumWidth(300)
-        cfg_scroll.setMaximumWidth(380)
+        cfg_scroll.setMinimumWidth(310); cfg_scroll.setMaximumWidth(400)
         cfg_scroll.setStyleSheet(f"QScrollArea{{border:none;background:{C['bg2']}}}")
-
-        cfg = QWidget()
-        cfg.setStyleSheet(f"background:{C['bg2']};")
-        cl = QVBoxLayout(cfg)
-        cl.setContentsMargins(12,12,12,12)
-        cl.setSpacing(6)
+        cfg = QWidget(); cfg.setStyleSheet(f"background:{C['bg2']};")
+        cl  = QVBoxLayout(cfg)
+        cl.setContentsMargins(12,12,12,12); cl.setSpacing(5)
 
         def section(title):
             l = QLabel(title)
             l.setStyleSheet(
                 f"color:{C['accent']};font-weight:bold;font-size:9pt;"
-                f"border-bottom:1px solid {C['border']};padding-bottom:4px;"
-                f"margin-top:10px;"
-            )
+                f"border-bottom:1px solid {C['border']};padding-bottom:4px;margin-top:10px;")
             cl.addWidget(l)
 
         def field(label, attr, default="", password=False):
             cl.addWidget(QLabel(label))
             le = QLineEdit(default)
-            if password: le.setEchoMode(QLineEdit.EchoMode.Password)
+            if password:
+                le.setEchoMode(QLineEdit.EchoMode.Password)
             setattr(self, attr, le)
             cl.addWidget(le)
 
         section("CASE INFORMATION")
-        field("Case Name",    "f_case_name",   "Investigation-001")
-        field("Case ID",      "f_case_id",     "FC-2025-001")
-        field("Examiner",     "f_examiner",    "")
+        field("Case Name",      "f_case_name", "Investigation-001")
+        field("Case ID",        "f_case_id",   "FC-2025-001")
+        field("Examiner",       "f_examiner",  "")
 
-        section("DEPLOYMENT")
-        field("Output Dir (remote)", "f_output_dir", "/tmp/forensic_out")
-        field("C2 Server (host:port, optional)", "f_server", "")
+        section("AGENT OUTPUT")
+        field("Remote Output Dir",               "f_output_dir", "/tmp/forensic_out")
+        field("C2 Server (host:port, optional)", "f_server",     "")
 
         section("SSH DEPLOYMENT")
-        field("SSH Target (user@host)", "f_ssh_target", "")
-        field("SSH Password / Key Path","f_ssh_pass",   "", password=True)
+        field("SSH Target (user@host)",    "f_ssh_target", "")
+        field("SSH Password / Key Path",   "f_ssh_pass",   "", password=True)
+
+        section("SMB DEPLOYMENT  (Windows targets)")
+        field("SMB Host (IP or hostname)", "f_smb_host",  "")
+        field("SMB Username (DOMAIN\\user or user)", "f_smb_user", "")
+        field("SMB Password",              "f_smb_pass",  "", password=True)
+        field("SMB Share\\SubPath (e.g. C$\\Temp)", "f_smb_rpath", "C$\\Temp")
 
         section("AGENT OPTIONS")
-        cl.addWidget(QLabel("Agent Type"))
-        self.f_agent_type = QComboBox()
-        self.f_agent_type.addItems(["Python Script (.py)",
-                                     "Standalone EXE (PyInstaller)",
-                                     "Shell Script (.sh)"])
-        cl.addWidget(self.f_agent_type)
-
         cl.addWidget(QLabel("Artifact Preset"))
         self.f_preset = QComboBox()
-        self.f_preset.addItems(["Use Current Selection",
-                                  "Quick Triage",
-                                  "Full Collection",
-                                  "Incident Response",
-                                  "Malware Hunt"])
+        self.f_preset.addItems([
+            "Use Current Selection", "Quick Triage",
+            "Full Collection", "Incident Response", "Malware Hunt"])
         cl.addWidget(self.f_preset)
 
+        cl.addWidget(QLabel("Agent Format"))
+        self.f_format = QComboBox()
+        self.f_format.addItems([
+            "🐍  Python Script  (.py)   — universal",
+            "📜  Shell Script   (.sh)   — Linux / macOS",
+            "📜  Batch Script   (.bat)  — Windows",
+            "📜  PowerShell     (.ps1)  — Windows",
+            "⚡  Windows EXE    (.exe)  — via PyInstaller",
+        ])
+        cl.addWidget(self.f_format)
+
         section("ACTIONS")
-        for label, method in [
-            ("⚙  Generate Agent Code",  self._generate),
-            ("💾  Save Agent File…",     self._save),
-            ("🚀  Deploy via SSH",       self._deploy_ssh),
-            ("📥  Import Agent Results…",self._import_results),
+        for label, method, accent in [
+            ("\u2699  Generate Agent Code",   self._generate,      True),
+            ("\U0001f4be  Save Agent File\u2026",    self._save,          False),
+            ("\U0001f680  Deploy via SSH",          self._deploy_ssh,    False),
+            ("\U0001f5a5\ufe0f  Deploy via SMB",         self._deploy_smb,    False),
+            ("\U0001f4e5  Import Agent Results\u2026", self._import_results, False),
         ]:
             btn = QPushButton(label)
             btn.setFixedHeight(32)
-            if "Generate" in label: btn.setObjectName("accent")
-            btn.clicked.connect(method)
+            if accent:
+                btn.setObjectName("accent")
+            btn.clicked.connect(lambda _=False, m=method: m())
             cl.addWidget(btn)
 
         cl.addStretch()
         cfg_scroll.setWidget(cfg)
         split.addWidget(cfg_scroll)
 
-        # ── Right code panel ──────────────────
+        # Right: code preview
         right = QWidget()
         rl = QVBoxLayout(right)
-        rl.setContentsMargins(0,0,0,0)
-        rl.setSpacing(0)
-
-        rh = QLabel("  GENERATED AGENT CODE")
-        rh.setObjectName("section_header")
-        rl.addWidget(rh)
-
+        rl.setContentsMargins(0,0,0,0); rl.setSpacing(0)
+        hdr_w = QWidget()
+        hdr_w.setStyleSheet(f"background:{C['bg3']};border-bottom:1px solid {C['border']};")
+        hdrl  = QHBoxLayout(hdr_w)
+        hdrl.setContentsMargins(8,4,8,4)
+        hdrl.addWidget(QLabel("  GENERATED AGENT CODE"))
+        self._status_lbl = QLabel("")
+        self._status_lbl.setStyleSheet(f"color:{C['green']};font-size:8pt;")
+        hdrl.addWidget(self._status_lbl)
+        hdrl.addStretch()
+        rl.addWidget(hdr_w)
         self.code_edit = QPlainTextEdit()
         self.code_edit.setStyleSheet(
             f"background:{C['bg']};color:{C['green']};"
             f"font-family:'Consolas','Cascadia Code','Courier New',monospace;"
-            f"font-size:9pt;border:none;padding:8px;"
-        )
-        self.code_edit.setPlainText(
-            "# Configure the settings on the left,\n"
-            "# then click 'Generate Agent Code'.\n"
-        )
+            f"font-size:9pt;border:none;padding:8px;")
+        self.code_edit.setPlainText("# Configure settings on the left, then click Generate.\n")
         rl.addWidget(self.code_edit)
         split.addWidget(right)
-        split.setSizes([340, 900])
+        split.setSizes([360, 900])
         lay.addWidget(split)
 
     def _get_artifacts(self):
@@ -4858,65 +5017,363 @@ class AgentTab(QWidget):
 
     def _generate(self):
         arts = self._get_artifacts()
-        ts   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._code = AGENT_TEMPLATE.format(
-            version       = APP_VERSION,
-            timestamp     = ts,
-            case_name     = self.f_case_name.text() or "Case",
-            case_id       = self.f_case_id.text() or "FC-001",
-            examiner      = self.f_examiner.text() or "Examiner",
-            artifacts_brief = ", ".join(arts[:5]) + (f" +{len(arts)-5} more" if len(arts)>5 else ""),
-            artifacts_json  = json.dumps(arts),
-            output_dir    = self.f_output_dir.text() or "/tmp/forensic_out",
-            server        = self.f_server.text() or "",
-        )
-        self.code_edit.setPlainText(self._code)
+        if not arts:
+            QMessageBox.warning(self, "No Artifacts",
+                "No artifacts selected. Choose a preset or visit Artifact Selection tab.")
+            return
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            self._code = AGENT_TEMPLATE.format(
+                version         = APP_VERSION,
+                timestamp       = ts,
+                case_name       = self.f_case_name.text() or "Case",
+                case_id         = self.f_case_id.text()   or "FC-001",
+                examiner        = self.f_examiner.text()  or "Examiner",
+                artifacts_brief = (", ".join(arts[:5]) +
+                                   (" +%d more" % (len(arts)-5) if len(arts)>5 else "")),
+                artifacts_json  = json.dumps(arts),
+                output_dir      = self.f_output_dir.text() or "/tmp/forensic_out",
+                server          = self.f_server.text() or "",
+            )
+            self.code_edit.setPlainText(self._code)
+            self._status_lbl.setText(
+                "Generated: %d artifacts, %d lines" % (
+                    len(arts), len(self._code.splitlines())))
+            self._status_lbl.setStyleSheet(f"color:{C['green']};font-size:8pt;")
+        except Exception as e:
+            import traceback
+            print("[_generate]", traceback.format_exc())
+            self._status_lbl.setText("Error: " + str(e)[:60])
+            self._status_lbl.setStyleSheet(f"color:{C['red']};font-size:8pt;")
+            QMessageBox.critical(self, "Generate Error", str(e))
 
     def _save(self):
+        """Save the generated agent in the format chosen by the Agent Format combo."""
         if not self._code:
-            QMessageBox.warning(self,"Generate First","Generate the agent code first."); return
-        path, _ = QFileDialog.getSaveFileName(self,"Save Agent","forensic_agent.py",
-                                               "Python (*.py);;Shell (*.sh);;All (*)")
-        if path:
-            with open(path,"w") as f: f.write(self._code)
-            try: shutil.copy(path, f"/mnt/user-data/outputs/{os.path.basename(path)}")
-            except: pass
-            QMessageBox.information(self,"Saved",f"Agent saved:\n{path}")
+            QMessageBox.warning(self, "Generate First",
+                "Generate the agent code first.")
+            return
+        fmt = getattr(self, "f_format", None)
+        fmt_idx = fmt.currentIndex() if fmt else 0   # default: Python
+        cid = (self.f_case_id.text() or "FC001").replace(" ", "_")
+        ver = APP_VERSION
+        _meta = {
+            0: ("forensic_agent_%s.py"  % cid, "Python Script (*.py);;All (*)"),
+            1: ("forensic_agent_%s.sh"  % cid, "Shell Script (*.sh);;All (*)"),
+            2: ("forensic_agent_%s.bat" % cid, "Batch Script (*.bat);;All (*)"),
+            3: ("forensic_agent_%s.ps1" % cid, "PowerShell (*.ps1);;All (*)"),
+            4: ("forensic_agent_%s.exe" % cid, "Windows EXE (*.exe);;All (*)"),
+        }
+        default_name, filt = _meta.get(fmt_idx, _meta[0])
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Agent", default_name, filt)
+        if not path:
+            return
+        try:
+            if fmt_idx == 0:
+                content = self._code
+            elif fmt_idx == 1:
+                content = self._make_sh_wrapper(self._code, cid, ver)
+            elif fmt_idx == 2:
+                content = self._make_bat_wrapper(self._code, cid, ver)
+            elif fmt_idx == 3:
+                content = self._make_ps1_wrapper(self._code, cid, ver)
+            elif fmt_idx == 4:
+                self._compile_exe(path, cid)
+                return   # _compile_exe shows its own dialog
+            # Write text content (use newline="" to preserve \r\n in BAT wrappers)
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(content)
+            try:
+                shutil.copy(path,
+                    "/mnt/user-data/outputs/" + os.path.basename(path))
+            except Exception:
+                pass
+            QMessageBox.information(self, "Saved", "Agent saved:\n" + path)
+        except Exception as ex:
+            QMessageBox.critical(self, "Save Error", str(ex))
+
+    # ── Agent format wrapper / compile helpers ────────────────────────────────
+
+    def _make_sh_wrapper(self, python_code, case_id, version):
+        """
+        Embed the Python source in a self-executing shell script via heredoc.
+        The heredoc delimiter uses a unique case-based string to avoid conflicts.
+        Deploy on Linux/macOS as root:  sh <script>
+        """
+        delim = "FORENSICPRO_%s_HEREDOC_END" % case_id.replace("-", "_").upper()
+        return (
+            "#!/bin/sh\n"
+            "# ForensicPro Remote Agent Launcher  [Shell Script]\n"
+            "# Generated by ForensicPro v%s  |  Case: %s\n"
+            "# Deploy on Linux / macOS target (run as root):\n"
+            "#   chmod +x <script> && ./<script>\n"
+            "_TMP=$(mktemp /tmp/fpa_XXXX.py 2>/dev/null"
+            " || echo /tmp/fpa_%s_$$.py)\n"
+            "cat > \"$_TMP\" <<'%s'\n"
+            "%s\n"
+            "%s\n"
+            "python3 \"$_TMP\" \"$@\"\n"
+            "_rc=$?; rm -f \"$_TMP\"; exit $_rc\n"
+        ) % (version, case_id, case_id, delim, python_code, delim)
+
+    def _make_bat_wrapper(self, python_code, case_id, version):
+        """
+        Embed base64-encoded Python in a Windows Batch launcher.
+        Uses PowerShell (available on Win 7+) to decode and write the .py file.
+        Deploy on Windows (run as Administrator):  cmd /c <script>
+        """
+        import base64 as _b64
+        b64 = _b64.b64encode(python_code.encode("utf-8")).decode("ascii")
+        # Split into 70-char lines; base64 chars are all alphanumeric / + / = so
+        # no BAT special-character escaping is needed
+        chunks = [b64[i:i+70] for i in range(0, len(b64), 70)]
+        # First chunk uses > (create), subsequent use >> (append)
+        echo_lines = "\r\n".join(
+            ("echo %s> \"%%_B%%\"" % c if i == 0
+             else "echo %s>> \"%%_B%%\"" % c)
+            for i, c in enumerate(chunks)
+        )
+        return (
+            "@echo off\r\n"
+            ":: ForensicPro Remote Agent Launcher  [Batch Script]\r\n"
+            ":: Generated by ForensicPro v%s  |  Case: %s\r\n"
+            ":: Deploy on Windows target (run as Administrator):\r\n"
+            "::   cmd /c %s.bat\r\n"
+            "setlocal\r\n"
+            "set \"_B=%%TEMP%%\\fpa_%s.b64\"\r\n"
+            "set \"_P=%%TEMP%%\\fpa_%s.py\"\r\n"
+            "%s\r\n"
+            "powershell -NoProfile -Command \"$b=[IO.File]::"
+            "ReadAllText('%%_B%%') -replace '\\s';"
+            "[IO.File]::WriteAllBytes('%%_P%%',[Convert]::"
+            "FromBase64String($b))\"\r\n"
+            "del \"%%_B%%\" 2>nul\r\n"
+            "python \"%%_P%%\"\r\n"
+            "del \"%%_P%%\" 2>nul\r\n"
+            "endlocal\r\n"
+        ) % (version, case_id, case_id, case_id, case_id, echo_lines)
+
+    def _make_ps1_wrapper(self, python_code, case_id, version):
+        """
+        Embed Python source in a PowerShell here-string launcher.
+        @'...'@ is fully literal (no variable / command expansion).
+        Deploy on Windows (run as Administrator):\n
+          powershell -ExecutionPolicy Bypass -File <script>
+        """
+        return (
+            "# ForensicPro Remote Agent Launcher  [PowerShell Script]\n"
+            "# Generated by ForensicPro v%s  |  Case: %s\n"
+            "# Deploy on Windows target (run as Administrator):\n"
+            "#   powershell -ExecutionPolicy Bypass -File <script>\n"
+            "$code = @'\n"
+            "%s\n"
+            "'@\n"
+            "$tmp = Join-Path $env:TEMP 'forensic_agent_%s.py'\n"
+            "[IO.File]::WriteAllText($tmp, $code, [Text.Encoding]::UTF8)\n"
+            "& python $tmp @args\n"
+            "Remove-Item $tmp -Force -ErrorAction SilentlyContinue\n"
+        ) % (version, case_id, python_code, case_id)
+
+    def _compile_exe(self, dest_path, case_id):
+        """
+        Compile the Python agent to a standalone Windows .exe via PyInstaller.
+        Runs in a background thread; shows an info or error dialog when done.
+        Requires:  pip install pyinstaller
+        """
+        code_snapshot = self._code
+
+        def _run():
+            import tempfile, subprocess as _sp, shutil as _sh
+            tmp_dir = tempfile.mkdtemp(prefix="forensicpro_build_")
+            py_src  = os.path.join(tmp_dir, "forensic_agent_%s.py" % case_id)
+            try:
+                with open(py_src, "w", encoding="utf-8") as f:
+                    f.write(code_snapshot)
+                res = _sp.run(
+                    [sys.executable, "-m", "PyInstaller",
+                     "--onefile", "--clean", "--noconfirm",
+                     "--name", "forensic_agent_%s" % case_id,
+                     "--distpath", tmp_dir,
+                     py_src],
+                    capture_output=True, text=True, timeout=300)
+                exe_built = os.path.join(tmp_dir, "forensic_agent_%s.exe" % case_id)
+                if res.returncode == 0 and os.path.isfile(exe_built):
+                    _sh.copy2(exe_built, dest_path)
+                    try:
+                        _sh.copy2(dest_path,
+                            "/mnt/user-data/outputs/" + os.path.basename(dest_path))
+                    except Exception:
+                        pass
+                    QMessageBox.information(None, "EXE Built",
+                        "Agent compiled successfully:\n" + dest_path)
+                else:
+                    QMessageBox.critical(None, "PyInstaller Error",
+                        "Build failed (exit %d):\n%s" % (
+                            res.returncode,
+                            (res.stdout + "\n" + res.stderr)[-1500:]))
+            except FileNotFoundError:
+                QMessageBox.critical(None, "Missing Dependency",
+                    "PyInstaller not found.\n"
+                    "Install it first:\n  pip install pyinstaller")
+            except Exception as ex:
+                QMessageBox.critical(None, "EXE Compile Error", str(ex))
+            finally:
+                try:
+                    _sh.rmtree(tmp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+        QMessageBox.information(self, "Building EXE…",
+            "PyInstaller is compiling the agent.\n"
+            "This may take 30–120 seconds.\n"
+            "A dialog will appear when the build completes.")
+        threading.Thread(target=_run, daemon=True).start()
 
     def _deploy_ssh(self):
-        target = self.f_ssh_target.text()
+        target = self.f_ssh_target.text().strip()
         if not target:
-            QMessageBox.warning(self,"SSH","Enter SSH target (user@host)."); return
+            QMessageBox.warning(self,"SSH","Enter SSH target (user@host).")
+            return
         if not self._code:
-            QMessageBox.warning(self,"Generate","Generate the agent first."); return
-        try: import paramiko
+            QMessageBox.warning(self,"Generate","Generate the agent first.")
+            return
+        try:
+            import paramiko
         except ImportError:
-            QMessageBox.critical(self,"Missing","Install paramiko:\npip install paramiko"); return
+            QMessageBox.critical(self,"Missing","Install paramiko:\n  pip install paramiko")
+            return
 
         def run():
             try:
-                user, host = target.split("@") if "@" in target else ("root", target)
-                client = paramiko.SSHClient()
+                user, host = (target.split("@",1) if "@" in target else ("root", target))
+                client  = paramiko.SSHClient()
                 client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                passwd = self.f_ssh_pass.text() or None
-                client.connect(host, username=user, password=passwd, timeout=15)
-                sftp = client.open_sftp()
-                rpath = f"/tmp/forensic_agent_{self.f_case_id.text()}.py"
-                with sftp.open(rpath,"w") as rf: rf.write(self._code)
+                passwd   = self.f_ssh_pass.text() or None
+                key_path = None
+                if passwd and os.path.isfile(passwd):
+                    key_path = passwd; passwd = None
+                kw = dict(username=user, timeout=15)
+                if key_path: kw["key_filename"] = key_path
+                else:        kw["password"]     = passwd
+                client.connect(host, **kw)
+                sftp    = client.open_sftp()
+                case_id = self.f_case_id.text() or "FC001"
+                rpath   = "/tmp/forensic_agent_%s.py" % case_id
+                with sftp.open(rpath,"w") as rf:
+                    rf.write(self._code)
                 sftp.chmod(rpath, 0o755)
-                _, out, err = client.exec_command(f"python3 {rpath} &")
-                stdout_data = out.read().decode()
+                _, out, _ = client.exec_command("nohup python3 %s &" % rpath)
+                stdout_data = out.read(4096).decode(errors="replace")
                 client.close()
-                QMessageBox.information(None,"Deployed",
-                    f"Agent deployed to {target}\nPath: {rpath}\n\n{stdout_data[:400]}")
+                QMessageBox.information(None,"SSH Deployed",
+                    "Agent deployed to %s\nRemote path: %s\n\nOutput:\n%s" % (
+                        target, rpath, stdout_data[:500]))
             except Exception as e:
-                QMessageBox.critical(None,"SSH Error", str(e))
+                QMessageBox.critical(None,"SSH Error",str(e))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _deploy_smb(self):
+        smb_host  = self.f_smb_host.text().strip()
+        smb_user  = self.f_smb_user.text().strip()
+        smb_pass  = self.f_smb_pass.text()
+        smb_rpath = self.f_smb_rpath.text().strip() or "C$\\Temp"
+
+        if not smb_host:
+            QMessageBox.warning(self,"SMB","Enter SMB host (IP or hostname).")
+            return
+        if not self._code:
+            QMessageBox.warning(self,"Generate","Generate the agent first.")
+            return
+
+        case_id    = self.f_case_id.text() or "FC001"
+        agent_name = "forensic_agent_%s.py" % case_id
+
+        def _parse_smb():
+            host  = smb_host.lstrip("\\").split("\\")[0].split("/")[0]
+            parts = smb_rpath.split("\\")
+            share = parts[0] if parts else "C$"
+            sub   = "\\".join(parts[1:]) if len(parts)>1 else "Temp"
+            domain = smb_user.split("\\")[0] if "\\" in smb_user else ""
+            user   = smb_user.split("\\")[-1]
+            return host, share, sub, user, domain
+
+        def run():
+            host, share, sub, user, domain = _parse_smb()
+            success  = False
+            last_err = ""
+
+            # Method A: impacket
+            try:
+                import impacket.smbconnection as _smbc
+                import io as _io
+                conn = _smbc.SMBConnection(host, host, sess_port=445, timeout=15)
+                conn.login(user, smb_pass, domain)
+                remote_rel = (sub + "\\" + agent_name).lstrip("\\")
+                data = self._code.encode("utf-8")
+                conn.putFile(share, remote_rel, _io.BytesIO(data).read)
+                conn.logoff()
+                success = True
+                last_err = ("Agent deployed via impacket SMB\n"
+                            "Host: %s  Share: %s  Path: %s\\%s" % (
+                                host, share, sub, agent_name))
+            except ImportError:
+                last_err = "impacket not installed"
+            except Exception as e:
+                last_err = "impacket: " + str(e)
+
+            # Method B: smbclient CLI
+            if not success:
+                try:
+                    import tempfile, subprocess as _sp
+                    tmp = tempfile.NamedTemporaryFile(
+                        suffix=".py", delete=False, mode="w", encoding="utf-8")
+                    tmp.write(self._code); tmp.close()
+                    smb_remote = "/" + sub.replace("\\","/") + "/" + agent_name
+                    cmd = ["smbclient",
+                           "//%s/%s" % (host, share),
+                           "-U", "%s%%%s" % (smb_user, smb_pass),
+                           "-c", 'put "%s" "%s"' % (tmp.name, smb_remote)]
+                    r = _sp.run(cmd, capture_output=True, text=True, timeout=20)
+                    os.unlink(tmp.name)
+                    if r.returncode == 0:
+                        success = True
+                        last_err = ("Agent deployed via smbclient\n"
+                                    "\\\\%s\\%s\\%s\\%s" % (
+                                        host, share, sub, agent_name))
+                    else:
+                        last_err = "smbclient: " + r.stderr[:200]
+                except FileNotFoundError:
+                    last_err = "smbclient not found (apt install samba-client)"
+                except Exception as e:
+                    last_err = "smbclient: " + str(e)
+
+            # Method C: Windows UNC direct copy
+            if not success and platform.system() == "Windows":
+                try:
+                    unc = "\\\\%s\\%s\\%s\\%s" % (host, share, sub, agent_name)
+                    with open(unc,"w",encoding="utf-8") as f:
+                        f.write(self._code)
+                    success  = True
+                    last_err = "Agent copied via UNC:\n" + unc
+                except Exception as e:
+                    last_err = "UNC: " + str(e)
+
+            if success:
+                QMessageBox.information(None,"SMB Deployed", last_err)
+            else:
+                QMessageBox.critical(None,"SMB Failed",
+                    "All SMB methods failed.\nLast error: " + last_err +
+                    "\n\nInstall one of:\n"
+                    "  pip install impacket\n"
+                    "  apt install samba-client")
 
         threading.Thread(target=run, daemon=True).start()
 
     def _import_results(self):
-        path, _ = QFileDialog.getOpenFileName(self,"Import Agent Results","",
-                                               "JSON/ZIP (*.json *.zip);;All (*)")
+        path, _ = QFileDialog.getOpenFileName(
+            self,"Import Agent Results","","JSON/ZIP (*.json *.zip);;All (*)")
         if not path: return
         try:
             if path.endswith(".zip"):
@@ -4928,49 +5385,9 @@ class AgentTab(QWidget):
                 with open(path) as f: data = json.load(f)
             return data
         except Exception as e:
-            QMessageBox.critical(self,"Import Error", str(e))
+            QMessageBox.critical(self,"Import Error",str(e))
             return None
 
-
-# ══════════════════════════════════════════════════════════════
-#  NEW / OPEN CASE DIALOG
-# ══════════════════════════════════════════════════════════════
-
-class CaseDialog(QDialog):
-    def __init__(self, parent=None, existing=None):
-        super().__init__(parent)
-        self.setWindowTitle("Case Properties")
-        self.setFixedSize(420, 280)
-        self.setStyleSheet(STYLESHEET)
-        lay = QVBoxLayout(self)
-
-        form = QFormLayout()
-        self.f_name   = QLineEdit(existing.get("name","New Investigation") if existing else "New Investigation")
-        self.f_number = QLineEdit(existing.get("number","FC-2025-001") if existing else "FC-2025-001")
-        self.f_examiner = QLineEdit(existing.get("examiner","") if existing else "")
-        self.f_notes  = QLineEdit(existing.get("notes","") if existing else "")
-        form.addRow("Case Name:",   self.f_name)
-        form.addRow("Case Number:", self.f_number)
-        form.addRow("Examiner:",    self.f_examiner)
-        form.addRow("Notes:",       self.f_notes)
-        lay.addLayout(form)
-
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
-                                QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        lay.addWidget(btns)
-
-    def values(self):
-        return {"name":self.f_name.text(),"number":self.f_number.text(),
-                "examiner":self.f_examiner.text(),"notes":self.f_notes.text()}
-
-
-
-# ══════════════════════════════════════════════════════════════
-#  EMAIL VIEWER TAB  (PST/OST via pypff, MSG via extract_msg,
-#                     MBOX via mailbox stdlib)
-# ══════════════════════════════════════════════════════════════
 
 class EmailViewerTab(QWidget):
     """
@@ -4991,75 +5408,73 @@ class EmailViewerTab(QWidget):
         lay.setContentsMargins(0,0,0,0)
         lay.setSpacing(0)
 
-        # ── Top toolbar ──────────────────────────────────────────────
+        # ── Toolbar ──────────────────────────────────────────────────
         tb = QWidget()
         tb.setStyleSheet(f"background:{C['bg3']};border-bottom:1px solid {C['border']};")
+        tb.setMaximumHeight(50)
         tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(8,4,8,4)
-        tbl.setSpacing(6)
-
+        tbl.setContentsMargins(8,4,8,4); tbl.setSpacing(6)
         open_btn = QPushButton("📂 Open Email File…")
         open_btn.clicked.connect(self._open_dialog)
         tbl.addWidget(open_btn)
-
         self.file_label = QLabel("No file loaded")
         self.file_label.setStyleSheet(f"color:{C['fg2']};font-size:9pt;")
         tbl.addWidget(self.file_label, 1)
-
         self.msg_count_label = QLabel("")
         self.msg_count_label.setStyleSheet(f"color:{C['accent']};font-size:9pt;")
         tbl.addWidget(self.msg_count_label)
-
         export_btn = QPushButton("💾 Export Selected")
         export_btn.clicked.connect(self._export_selected)
         tbl.addWidget(export_btn)
-
-        search_edit = QLineEdit()
-        search_edit.setPlaceholderText("Search messages…")
-        search_edit.setFixedWidth(200)
-        search_edit.textChanged.connect(self._filter_messages)
-        self._search_edit = search_edit
-        tbl.addWidget(search_edit)
-
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search messages…")
+        self._search_edit.setFixedWidth(200)
+        self._search_edit.textChanged.connect(self._filter_messages)
+        tbl.addWidget(self._search_edit)
         lay.addWidget(tb)
 
-        # ── Three-pane splitter ───────────────────────────────────────
-        h_split = QSplitter(Qt.Orientation.Horizontal)
-        h_split.setHandleWidth(2)
+        # ── Main layout: left folder tree | right vertical split ──────
+        main_split = QSplitter(Qt.Orientation.Horizontal)
+        main_split.setHandleWidth(2)
 
-        # Left: folder tree
+        # ── LEFT: folder tree ─────────────────────────────────────────
         folder_w = QWidget()
         folder_w.setMinimumWidth(160)
-        folder_w.setMaximumWidth(280)
+        folder_w.setMaximumWidth(260)
+        folder_w.setStyleSheet(f"background:{C['sidebar']};")
         fl = QVBoxLayout(folder_w)
-        fl.setContentsMargins(0,0,0,0)
-        fl.setSpacing(0)
+        fl.setContentsMargins(0,0,0,0); fl.setSpacing(0)
         fh = QLabel("  FOLDERS")
         fh.setObjectName("section_header")
         fl.addWidget(fh)
         self.folder_tree = QTreeWidget()
         self.folder_tree.setHeaderHidden(True)
         self.folder_tree.setStyleSheet(
-            f"QTreeWidget{{background:{C['sidebar']};border:none;}}")
+            f"QTreeWidget{{background:{C['sidebar']};border:none;}}"
+            f"QTreeWidget::item{{padding:3px 4px;}}"
+            f"QTreeWidget::item:selected{{background:{C['sel']};color:{C['accent']};}}"
+            f"QTreeWidget::item:hover{{background:{C['bg3']};}}")
         self.folder_tree.currentItemChanged.connect(self._on_folder_select)
         fl.addWidget(self.folder_tree)
-        h_split.addWidget(folder_w)
+        main_split.addWidget(folder_w)
 
-        # Middle: message list
-        mid_w = QWidget()
-        mid_w.setMinimumWidth(300)
-        ml = QVBoxLayout(mid_w)
-        ml.setContentsMargins(0,0,0,0)
-        ml.setSpacing(0)
-        mh = QLabel("  MESSAGES")
-        mh.setObjectName("section_header")
-        ml.addWidget(mh)
+        # ── RIGHT: vertical splitter (message list top | detail bottom) ──
+        right_split = QSplitter(Qt.Orientation.Vertical)
+        right_split.setHandleWidth(3)
+
+        # TOP: message list table
+        msg_w = QWidget()
+        ml = QVBoxLayout(msg_w)
+        ml.setContentsMargins(0,0,0,0); ml.setSpacing(0)
+        msg_hdr = QLabel("  MESSAGES")
+        msg_hdr.setObjectName("section_header")
+        ml.addWidget(msg_hdr)
         self.msg_table = QTableWidget(0, 5)
         self.msg_table.setHorizontalHeaderLabels(
-            ["From","Subject","Date","Size","Attachments"])
+            ["From","Subject","Date","Size","Att."])
         self.msg_table.horizontalHeader().setSectionResizeMode(
             1, QHeaderView.ResizeMode.Stretch)
-        for c in (0,2,3,4):
+        for c in (0, 2, 3, 4):
             self.msg_table.horizontalHeader().setSectionResizeMode(
                 c, QHeaderView.ResizeMode.ResizeToContents)
         self.msg_table.verticalHeader().setVisible(False)
@@ -5070,34 +5485,35 @@ class EmailViewerTab(QWidget):
         self.msg_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.msg_table.customContextMenuRequested.connect(self._msg_ctx)
         ml.addWidget(self.msg_table)
-        h_split.addWidget(mid_w)
+        right_split.addWidget(msg_w)
 
-        # Right: message content
-        right_w = QWidget()
-        rl = QVBoxLayout(right_w)
-        rl.setContentsMargins(0,0,0,0)
-        rl.setSpacing(0)
+        # BOTTOM: message detail (metadata panel top, body bottom)
+        detail_w = QWidget()
+        dl = QVBoxLayout(detail_w)
+        dl.setContentsMargins(0,0,0,0); dl.setSpacing(0)
 
-        rh = QLabel("  MESSAGE")
-        rh.setObjectName("section_header")
-        rl.addWidget(rh)
-
-        # Header area
+        # Metadata panel (From/To/Subject/Date)
+        meta_hdr = QLabel("  MESSAGE DETAILS")
+        meta_hdr.setObjectName("section_header")
+        dl.addWidget(meta_hdr)
         self.header_box = QTextEdit()
         self.header_box.setReadOnly(True)
-        self.header_box.setMaximumHeight(120)
+        self.header_box.setFixedHeight(100)
         self.header_box.setStyleSheet(
             f"background:{C['bg2']};color:{C['fg']};font-size:9pt;"
             f"border:none;border-bottom:1px solid {C['border']};padding:6px;")
-        rl.addWidget(self.header_box)
+        dl.addWidget(self.header_box)
 
         # Body
+        body_hdr = QLabel("  MESSAGE BODY")
+        body_hdr.setObjectName("section_header")
+        dl.addWidget(body_hdr)
         self.body_view = QTextEdit()
         self.body_view.setReadOnly(True)
         self.body_view.setStyleSheet(
             f"background:{C['bg']};color:{C['fg']};"
             f"font-size:9pt;border:none;padding:8px;")
-        rl.addWidget(self.body_view, 1)
+        dl.addWidget(self.body_view, 1)
 
         # Attachments bar
         self.attach_bar = QWidget()
@@ -5105,37 +5521,35 @@ class EmailViewerTab(QWidget):
             f"background:{C['bg2']};border-top:1px solid {C['border']};")
         self.attach_bar.setVisible(False)
         abl = QHBoxLayout(self.attach_bar)
-        abl.setContentsMargins(8,4,8,4)
-        abl.setSpacing(6)
+        abl.setContentsMargins(8,4,8,4); abl.setSpacing(6)
         self.attach_label = QLabel("Attachments:")
         self.attach_label.setStyleSheet(f"color:{C['fg2']};font-size:8pt;")
         abl.addWidget(self.attach_label)
         self.attach_scroll = QScrollArea()
         self.attach_scroll.setWidgetResizable(True)
         self.attach_scroll.setFixedHeight(40)
-        self.attach_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-        self.attach_scroll.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.attach_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.attach_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.attach_scroll.setStyleSheet("border:none;background:transparent;")
         self._attach_inner = QWidget()
         self._attach_lay   = QHBoxLayout(self._attach_inner)
         self._attach_lay.setContentsMargins(0,0,0,0)
         self.attach_scroll.setWidget(self._attach_inner)
         abl.addWidget(self.attach_scroll, 1)
-        rl.addWidget(self.attach_bar)
+        dl.addWidget(self.attach_bar)
 
-        h_split.addWidget(right_w)
-        h_split.setSizes([200, 380, 600])
-        lay.addWidget(h_split)
+        right_split.addWidget(detail_w)
+        right_split.setSizes([280, 420])
+        main_split.addWidget(right_split)
+        main_split.setSizes([210, 900])
+        lay.addWidget(main_split)
 
         # Internal state
-        self._messages      = []   # list of message dicts for current folder
-        self._all_messages  = []   # unfiltered
-        self._current_msg   = None
-        self._folder_map    = {}   # tree item -> folder object
+        self._messages     = []
+        self._all_messages = []
+        self._current_msg  = None
+        self._folder_map   = {}
 
-    # ── Open file ────────────────────────────────────────────────────
     def _open_dialog(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Email File", "",
@@ -5740,15 +6154,152 @@ class EmailViewerTab(QWidget):
     def _msg_ctx(self, pos):
         row = self.msg_table.rowAt(pos.y())
         if row < 0: return
+        # Get message dict safely via UserRole
+        item0 = self.msg_table.item(row, 0)
+        msg_idx = item0.data(Qt.ItemDataRole.UserRole) if item0 else None
+        m = next((x for x in self._all_messages
+                   if x.get("index") == msg_idx), None)
+        if m is None and row < len(self._messages):
+            m = self._messages[row]
+
         menu = QMenu(self)
-        menu.addAction("💾 Export Message…", self._export_selected)
-        menu.addAction("Copy Subject", lambda: (
-            QApplication.clipboard().setText(
-                self._messages[row]["subject"] if row < len(self._messages) else "")))
-        menu.addAction("Copy Sender", lambda: (
-            QApplication.clipboard().setText(
-                self._messages[row]["sender"] if row < len(self._messages) else "")))
+        menu.addAction("📧 Export as .EML…",
+            lambda: self._export_as_eml(m))
+        menu.addAction("📧 Export as .MSG…",
+            lambda: self._export_as_msg(m))
+        menu.addAction("💾 Export Message Text…",
+            self._export_selected)
+        menu.addSeparator()
+        menu.addAction("📋 Copy Subject",
+            lambda: QApplication.clipboard().setText(
+                m["subject"] if m else ""))
+        menu.addAction("📋 Copy Sender",
+            lambda: QApplication.clipboard().setText(
+                m["sender"] if m else ""))
+        menu.addAction("📋 Copy All Headers",
+            lambda: self._copy_headers(m))
+        menu.addSeparator()
+        menu.addAction("🔖 Bookmark this Message",
+            lambda: self._bookmark_msg(m))
         menu.exec(self.msg_table.mapToGlobal(pos))
+
+    def _export_as_eml(self, m):
+        """Export a message as standard .eml (RFC 2822) format."""
+        if not m:
+            QMessageBox.warning(self,"No Message","Select a message first.")
+            return
+        subj = m.get("subject","message")[:40].replace("/","_").replace("\\","_")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export as EML", f"{subj}.eml", "EML (*.eml);;All (*)")
+        if not path: return
+        try:
+            import email.mime.multipart, email.mime.text
+            msg_obj = m.get("msg_obj")
+            mbox_msg = m.get("_mbox_msg")
+
+            if mbox_msg:
+                # MBOX/EML — already email.message.Message, just write it
+                with open(path,"wb") as f:
+                    import email.generator
+                    gen = email.generator.BytesGenerator(f)
+                    gen.flatten(mbox_msg)
+            elif msg_obj:
+                # pypff — reconstruct from parts
+                eml = email.mime.multipart.MIMEMultipart("mixed")
+                eml["From"]    = self._safe_str(msg_obj.get_sender_name())
+                eml["Subject"] = self._safe_str(msg_obj.get_subject())
+                try:
+                    body_bytes = msg_obj.get_plain_text_body()
+                    if body_bytes:
+                        body_txt = body_bytes.decode(errors="replace") if isinstance(body_bytes,bytes) else str(body_bytes)
+                        eml.attach(email.mime.text.MIMEText(body_txt,"plain","utf-8"))
+                except Exception: pass
+                try:
+                    html_bytes = msg_obj.get_html_body()
+                    if html_bytes:
+                        html_txt = html_bytes.decode(errors="replace") if isinstance(html_bytes,bytes) else str(html_bytes)
+                        eml.attach(email.mime.text.MIMEText(html_txt,"html","utf-8"))
+                except Exception: pass
+                with open(path,"wb") as f:
+                    import email.generator
+                    gen = email.generator.BytesGenerator(f)
+                    gen.flatten(eml)
+            else:
+                # MSG path
+                msg_path = m.get("_path","")
+                if msg_path and os.path.isfile(msg_path):
+                    import extract_msg
+                    msg = extract_msg.openMsg(msg_path)
+                    try:
+                        eml = email.mime.multipart.MIMEMultipart("mixed")
+                        eml["From"]    = str(msg.sender or "")
+                        eml["To"]      = str(msg.to or "")
+                        eml["Subject"] = str(msg.subject or "")
+                        eml["Date"]    = str(msg.date or "")
+                        body = msg.body or ""
+                        if isinstance(body,bytes): body = body.decode(errors="replace")
+                        eml.attach(email.mime.text.MIMEText(body,"plain","utf-8"))
+                        if msg.htmlBody:
+                            hb = msg.htmlBody
+                            if isinstance(hb,bytes): hb = hb.decode(errors="replace")
+                            eml.attach(email.mime.text.MIMEText(hb,"html","utf-8"))
+                    finally:
+                        try: msg.close()
+                        except Exception: pass
+                    with open(path,"wb") as f:
+                        import email.generator
+                        gen = email.generator.BytesGenerator(f)
+                        gen.flatten(eml)
+                else:
+                    QMessageBox.warning(self,"Export","Cannot locate source for this message.")
+                    return
+            QMessageBox.information(self,"Exported",f"Saved EML:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self,"Export Error",str(e))
+
+    def _export_as_msg(self, m):
+        """Export a message as .msg (Outlook format) if possible."""
+        if not m:
+            QMessageBox.warning(self,"No Message","Select a message first.")
+            return
+        # If source is already a .msg file, just copy it
+        src_path = m.get("_path","")
+        if src_path and os.path.isfile(src_path) and src_path.lower().endswith(".msg"):
+            subj = m.get("subject","message")[:40].replace("/","_")
+            dst, _ = QFileDialog.getSaveFileName(
+                self,"Save MSG",f"{subj}.msg","MSG (*.msg);;All (*)")
+            if dst:
+                try:
+                    shutil.copy2(src_path, dst)
+                    QMessageBox.information(self,"Saved",f"Saved MSG:\n{dst}")
+                except Exception as e:
+                    QMessageBox.critical(self,"Error",str(e))
+        else:
+            # Fall back to EML export
+            QMessageBox.information(self,"Export as MSG",
+                "Direct MSG export is only available for .msg source files.\n"
+                "Exporting as .EML instead.")
+            self._export_as_eml(m)
+
+    def _copy_headers(self, m):
+        if not m: return
+        lines = [
+            f"From:    {m.get('sender','')}",
+            f"Subject: {m.get('subject','')}",
+            f"Date:    {m.get('date','')}",
+        ]
+        QApplication.clipboard().setText("\n".join(lines))
+
+    def _bookmark_msg(self, m):
+        if not m: return
+        try:
+            self.parent().parent()._on_bookmark(
+                "Email", {"Subject": m.get("subject",""),
+                          "From": m.get("sender",""),
+                          "Date": m.get("date","")},
+                "File of Interest")
+        except Exception:
+            pass
 
     # ── Export ───────────────────────────────────────────────────────
     def _export_selected(self):
@@ -5827,117 +6378,128 @@ TAG_TO_TAB = {
 
 
 class BookmarkTab(QWidget):
-    """
-    Bookmark manager with labelled sub-tabs (default categories).
-    Each sub-tab shows a table of bookmarked rows with notes,
-    source artifact name, timestamp, and tag.
-    Double-click a bookmark row to jump back to the artifact in Results tab.
-    """
-    # Emits artifact_name when user wants to navigate to it in results
+    """Bookmark manager — sidebar list + table per category."""
     navigate_to = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
-        self._tab_tables = []   # list of QTableWidget, one per sub-tab
+        self._tables  = {}   # idx -> QTableWidget
+        self._details = {}   # idx -> QTextEdit
+        self._cur_idx = 0
+        self._inserting = False   # re-entrancy guard
         self._setup()
 
     def _setup(self):
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(0,0,0,0)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # Toolbar
+        # toolbar
         tb = QWidget()
         tb.setStyleSheet(f"background:{C['bg3']};border-bottom:1px solid {C['border']};")
+        tb.setMaximumHeight(50)
         tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(8,4,8,4)
+        tbl.setContentsMargins(8, 4, 8, 4)
         tbl.setSpacing(6)
-
-        title = QLabel("🔖  BOOKMARKS")
+        title = QLabel("  BOOKMARKS")
         title.setStyleSheet(f"color:{C['accent']};font-weight:bold;font-size:10pt;")
         tbl.addWidget(title)
         tbl.addStretch()
-
-        for label, slot in [
-            ("Export All…",     self._export_all),
-            ("Clear Tab",       self._clear_current_tab),
-            ("Clear All",       self._clear_all),
-        ]:
+        for label, slot in [("Export All...", self._export_all),
+                             ("Clear Category", self._clear_current),
+                             ("Clear All", self._clear_all)]:
             btn = QPushButton(label)
             btn.setFixedHeight(26)
             btn.clicked.connect(slot)
             tbl.addWidget(btn)
-
         self.bm_count = QLabel("0 bookmarks")
         self.bm_count.setStyleSheet(f"color:{C['fg2']};font-size:9pt;padding:0 8px;")
         tbl.addWidget(self.bm_count)
         lay.addWidget(tb)
 
-        # Sub-tabs — one per default category
-        self.sub_tabs = QTabWidget()
-        self.sub_tabs.setTabPosition(QTabWidget.TabPosition.North)
-        self.sub_tabs.setStyleSheet(
-            f"QTabWidget::pane{{border:none;background:{C['bg']}}}"
-            f"QTabBar::tab{{background:{C['bg3']};color:{C['fg2']};"
-            f"border:1px solid {C['border']};border-bottom:none;"
-            f"padding:5px 14px;margin-right:1px;font-size:9pt;}}"
-            f"QTabBar::tab:selected{{background:{C['bg']};color:{C['accent']};"
-            f"border-bottom:2px solid {C['accent']};}}"
-            f"QTabBar::tab:hover:!selected{{background:{C['btn_hover']};}}")
-        lay.addWidget(self.sub_tabs)
+        # body: sidebar + stacked
+        body = QSplitter(Qt.Orientation.Horizontal)
+        body.setHandleWidth(2)
 
-        # Build each sub-tab
-        COLS = ["Artifact","Tag","Timestamp","Summary","Notes"]
-        for tab_label, col, desc in BOOKMARK_TABS_DEF:
+        # sidebar
+        sidebar = QWidget()
+        sidebar.setMinimumWidth(160)
+        sidebar.setMaximumWidth(220)
+        sidebar.setStyleSheet(f"background:{C['sidebar']};")
+        sl = QVBoxLayout(sidebar)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.setSpacing(0)
+        sh = QLabel("  CATEGORIES")
+        sh.setStyleSheet(
+            f"background:{C['bg3']};color:{C['fg2']};font-size:8pt;"
+            f"font-weight:bold;padding:5px 8px;border-bottom:1px solid {C['border']};")
+        sl.addWidget(sh)
+        self.cat_list = QListWidget()
+        self.cat_list.setStyleSheet(
+            f"QListWidget{{background:{C['sidebar']};border:none;outline:none;}}"
+            f"QListWidget::item{{padding:8px 12px;color:{C['fg']};font-size:9pt;"
+            f"border-bottom:1px solid {C['border']};}}"
+            f"QListWidget::item:selected{{background:{C['sel']};color:{C['accent']};"
+            f"border-left:3px solid {C['accent']};}}"
+            f"QListWidget::item:hover:!selected{{background:{C['bg3']};}}")
+        for label, col, desc in BOOKMARK_TABS_DEF:
+            item = QListWidgetItem(label)
+            item.setForeground(QBrush(QColor(col)))
+            item.setToolTip(desc)
+            self.cat_list.addItem(item)
+        # Connect AFTER all items added
+        self.cat_list.currentRowChanged.connect(self._on_cat_select)
+        sl.addWidget(self.cat_list)
+        body.addWidget(sidebar)
+
+        # stacked pages
+        self._stack = QStackedWidget()
+        COLS = ["Artifact", "Tag", "Timestamp", "Summary", "Notes"]
+        for idx, (tab_label, col, desc) in enumerate(BOOKMARK_TABS_DEF):
             page = QWidget()
             page.setStyleSheet(f"background:{C['bg']};")
             pl = QVBoxLayout(page)
-            pl.setContentsMargins(0,0,0,0)
+            pl.setContentsMargins(0, 0, 0, 0)
             pl.setSpacing(0)
 
-            # Description bar
             desc_bar = QLabel(f"  {desc}")
             desc_bar.setStyleSheet(
                 f"background:{C['bg2']};color:{C['fg2']};font-size:8pt;"
                 f"padding:4px 8px;border-bottom:1px solid {C['border']};")
             pl.addWidget(desc_bar)
 
-            # Splitter: table top, detail bottom
             vs = QSplitter(Qt.Orientation.Vertical)
             vs.setHandleWidth(3)
 
+            # Table — NO signals connected here
             tbl_w = QTableWidget(0, len(COLS))
             tbl_w.setHorizontalHeaderLabels(COLS)
             tbl_w.horizontalHeader().setSectionResizeMode(
-                3, QHeaderView.ResizeMode.Stretch)   # Summary stretches
+                3, QHeaderView.ResizeMode.Stretch)
             tbl_w.horizontalHeader().setSectionResizeMode(
-                4, QHeaderView.ResizeMode.Stretch)   # Notes stretches
-            for ci in (0,1,2):
+                4, QHeaderView.ResizeMode.Stretch)
+            for ci in (0, 1, 2):
                 tbl_w.horizontalHeader().setSectionResizeMode(
                     ci, QHeaderView.ResizeMode.ResizeToContents)
             tbl_w.verticalHeader().setVisible(False)
             tbl_w.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             tbl_w.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
             tbl_w.setAlternatingRowColors(True)
-            tbl_w.setSortingEnabled(True)
+            tbl_w.setSortingEnabled(False)   # NEVER enable sorting on bookmark tables
             tbl_w.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             tbl_w.customContextMenuRequested.connect(
-                lambda pos, t=tbl_w: self._bm_ctx(pos, t))
-            tbl_w.currentCellChanged.connect(
-                lambda r,c,pr,pc, t=tbl_w, ti=len(self._tab_tables):
-                    self._on_bm_select(r, t, ti))
-            tbl_w.setStyleSheet(
-                f"QTableWidget{{background:{C['panel']};color:{C['fg']};"
-                f"border:none;gridline-color:{C['border']};}}"
-                f"QTableWidget::item:selected{{background:{C['sel']};color:{C['accent']};}}")
+                lambda pos, t=tbl_w, i=idx: self._bm_ctx(pos, t, i))
+            # Use clicked only — never itemSelectionChanged/currentCellChanged
+            tbl_w.clicked.connect(
+                lambda _mi, t=tbl_w, i=idx: self._on_row_select(t, i))
             vs.addWidget(tbl_w)
-            self._tab_tables.append(tbl_w)
+            self._tables[idx] = tbl_w
 
             # Detail panel
-            detail_w = QWidget()
-            detail_w.setStyleSheet(f"background:{C['bg2']};")
-            dl = QVBoxLayout(detail_w)
-            dl.setContentsMargins(0,0,0,0)
+            det_w = QWidget()
+            det_w.setStyleSheet(f"background:{C['bg2']};")
+            dl = QVBoxLayout(det_w)
+            dl.setContentsMargins(0, 0, 0, 0)
             dl.setSpacing(0)
             dh = QLabel("  ITEM DETAIL")
             dh.setStyleSheet(
@@ -5945,237 +6507,299 @@ class BookmarkTab(QWidget):
                 f"font-weight:bold;padding:3px 8px;"
                 f"border-top:1px solid {C['border']};")
             dl.addWidget(dh)
-            detail_txt = QTextEdit()
-            detail_txt.setReadOnly(True)
-            detail_txt.setStyleSheet(
+            det = QTextEdit()
+            det.setReadOnly(True)
+            det.setStyleSheet(
                 f"background:{C['bg2']};color:{C['fg']};"
                 f"font-family:'Consolas','Courier New',monospace;"
                 f"font-size:9pt;border:none;padding:6px;")
-            dl.addWidget(detail_txt)
-            # Store detail widget reference on the table
-            tbl_w._detail = detail_txt
-            vs.addWidget(detail_w)
+            dl.addWidget(det)
+            self._details[idx] = det
+            vs.addWidget(det_w)
             vs.setSizes([300, 160])
-
             pl.addWidget(vs)
-            self.sub_tabs.addTab(page, tab_label)
+            self._stack.addWidget(page)
 
-        self.sub_tabs.currentChanged.connect(self._on_sub_tab_changed)
+        body.addWidget(self._stack)
+        body.setSizes([190, 900])
+        lay.addWidget(body)
 
-    # ── Add bookmark ──────────────────────────────────────────────────
-    def add_bookmark(self, artifact_name: str, row_data: dict, tag: str):
-        """Add a row_data dict as a bookmark under the appropriate sub-tab."""
-        tab_idx = TAG_TO_TAB.get(tag, 0)
-        # Clamp to available tabs
-        tab_idx = min(tab_idx, len(self._tab_tables) - 1)
-        tbl = self._tab_tables[tab_idx]
+        self.cat_list.setCurrentRow(0)
 
-        # Build summary from first few fields
-        summary = "  |  ".join(
-            f"{k}: {str(v)[:40]}" for k,v in list(row_data.items())[:4])
-        ts  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        row = tbl.rowCount()
-        tbl.setSortingEnabled(False)
-        tbl.insertRow(row)
-
-        tag_col  = C['red'] if 'Malware' in tag else \
-                   C['orange'] if 'Suspicious' in tag else \
-                   C['yellow'] if 'Key' in tag else \
-                   C['purple'] if 'IOC' in tag else \
-                   C['green']  if 'User' in tag or 'Cleared' in tag else \
-                   C['accent']
-
-        for ci, (val, color) in enumerate([
-            (artifact_name, C['accent']),
-            (tag,           tag_col),
-            (ts,            C['fg2']),
-            (summary,       C['fg']),
-            ("",            C['fg']),   # Notes — editable
-        ]):
-            item = QTableWidgetItem(val)
-            item.setForeground(QBrush(QColor(color)))
-            if ci == 4:
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
-                item.setToolTip("Double-click to add notes")
-            else:
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            # Store full row_data in first column for retrieval
-            if ci == 0:
-                item.setData(Qt.ItemDataRole.UserRole, row_data)
-            tbl.setItem(row, ci, item)
-
-        tbl.setSortingEnabled(True)
+    def _on_cat_select(self, idx):
+        if idx < 0:
+            return
+        self._cur_idx = idx
+        self._stack.setCurrentIndex(idx)
         self._update_count()
 
-        # Flash the sub-tab to show where it was added
-        self.sub_tabs.setCurrentIndex(tab_idx)
-        tbl.scrollToBottom()
-        tbl.selectRow(tbl.rowCount() - 1)
+    def _on_row_select(self, tbl, idx):
+        if self._inserting:
+            return
+        try:
+            row = tbl.currentRow()
+            if row < 0 or row >= tbl.rowCount():
+                return
+            item0 = tbl.item(row, 0)
+            if not item0:
+                return
+            rd       = item0.data(Qt.ItemDataRole.UserRole) or {}
+            tag_item = tbl.item(row, 1)
+            ts_item  = tbl.item(row, 2)
+            det      = self._details.get(idx)
+            if not det:
+                return
 
-    def _on_bm_select(self, row, tbl, tab_idx):
-        if row < 0 or not hasattr(tbl, '_detail'): return
-        item = tbl.item(row, 0)
-        if not item: return
-        rd = item.data(Qt.ItemDataRole.UserRole) or {}
-        # Build HTML detail
-        parts = [f"<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"]
-        art_item = tbl.item(row, 0)
-        tag_item = tbl.item(row, 1)
-        ts_item  = tbl.item(row, 2)
-        if art_item: parts.append(
-            f"<p><b style='color:{C['accent']}'>{art_item.text()}</b>"
-            f" &nbsp;<span style='color:{C['orange']}'>{tag_item.text() if tag_item else ''}</span>"
-            f"&nbsp;&nbsp;<span style='color:{C['fg2']};font-size:8pt;'>{ts_item.text() if ts_item else ''}</span></p>")
-        parts.append("<hr style='border-color:#30363d;margin:6px 0;'>")
-        for k, v in rd.items():
-            v2 = str(v)[:500]
+            def e(s):
+                return (str(s).replace("&", "&amp;")
+                               .replace("<", "&lt;").replace(">", "&gt;"))
+
+            parts = [f"<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"]
             parts.append(
-                f"<div style='margin:2px 0;'>"
-                f"<span style='color:{C['fg2']};min-width:140px;display:inline-block;"
-                f"font-size:8pt;'>{k}:</span>"
-                f"<span style='color:{C['fg']};'>&nbsp;{v2}</span></div>")
-        parts.append("</div>")
-        tbl._detail.setHtml("".join(parts))
+                f"<p><b style='color:{C['accent']}'>{e(item0.text())}</b>"
+                f"&nbsp;<span style='color:{C['orange']}'>"
+                f"{e(tag_item.text() if tag_item else '')}</span>"
+                f"&nbsp;&nbsp;<span style='color:{C['fg2']};font-size:8pt;'>"
+                f"{e(ts_item.text() if ts_item else '')}</span></p>"
+                f"<hr style='border-color:{C['border']};margin:4px 0;'>")
+            for k, v in rd.items():
+                parts.append(
+                    f"<div style='margin:2px 0;'>"
+                    f"<span style='color:{C['fg2']};min-width:130px;"
+                    f"display:inline-block;font-size:8pt;'>{e(k)}:</span>"
+                    f"<span style='color:{C['fg']};'>&nbsp;{e(str(v)[:500])}</span>"
+                    f"</div>")
+            parts.append("</div>")
+            det.setHtml("".join(parts))
+        except Exception as ex:
+            print(f"[_on_row_select] {ex}")
 
-    def _on_sub_tab_changed(self, idx):
-        self._update_count()
+    def add_bookmark(self, artifact_name, row_data, tag):
+        """Append a row to the appropriate category table. Crash-proof."""
+        if self._inserting:
+            return   # prevent re-entrancy
+        try:
+            self._inserting = True
+            cat_idx = TAG_TO_TAB.get(tag, 0)
+            cat_idx = min(cat_idx, len(BOOKMARK_TABS_DEF) - 1)
+            tbl     = self._tables.get(cat_idx)
+            if tbl is None:
+                return
 
-    # ── Context menu ──────────────────────────────────────────────────
-    def _bm_ctx(self, pos, tbl):
+            summary = "  |  ".join(
+                f"{k}: {str(v)[:40]}" for k, v in list(row_data.items())[:4])
+            ts      = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            tag_col = (C['red']    if 'Malware'    in tag else
+                       C['orange'] if 'Suspicious' in tag else
+                       C['yellow'] if 'Key'        in tag else
+                       C['purple'] if 'IOC'        in tag else
+                       C['green']  if 'User' in tag or 'Cleared' in tag else
+                       C['accent'])
+
+            # Block table signals for the entire insertion
+            tbl.blockSignals(True)
+            new_row = tbl.rowCount()
+            tbl.insertRow(new_row)
+            for ci, (val, color, editable, udata) in enumerate([
+                (str(artifact_name), C['accent'], False, dict(row_data)),
+                (str(tag),           tag_col,     False, None),
+                (str(ts),            C['fg2'],    False, None),
+                (str(summary),       C['fg'],     False, None),
+                ("",                 C['fg'],     True,  None),
+            ]):
+                cell  = QTableWidgetItem(val)
+                cell.setForeground(QBrush(QColor(color)))
+                flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                if editable:
+                    flags |= Qt.ItemFlag.ItemIsEditable
+                    cell.setToolTip("Double-click to add notes")
+                cell.setFlags(flags)
+                if udata is not None:
+                    cell.setData(Qt.ItemDataRole.UserRole, udata)
+                tbl.setItem(new_row, ci, cell)
+            tbl.blockSignals(False)
+
+        except Exception as e:
+            print(f"[add_bookmark insert] {e}")
+            try:
+                tbl.blockSignals(False)
+            except Exception:
+                pass
+        finally:
+            self._inserting = False
+
+        # All UI updates AFTER _inserting is cleared — safe now
+        try:
+            self._update_count()
+            # Switch category in sidebar without signal re-entrancy
+            if self.cat_list.currentRow() != cat_idx:
+                self.cat_list.blockSignals(True)
+                self.cat_list.setCurrentRow(cat_idx)
+                self.cat_list.blockSignals(False)
+                self._stack.setCurrentIndex(cat_idx)
+                self._cur_idx = cat_idx
+        except Exception as e:
+            print(f"[add_bookmark post] {e}")
+
+    def _current_table(self):
+        return self._tables.get(self._cur_idx)
+
+    def _safe_remove(self, tbl, row):
+        if self._inserting:
+            return
+        try:
+            tbl.blockSignals(True)
+            tbl.removeRow(row)
+            tbl.blockSignals(False)
+            self._update_count()
+        except Exception as e:
+            try:
+                tbl.blockSignals(False)
+            except Exception:
+                pass
+            print(f"[_safe_remove] {e}")
+
+    def _update_count(self):
+        try:
+            total = sum(t.rowCount() for t in self._tables.values())
+            cur   = (self._tables[self._cur_idx].rowCount()
+                     if self._cur_idx in self._tables else 0)
+            self.bm_count.setText(f"{total} total  |  {cur} in category")
+            for i in range(self.cat_list.count()):
+                t    = self._tables.get(i)
+                cnt  = t.rowCount() if t else 0
+                base = BOOKMARK_TABS_DEF[i][0] if i < len(BOOKMARK_TABS_DEF) else ""
+                item = self.cat_list.item(i)
+                if item:
+                    item.setText(f"{base}  ({cnt})" if cnt else base)
+        except Exception as e:
+            print(f"[_update_count] {e}")
+
+    def _bm_ctx(self, pos, tbl, idx):
+        if self._inserting:
+            return
         row = tbl.rowAt(pos.y())
-        if row < 0: return
-        item = tbl.item(row, 0)
-        rd   = item.data(Qt.ItemDataRole.UserRole) if item else {}
-        art  = item.text() if item else ""
-
-        menu = QMenu(self)
-        menu.addAction("🔍 Go to Artifact in Results",
+        if row < 0:
+            return
+        item0 = tbl.item(row, 0)
+        rd    = item0.data(Qt.ItemDataRole.UserRole) if item0 else {}
+        art   = item0.text() if item0 else ""
+        menu  = QMenu(self)
+        menu.addAction("Go to Artifact in Results",
             lambda: self.navigate_to.emit(art))
-        menu.addAction("📋 Copy Summary",
+        menu.addAction("Copy Summary",
             lambda: QApplication.clipboard().setText(
-                tbl.item(row,3).text() if tbl.item(row,3) else ""))
-        menu.addAction("📋 Copy as JSON",
-            lambda: QApplication.clipboard().setText(
-                json.dumps(rd, default=str)))
+                tbl.item(row, 3).text() if tbl.item(row, 3) else ""))
+        menu.addAction("Copy as JSON",
+            lambda: QApplication.clipboard().setText(json.dumps(rd, default=str)))
         menu.addSeparator()
-
-        # Move to different tab
-        move_m = menu.addMenu("Move to Tab…")
+        move_m = menu.addMenu("Move to Category...")
         for i, (lbl, _, _d) in enumerate(BOOKMARK_TABS_DEF):
-            move_m.addAction(lbl, lambda _, ti=i, r=row, t=tbl: self._move_row(t, r, ti))
-
+            if i != idx:
+                move_m.addAction(lbl,
+                    lambda _, ti=i, r=row, t=tbl: self._move_row(t, r, ti))
         menu.addSeparator()
-        menu.addAction("🗑 Remove Bookmark", lambda: (tbl.removeRow(row),
-                                                       self._update_count()))
+        menu.addAction("Remove", lambda: self._safe_remove(tbl, row))
         menu.exec(tbl.mapToGlobal(pos))
 
     def _move_row(self, src_tbl, row, dest_idx):
-        """Move a bookmark row to a different sub-tab."""
-        if dest_idx >= len(self._tab_tables): return
-        dest_tbl = self._tab_tables[dest_idx]
         item0 = src_tbl.item(row, 0)
-        if not item0: return
+        if not item0:
+            return
         rd  = item0.data(Qt.ItemDataRole.UserRole) or {}
         art = item0.text()
-        tag = BOOKMARK_TABS_DEF[dest_idx][0]
-        src_tbl.removeRow(row)
-        self.add_bookmark(art, rd, tag.split()[-1])   # strip emoji
-        self.sub_tabs.setCurrentIndex(dest_idx)
-        self._update_count()
+        self._safe_remove(src_tbl, row)
+        tag = BOOKMARK_TABS_DEF[dest_idx][0].split()[-1]
+        self.add_bookmark(art, rd, tag)
 
-    # ── Utilities ─────────────────────────────────────────────────────
-    def _update_count(self):
-        total = sum(t.rowCount() for t in self._tab_tables)
-        cur   = self._tab_tables[self.sub_tabs.currentIndex()].rowCount() \
-                if self.sub_tabs.currentIndex() < len(self._tab_tables) else 0
-        self.bm_count.setText(
-            f"{total} total  |  {cur} in this tab")
-
-    def _clear_current_tab(self):
-        idx = self.sub_tabs.currentIndex()
-        if idx < 0 or idx >= len(self._tab_tables): return
-        tbl = self._tab_tables[idx]
-        if tbl.rowCount() == 0: return
+    def _clear_current(self):
+        tbl = self._current_table()
+        if not tbl or tbl.rowCount() == 0:
+            return
         if QMessageBox.question(
-                self, "Clear Tab",
-                f"Remove all {tbl.rowCount()} bookmark(s) from this tab?",
+                self, "Clear Category",
+                f"Remove all {tbl.rowCount()} bookmark(s)?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         ) == QMessageBox.StandardButton.Yes:
+            tbl.blockSignals(True)
             tbl.setRowCount(0)
+            tbl.blockSignals(False)
             self._update_count()
 
     def _clear_all(self):
-        total = sum(t.rowCount() for t in self._tab_tables)
-        if total == 0: return
+        total = sum(t.rowCount() for t in self._tables.values())
+        if total == 0:
+            return
         if QMessageBox.question(
-                self, "Clear All Bookmarks",
-                f"Remove all {total} bookmarks across all tabs?",
+                self, "Clear All",
+                f"Remove all {total} bookmarks?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         ) == QMessageBox.StandardButton.Yes:
-            for t in self._tab_tables: t.setRowCount(0)
+            for t in self._tables.values():
+                t.blockSignals(True)
+                t.setRowCount(0)
+                t.blockSignals(False)
             self._update_count()
 
     def _export_all(self):
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Bookmarks", "bookmarks",
             "JSON (*.json);;CSV (*.csv);;HTML (*.html)")
-        if not path: return
+        if not path:
+            return
         all_bm = []
         for ti, (tab_label, _, _d) in enumerate(BOOKMARK_TABS_DEF):
-            tbl = self._tab_tables[ti]
+            tbl = self._tables.get(ti)
+            if not tbl:
+                continue
             for r in range(tbl.rowCount()):
-                item0 = tbl.item(r, 0)
-                rd    = item0.data(Qt.ItemDataRole.UserRole) if item0 else {}
-                note  = tbl.item(r, 4).text() if tbl.item(r, 4) else ""
-                ts    = tbl.item(r, 2).text() if tbl.item(r, 2) else ""
+                i0 = tbl.item(r, 0)
                 all_bm.append({
-                    "tab":      tab_label,
-                    "artifact": item0.text() if item0 else "",
-                    "tag":      tbl.item(r,1).text() if tbl.item(r,1) else "",
-                    "timestamp":ts,
-                    "notes":    note,
-                    "data":     rd,
+                    "category":  tab_label,
+                    "artifact":  i0.text() if i0 else "",
+                    "tag":       tbl.item(r, 1).text() if tbl.item(r, 1) else "",
+                    "timestamp": tbl.item(r, 2).text() if tbl.item(r, 2) else "",
+                    "notes":     tbl.item(r, 4).text() if tbl.item(r, 4) else "",
+                    "data":      i0.data(Qt.ItemDataRole.UserRole) if i0 else {},
                 })
         if path.endswith(".json"):
-            with open(path,"w") as f: json.dump(all_bm, f, indent=2, default=str)
+            with open(path, "w") as f:
+                json.dump(all_bm, f, indent=2, default=str)
         elif path.endswith(".csv"):
             import csv as _csv
-            with open(path,"w",newline="") as f:
+            with open(path, "w", newline="") as f:
                 w = _csv.writer(f)
-                w.writerow(["Tab","Artifact","Tag","Timestamp","Notes","Summary"])
+                w.writerow(["Category","Artifact","Tag","Timestamp","Notes","Summary"])
                 for bm in all_bm:
-                    summary = "  |  ".join(f"{k}: {v}" for k,v in list(bm["data"].items())[:4])
-                    w.writerow([bm["tab"],bm["artifact"],bm["tag"],
-                                bm["timestamp"],bm["notes"],summary])
-        else:  # HTML
-            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    summary = " | ".join(
+                        f"{k}: {v}" for k, v in list(bm["data"].items())[:4])
+                    w.writerow([bm["category"], bm["artifact"], bm["tag"],
+                                bm["timestamp"], bm["notes"], summary])
+        else:
+            now  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            rows = ""
+            for bm in all_bm:
+                s = " | ".join(f"{k}: {v}" for k, v in list(bm["data"].items())[:4])
+                rows += (f"<tr><td>{bm['category']}</td><td>{bm['artifact']}</td>"
+                         f"<td>{bm['tag']}</td><td>{bm['timestamp']}</td>"
+                         f"<td>{s}</td><td>{bm['notes']}</td></tr>")
             html = (f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
-                    f"<title>Bookmarks Export</title>"
-                    f"<style>body{{background:#0d1117;color:#e6edf3;"
+                    f"<title>Bookmarks</title><style>"
+                    f"body{{background:#0d1117;color:#e6edf3;"
                     f"font-family:'Segoe UI',sans-serif;margin:32px}}"
-                    f"h1{{color:#58a6ff}}h2{{color:#d29922;margin-top:20px}}"
-                    f"table{{border-collapse:collapse;width:100%;margin:8px 0}}"
-                    f"th{{background:#21262d;color:#8b949e;padding:6px 10px;text-align:left}}"
+                    f"h1{{color:#58a6ff}}"
+                    f"table{{border-collapse:collapse;width:100%}}"
+                    f"th{{background:#21262d;color:#8b949e;"
+                    f"padding:6px 10px;text-align:left}}"
                     f"td{{padding:5px 10px;border-bottom:1px solid #21262d}}"
-                    f"tr:nth-child(even){{background:#1a2030}}</style></head><body>"
-                    f"<h1>ForensicPro Bookmarks</h1>"
-                    f"<p style='color:#8b949e'>Exported: {now}</p>")
-            for tab_label, _, _d in BOOKMARK_TABS_DEF:
-                tab_bms = [b for b in all_bm if b["tab"] == tab_label]
-                if not tab_bms: continue
-                html += f"<h2>{tab_label} ({len(tab_bms)})</h2>"
-                html += ("<table><tr><th>Artifact</th><th>Timestamp</th>"
-                         "<th>Summary</th><th>Notes</th></tr>")
-                for bm in tab_bms:
-                    summary = "  |  ".join(
-                        f"{k}: {v}" for k,v in list(bm["data"].items())[:4])
-                    html += (f"<tr><td>{bm['artifact']}</td>"
-                             f"<td>{bm['timestamp']}</td>"
-                             f"<td>{summary}</td>"
-                             f"<td>{bm['notes']}</td></tr>")
-                html += "</table>"
-            html += "</body></html>"
-            with open(path,"w") as f: f.write(html)
+                    f"tr:nth-child(even){{background:#1a2030}}"
+                    f"</style></head><body>"
+                    f"<h1>ForensicPro Bookmarks — {now}</h1>"
+                    f"<table><tr><th>Category</th><th>Artifact</th><th>Tag</th>"
+                    f"<th>Timestamp</th><th>Summary</th><th>Notes</th></tr>"
+                    f"{rows}</table></body></html>")
+            with open(path, "w") as f:
+                f.write(html)
         QMessageBox.information(self, "Exported",
             f"Exported {len(all_bm)} bookmark(s) to:\n{path}")
 
@@ -6183,6 +6807,110 @@ class BookmarkTab(QWidget):
 # ══════════════════════════════════════════════════════════════
 #  MAIN WINDOW
 # ══════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════
+#  CASE DIALOG  (New Case / Edit Case Info)
+# ══════════════════════════════════════════════════════════════
+class CaseDialog(QDialog):
+    """Dialog for creating or editing a forensic case.
+
+    Exposes .values() -> dict with keys:
+        name, number, examiner, notes
+    matching the structure of MainWindow.case_info.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Case Information")
+        self.setFixedSize(480, 320)
+        self.setStyleSheet(STYLESHEET)
+        self._build(parent)
+
+    def _build(self, parent):
+        # Pre-populate from parent.case_info if available
+        existing = {}
+        if hasattr(parent, "case_info") and isinstance(parent.case_info, dict):
+            existing = parent.case_info
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(10)
+
+        # ── Title bar ──────────────────────────────────────────
+        title = QLabel("  NEW CASE")
+        title.setStyleSheet(
+            f"color:{C['accent']};font-weight:bold;font-size:11pt;"
+            f"background:{C['bg3']};padding:6px 10px;"
+            f"border-bottom:1px solid {C['border']};")
+        lay.addWidget(title)
+
+        # ── Form ───────────────────────────────────────────────
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setSpacing(8)
+
+        def _le(default=""):
+            w = QLineEdit(default)
+            w.setStyleSheet(
+                f"background:{C['bg2']};color:{C['fg']};"
+                f"border:1px solid {C['border']};border-radius:3px;padding:4px 6px;")
+            return w
+
+        self._f_name     = _le(existing.get("name",     "New Case"))
+        self._f_number   = _le(existing.get("number",   "FC-2025-001"))
+        self._f_examiner = _le(existing.get("examiner", ""))
+
+        self._f_notes = QPlainTextEdit(existing.get("notes", ""))
+        self._f_notes.setFixedHeight(70)
+        self._f_notes.setStyleSheet(
+            f"background:{C['bg2']};color:{C['fg']};"
+            f"border:1px solid {C['border']};border-radius:3px;padding:4px 6px;")
+        self._f_notes.setPlaceholderText("Optional case notes…")
+
+        lbl_style = f"color:{C['fg2']};font-size:9pt;"
+        for label, widget in [
+            ("Case Name:",   self._f_name),
+            ("Case Number:", self._f_number),
+            ("Examiner:",    self._f_examiner),
+            ("Notes:",       self._f_notes),
+        ]:
+            lbl = QLabel(label)
+            lbl.setStyleSheet(lbl_style)
+            form.addRow(lbl, widget)
+
+        lay.addLayout(form)
+        lay.addStretch()
+
+        # ── Buttons ────────────────────────────────────────────
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel)
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Create Case")
+        btns.button(QDialogButtonBox.StandardButton.Ok).setStyleSheet(
+            f"background:{C['accent']};color:#000;font-weight:bold;"
+            f"border:none;border-radius:4px;padding:5px 18px;")
+        btns.button(QDialogButtonBox.StandardButton.Cancel).setStyleSheet(
+            f"background:{C['btn']};color:{C['fg']};"
+            f"border:1px solid {C['border']};border-radius:4px;padding:5px 18px;")
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    def _on_accept(self):
+        if not self._f_name.text().strip():
+            QMessageBox.warning(self, "Required", "Case Name cannot be empty.")
+            return
+        self.accept()
+
+    def values(self) -> dict:
+        """Return the filled-in case info dict."""
+        return {
+            "name":     self._f_name.text().strip()     or "New Case",
+            "number":   self._f_number.text().strip()   or "FC-001",
+            "examiner": self._f_examiner.text().strip(),
+            "notes":    self._f_notes.toPlainText().strip(),
+        }
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -6603,25 +7331,264 @@ class MainWindow(QMainWindow):
 
     # ── Verify hashes ─────────────────────────
     def _verify_all(self):
-        paths = []
-        for i in range(self.browser.img_root.childCount()):
-            child = self.browser.img_root.child(i)
-            data  = child.data(0, Qt.ItemDataRole.UserRole)
-            if data and data.get("path"):
-                paths.append(data["path"])
-        if not paths:
-            QMessageBox.information(self,"Verify","No forensic images to hash."); return
+        """Open the Hash Database / Calculator dialog."""
+        self._open_hash_db()
 
-        self.set_status(f"Hashing {len(paths)} image(s)…")
-        def run():
-            lines = []
-            for p in paths:
-                if os.path.isfile(p):
-                    m = md5_path(p); s = sha256_path(p)
-                    lines.append(f"{os.path.basename(p)}\n  MD5:    {m}\n  SHA-256:{s}\n")
-            QMessageBox.information(self,"Hash Results","\n".join(lines) or "No files hashed.")
-            self.set_status("Hash verification complete.")
-        threading.Thread(target=run, daemon=True).start()
+    def _open_hash_db(self):
+        """Hash Database — compute and store MD5/SHA-256 for files in the browser list."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Hash Database & Calculator")
+        dlg.resize(900, 600)
+        dlg.setStyleSheet(STYLESHEET)
+        lay = QVBoxLayout(dlg)
+
+        # ── Top bar ─────────────────────────────────────────────
+        tb = QWidget()
+        tbl = QHBoxLayout(tb)
+        tbl.setContentsMargins(6,4,6,4); tbl.setSpacing(6)
+
+        calc_btn   = QPushButton("⚡ Calculate Hashes for Listed Files")
+        calc_btn.setObjectName("accent")
+        import_btn = QPushButton("📂 Import Hash DB (CSV/JSON)…")
+        export_btn = QPushButton("💾 Export Hash DB…")
+        clear_btn  = QPushButton("🗑 Clear DB")
+        verify_btn = QPushButton("✓ Verify Selected File…")
+
+        for btn in (calc_btn, import_btn, export_btn, clear_btn, verify_btn):
+            btn.setFixedHeight(28)
+            tbl.addWidget(btn)
+        tbl.addStretch()
+
+        self._hash_progress = QProgressBar()
+        self._hash_progress.setFixedWidth(200)
+        self._hash_progress.setFixedHeight(18)
+        self._hash_progress.setTextVisible(True)
+        self._hash_progress.setValue(0)
+        tbl.addWidget(self._hash_progress)
+        lay.addWidget(tb)
+
+        # ── Search bar ───────────────────────────────────────────
+        sb = QWidget()
+        sbl = QHBoxLayout(sb)
+        sbl.setContentsMargins(6,2,6,2)
+        sbl.addWidget(QLabel("Filter:"))
+        hash_filter = QLineEdit()
+        hash_filter.setPlaceholderText("Filter by filename, MD5, SHA-256…")
+        sbl.addWidget(hash_filter)
+        lay.addWidget(sb)
+
+        # ── Hash table — Filename | MD5 | SHA-256 only ──────────────
+        hash_cols = ["Filename", "MD5", "SHA-256"]
+        hash_tbl  = QTableWidget(0, len(hash_cols))
+        hash_tbl.setHorizontalHeaderLabels(hash_cols)
+        hash_tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hash_tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hash_tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hash_tbl.verticalHeader().setVisible(False)
+        hash_tbl.setAlternatingRowColors(True)
+        hash_tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        hash_tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        hash_tbl.setSortingEnabled(True)
+        lay.addWidget(hash_tbl)
+
+        # In-memory hash database {path: {md5, sha256, size}}
+        if not hasattr(self, '_hash_db'):
+            self._hash_db = {}
+
+        def _refresh_table(filter_text=""):
+            ft = filter_text.lower()
+            hash_tbl.setSortingEnabled(False)
+            hash_tbl.setRowCount(0)
+            for path, info in self._hash_db.items():
+                fn = os.path.basename(path)
+                m5 = info.get("md5","")
+                sh = info.get("sha256","")
+                if ft and not any(ft in x.lower() for x in (fn, m5, sh)):
+                    continue
+                r = hash_tbl.rowCount()
+                hash_tbl.insertRow(r)
+                for ci, (val, color) in enumerate([
+                    (fn, C['fg']),
+                    (m5, C['accent']),
+                    (sh, C['green']),
+                ]):
+                    cell = QTableWidgetItem(str(val))
+                    cell.setForeground(QBrush(QColor(color)))
+                    cell.setData(Qt.ItemDataRole.UserRole, path)  # store full path
+                    hash_tbl.setItem(r, ci, cell)
+            hash_tbl.setSortingEnabled(True)
+
+        hash_filter.textChanged.connect(_refresh_table)
+        _refresh_table()
+
+        def _calc_hashes():
+            # Collect files from the browser's current directory directly.
+            # This is more reliable than reading the Path column, which may
+            # be empty if the directory was loaded before the column was added.
+            files = []
+            cur_dir = self.browser.current_dir
+            try:
+                for entry in cur_dir.iterdir():
+                    if entry.is_file():
+                        files.append(str(entry))
+            except Exception:
+                pass
+            # Also try reading Path column (col 6) as fallback
+            if not files:
+                fb = self.browser.file_table
+                for r in range(fb.rowCount()):
+                    pi = fb.item(r, 6)
+                    if pi and pi.text() and os.path.isfile(pi.text()):
+                        files.append(pi.text())
+            if not files:
+                QMessageBox.information(dlg, "No Files",
+                    f"No files found in:\n{self.browser.current_dir}\n\n"
+                    "Navigate to a directory in the Evidence Browser first.")
+                return
+            calc_btn.setEnabled(False)
+            self._hash_progress.setMaximum(len(files))
+            self._hash_progress.setValue(0)
+
+            def run():
+                for i, path in enumerate(files):
+                    try:
+                        m5 = md5_path(path)
+                        sh = sha256_path(path)
+                        self._hash_db[path] = {"md5": m5, "sha256": sh}
+                        # ── Update file browser columns (Path=col6, MD5=col8, SHA256=col9)
+                        fb = self.browser.file_table
+                        # Reveal hash columns on first successful hash
+                        fb.setColumnHidden(8, False)
+                        fb.setColumnHidden(9, False)
+                        for r in range(fb.rowCount()):
+                            # Match by Path column (6) or Name column (0)
+                            pi6 = fb.item(r, 6)
+                            pi0 = fb.item(r, 0)
+                            row_path = (pi6.text() if pi6 else "") or ""
+                            row_name = (pi0.text() if pi0 else "").strip()
+                            row_name = row_name.lstrip("📁📄📝🎵🎬📕📦⚙🐍📜🔖🗄🖴📋🔑🔗⚡").strip()
+                            if row_path == path or row_name == os.path.basename(path):
+                                i8 = fb.item(r, 8)
+                                i9 = fb.item(r, 9)
+                                if i8: i8.setText(m5)
+                                else:
+                                    c = QTableWidgetItem(m5)
+                                    c.setForeground(QBrush(QColor(C['accent'])))
+                                    fb.setItem(r, 8, c)
+                                if i9: i9.setText(sh)
+                                else:
+                                    c = QTableWidgetItem(sh)
+                                    c.setForeground(QBrush(QColor(C['green'])))
+                                    fb.setItem(r, 9, c)
+                                break
+                    except Exception as e:
+                        self._hash_db[path] = {"md5":"", "sha256":""}
+                    self._hash_progress.setValue(i+1)
+                _refresh_table()
+                calc_btn.setEnabled(True)
+                self.set_status(f"  Hashed {len(files)} files.")
+
+            threading.Thread(target=run, daemon=True).start()
+
+        def _import_db():
+            path, _ = QFileDialog.getOpenFileName(
+                dlg,"Import Hash DB","","CSV (*.csv);;JSON (*.json);;All (*)")
+            if not path: return
+            try:
+                if path.endswith(".json"):
+                    with open(path) as f: data = json.load(f)
+                    self._hash_db.update(data)
+                else:
+                    import csv as _csv
+                    with open(path,newline="") as f:
+                        for row in _csv.DictReader(f):
+                            p = row.get("Path","")
+                            if p:
+                                self._hash_db[p] = {
+                                    "md5":    row.get("MD5",""),
+                                    "sha256": row.get("SHA-256",""),
+                                    "size":   int(row.get("Size",0) or 0),
+                                    "status": row.get("Status",""),
+                                }
+                _refresh_table()
+                QMessageBox.information(dlg,"Imported",
+                    f"Imported {len(self._hash_db)} hash records.")
+            except Exception as e:
+                QMessageBox.critical(dlg,"Import Error",str(e))
+
+        def _export_db():
+            path, _ = QFileDialog.getSaveFileName(
+                dlg,"Export Hash DB","hash_db",
+                "CSV (*.csv);;JSON (*.json)")
+            if not path: return
+            try:
+                if path.endswith(".json"):
+                    with open(path,"w") as f:
+                        json.dump(self._hash_db, f, indent=2, default=str)
+                else:
+                    import csv as _csv
+                    with open(path,"w",newline="") as f:
+                        w = _csv.writer(f)
+                        w.writerow(["File","Path","MD5","SHA-256","Size","Status"])
+                        for p, info in self._hash_db.items():
+                            w.writerow([os.path.basename(p), p,
+                                        info.get("md5",""), info.get("sha256",""),
+                                        info.get("size",""), info.get("status","")])
+                QMessageBox.information(dlg,"Exported",f"Saved to:\n{path}")
+            except Exception as e:
+                QMessageBox.critical(dlg,"Export Error",str(e))
+
+        def _clear_db():
+            if QMessageBox.question(dlg,"Clear Hash DB",
+                    f"Clear all {len(self._hash_db)} hash records?",
+                    QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No
+            ) == QMessageBox.StandardButton.Yes:
+                self._hash_db.clear()
+                _refresh_table()
+
+        def _verify_file():
+            path, _ = QFileDialog.getOpenFileName(dlg,"Select File to Verify","","All (*)")
+            if not path: return
+            self.set_status(f"  Computing hashes for {os.path.basename(path)}…")
+            m5  = md5_path(path)
+            sh  = sha256_path(path)
+            sz  = os.path.getsize(path)
+            stored = self._hash_db.get(path)
+            if stored:
+                md5_match = stored.get("md5","") == m5
+                sha_match = stored.get("sha256","") == sh
+                status    = "MATCH ✓" if (md5_match and sha_match) else "MISMATCH ✗"
+                QMessageBox.information(dlg, "Verify Result",
+                    f"File: {os.path.basename(path)}\n\n"
+                    f"Computed MD5:    {m5}\n"
+                    f"Stored MD5:      {stored.get('md5','')}\n"
+                    f"MD5:             {'Match ✓' if md5_match else 'MISMATCH ✗'}\n\n"
+                    f"Computed SHA-256:\n{sh}\n"
+                    f"Stored SHA-256:\n{stored.get('sha256','')}\n"
+                    f"SHA-256:         {'Match ✓' if sha_match else 'MISMATCH ✗'}\n\n"
+                    f"Result: {status}")
+            else:
+                self._hash_db[path] = {"md5": m5, "sha256": sh}
+                QMessageBox.information(dlg, "Hash Computed",
+                    f"File: {os.path.basename(path)}\n\n"
+                    f"MD5:\n{m5}\n\n"
+                    f"SHA-256:\n{sh}\n\n"
+                    f"Added to hash database.")
+            _refresh_table()
+            self.set_status("  Hash verification complete.")
+
+        calc_btn.clicked.connect(_calc_hashes)
+        import_btn.clicked.connect(_import_db)
+        export_btn.clicked.connect(_export_db)
+        clear_btn.clicked.connect(_clear_db)
+        verify_btn.clicked.connect(_verify_file)
+
+        # Close button
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        lay.addWidget(close_btn)
+
+        dlg.exec()
 
     # ── Case management ───────────────────────
     def _new_case(self):
