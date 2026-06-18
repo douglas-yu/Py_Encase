@@ -21,8 +21,8 @@ from PyQt6.QtWidgets import (
     QMenuBar, QMenu, QFileDialog, QMessageBox, QDialog, QDialogButtonBox,
     QVBoxLayout, QHBoxLayout, QGridLayout, QScrollArea, QFrame, QProgressBar,
     QCheckBox, QComboBox, QGroupBox, QListWidget, QListWidgetItem, QSizePolicy,
-    QStackedWidget, QFormLayout, QSpinBox, QToolButton, QAbstractItemView,
-    QScrollBar, QListView,
+    QStackedWidget, QFormLayout, QSpinBox,  QToolButton, QAbstractItemView,
+    QScrollBar,
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QSize, QRect, QPoint, QMimeData,
@@ -32,7 +32,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QFont, QFontMetrics, QColor, QPalette, QIcon, QPixmap, QImage,
     QTextCursor, QTextCharFormat, QSyntaxHighlighter, QBrush, QPainter,
-    QLinearGradient, QAction as QGuiAction, QAction,
+    QLinearGradient, QAction as QGuiAction,QAction,
 )
 
 # ══════════════════════════════════════════════════════════════
@@ -337,6 +337,34 @@ def fmt_ts(ts):
     try: return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
     except: return "—"
 
+def fmt_win_filetime(ft):
+    """Format a Windows FILETIME (100ns since 1601) as a timestamp string."""
+    try:
+        if not ft:
+            return ""
+        return (datetime.datetime(1601, 1, 1) +
+                datetime.timedelta(microseconds=ft / 10)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+def _lnk_localpath(data):
+    """Best-effort extraction of the LocalBasePath from raw .lnk bytes."""
+    if not data or data[:4] != b"\x4c\x00\x00\x00" or len(data) < 76:
+        return ""
+    try:
+        flags  = struct.unpack_from("<I", data, 20)[0]
+        offset = 76
+        if flags & 0x01:                       # HasLinkTargetIDList
+            idl_sz  = struct.unpack_from("<H", data, offset)[0]
+            offset += 2 + idl_sz
+        if flags & 0x02 and len(data) > offset + 28:   # HasLinkInfo
+            lp_off = struct.unpack_from("<I", data, offset + 16)[0]
+            raw_p  = data[offset + lp_off:].split(b"\x00")[0]
+            return raw_p.decode("latin-1", errors="replace")
+    except Exception:
+        pass
+    return ""
+
 def md5_path(p, chunk=1<<16):
     h = hashlib.md5()
     try:
@@ -443,12 +471,6 @@ ARTIFACT_CATEGORIES = {
         "SAM Database Hash Dump","LSA Secrets","DPAPI Master Keys",
         "Browser Saved Passwords","Certificate Store",
     ],
-    "Removable Media & USB": [
-        "USB Device History",
-        "USB First/Last Connection Times",
-        "Drive Letter Assignments",
-        "Volume Serial Numbers",
-    ],
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -458,144 +480,1359 @@ ARTIFACT_CATEGORIES = {
 
 def _collect_from_image(artifact_name, image_path):
     """
-    Collect non-volatile artifacts from a forensic image using pytsk3.
-    Walks the image filesystem to find files relevant to each artifact type.
+    Collect and PARSE non-volatile artifacts from a forensic image.
+    Uses path-aware + magic-byte-validated search to prevent artifact mixing.
+    Each artifact uses exact filename matching + directory path hints + header verification.
     """
+    import os, struct, datetime, tempfile, shutil, json, sqlite3, codecs
+
     results = []
+
+    VOLATILE = {
+        "Running Processes", "Active Connections", "ARP Cache", "DNS Cache",
+        "Network Interfaces", "Loaded Drivers/Modules", "System Uptime",
+        "Process Memory Strings", "Injected DLLs", "Hollowed Processes",
+        "Heap Allocations", "Kernel Objects",
+    }
+    if artifact_name in VOLATILE:
+        return [{"Note": f"{artifact_name} is a volatile artifact — live system only."}]
+
+    # ── Open image ────────────────────────────────────────────────────────────
     try:
         ifs = ForensicImageFS.get(image_path)
         if not ifs.fs:
             return [{"Error": "Cannot open image filesystem: %s" % (ifs.error or "unknown")}]
+    except Exception as e:
+        return [{"Error": f"ForensicImageFS init failed: {e}"}]
 
-        import pytsk3
+    # ── Magic bytes ───────────────────────────────────────────────────────────
+    MAGIC_REGF   = b'regf'
+    MAGIC_EVTX   = b'ElfFile\x00'
+    MAGIC_LNK    = b'\x4c\x00\x00\x00'
+    MAGIC_SQLITE = b'SQLite format 3'
 
-        def walk_fs(folder_inode, path_prefix="/", max_depth=6, _depth=0):
-            """Yield (full_path, entry_dict) for every file in the image."""
-            if _depth > max_depth:
-                return
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _safe_str(raw, enc='utf-8'):
+        if isinstance(raw, (bytes, bytearray)):
             try:
-                entries = ifs.list_dir(inode=folder_inode)
+                return raw.decode('utf-16-le', errors='replace').rstrip('\x00')
             except Exception:
-                return
-            for e in entries:
-                full = path_prefix.rstrip("/") + "/" + e["name"]
-                yield full, e
-                if e["is_dir"] and e["inode"]:
-                    yield from walk_fs(e["inode"], full, max_depth, _depth+1)
+                return raw.decode(enc, errors='replace')
+        return str(raw) if raw is not None else ''
 
-        # Walk root
-        root_entries = ifs.list_dir()
+    def _clean(s):
+        """Strip null bytes and non-printable chars."""
+        return ''.join(c for c in str(s) if c.isprintable() and c != '\x00')
 
-        def find_files(extensions=None, name_patterns=None, max_results=200):
-            """Find files in the image matching extensions or name patterns."""
-            found = []
-            for full_path, e in walk_fs(None):
-                if e["is_dir"]: continue
-                nm = e["name"].lower()
-                match = False
-                if extensions and any(nm.endswith(x) for x in extensions):
-                    match = True
-                if name_patterns and any(p in nm for p in name_patterns):
-                    match = True
-                if match:
-                    found.append((full_path, e))
-                if len(found) >= max_results:
-                    break
-            return found
+    def _fmt_ts(ts):
+        try:
+            return datetime.datetime.utcfromtimestamp(float(ts)).strftime('%Y-%m-%d %H:%M:%S UTC')
+        except Exception:
+            return str(ts)
 
-        # ── Map artifact names to file searches ───────────────────────
-        IMAGE_ARTIFACT_MAP = {
-            "PST/OST Files (Outlook)":    ([".pst",".ost"], []),
-            "MSG Files (Outlook)":         ([".msg"], []),
-            "Thunderbird MBOX":            ([".mbox"], ["inbox","sent","drafts"]),
-            "Browser History":             ([], ["places.sqlite","history"]),
-            "Browser Cookies":             ([], ["cookies.sqlite","cookies"]),
-            "Browser Saved Passwords":     ([], ["login data","key4.db"]),
-            "Registry Run Keys":           ([".reg"], ["ntuser.dat","software","system","sam","security"]),
-            "Prefetch Files":              ([".pf"], []),
-            "LNK / Shortcut Files":        ([".lnk"], []),
-            "Recycle Bin Contents":        ([], ["$r","$i"]),
-            "Security Event Log":          ([".evtx"], ["security"]),
-            "System Event Log":            ([".evtx"], ["system"]),
-            "Application Event Log":       ([".evtx"], ["application"]),
-            "PowerShell Operational Log":  ([".evtx"], ["powershell"]),
-            "SQLite Database":             ([".db",".sqlite",".sqlite3"], []),
-            "Certificate Store":           ([".cer",".crt",".pfx",".p12"], []),
-            "Email Attachments":           ([".pdf",".docx",".xlsx",".zip",".exe",".jpg",".png"], []),
-            "Email Contacts":              ([".pst",".ost",".vcf"], []),
-            "Email Calendar Items":        ([".pst",".ost",".ics"], []),
-        }
+    def _fmt_win_ft(ft):
+        try:
+            ts = (int(ft) - 116444736000000000) / 10_000_000
+            return datetime.datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S UTC')
+        except Exception:
+            return str(ft)
 
-        # Non-volatile file system artifacts that make sense for images
-        NON_VOLATILE = {
-            "Recently Accessed Files", "Prefetch Files", "LNK / Shortcut Files",
-            "Temp Directory Contents", "Recycle Bin Contents", "Alternate Data Streams",
-            "$MFT Entries", "Security Event Log", "System Event Log",
-            "Application Event Log", "PowerShell Operational Log", "RDP Session Log",
-            "Installed Software", "Browser History", "Browser Cookies",
-            "Browser Saved Passwords", "Browser Extensions", "Registry Run Keys",
-            "Startup Folder Items", "Scheduled Tasks", "Certificate Store",
-            "SAM Database Hash Dump", "PST/OST Files (Outlook)", "MSG Files (Outlook)",
-            "Thunderbird MBOX", "Email Accounts Config", "Email Attachments",
-            "Email Contacts", "Email Calendar Items", "LNK / Shortcut Files",
-        }
+    def _rot13(s):
+        return codecs.decode(str(s), 'rot_13')
 
-        if artifact_name not in NON_VOLATILE:
-            return [{
-                "Note":     "Volatile artifact — not available in forensic images.",
-                "Artifact": artifact_name,
-                "Tip":      "This artifact requires a live system. Use 'Local System' target.",
-            }]
+    # ── Iterative filesystem walker ───────────────────────────────────────────
+    def walk_fs():
+        """Yield (full_path, entry_dict) for every non-dir entry in image."""
+        stack   = [(None, '')]
+        visited = set()
+        while stack:
+            folder_inode, prefix = stack.pop()
+            try:
+                entries = (ifs.list_dir() if folder_inode is None
+                           else ifs.list_dir(inode=folder_inode))
+            except Exception:
+                continue
+            for e in (entries or []):
+                try:
+                    nm = e.get('name', '')
+                    if isinstance(nm, (bytes, bytearray)):
+                        nm = nm.decode('utf-8', errors='replace')
+                    nm = str(nm) if nm else ''
+                    if not nm or nm in ('.', '..', '$OrphanFiles'):
+                        continue
+                    inode  = e.get('inode')
+                    is_dir = bool(e.get('is_dir', False))
+                    full   = (prefix.rstrip('/') + '/' + nm) if prefix else nm
+                    e2     = dict(e)
+                    e2['name'] = nm
+                    yield full, e2
+                    if is_dir and inode and inode not in visited:
+                        visited.add(inode)
+                        stack.append((inode, full))
+                except Exception:
+                    continue
 
-        exts, patterns = IMAGE_ARTIFACT_MAP.get(artifact_name, ([], []))
+    # ── Path-aware, magic-validated file finder ───────────────────────────────
+    def find_files(exact_names=None, path_must=None, path_must_not=None,
+                   extensions=None, name_startswith=None,
+                   magic=None, max_results=50):
+        """
+        exact_names    : list — filename must EXACTLY match one of these (case-insensitive)
+        path_must      : list — ALL of these substrings must appear in the full path (case-insensitive)
+        path_must_not  : list — NONE of these substrings may appear in path
+        extensions     : list — file extension must match (e.g. ['.lnk', '.pf'])
+        name_startswith: list — filename must start with one of these (case-insensitive)
+        magic          : bytes — first N bytes of file must match this
+        """
+        found = []
+        en_lo = [n.lower() for n in (exact_names    or [])]
+        pm_lo = [p.lower() for p in (path_must      or [])]
+        pn_lo = [p.lower() for p in (path_must_not  or [])]
+        ex_lo = [e.lower() for e in (extensions     or [])]
+        sw_lo = [s.lower() for s in (name_startswith or [])]
 
-        if exts or patterns:
-            found = find_files(exts, patterns)
-            if not found:
-                return [{"Note": "No matching files found in image.",
-                          "Artifact": artifact_name, "Image": image_path}]
-            for fp, e in found:
-                row = {
-                    "Path":     fp,
-                    "Name":     e["name"],
-                    "Size":     fmt_size(e["size"]) if e["size"] else "0",
-                    "Modified": fmt_ts(e["mtime"]) if e["mtime"] else "",
-                    "Inode":    str(e["inode"]),
-                    "Type":     e.get("type",""),
-                }
-                # For PST files try to parse message count
-                if fp.lower().endswith((".pst",".ost")) and e["inode"]:
+        for full_path, e in walk_fs():
+            if e.get('is_dir'):
+                continue
+            nl = e.get('name', '').lower()
+            pl = full_path.lower()
+
+            if en_lo and nl not in en_lo:
+                continue
+            if pm_lo and not all(p in pl for p in pm_lo):
+                continue
+            if pn_lo and any(p in pl for p in pn_lo):
+                continue
+            if ex_lo and not any(nl.endswith(x) for x in ex_lo):
+                continue
+            if sw_lo and not any(nl.startswith(s) for s in sw_lo):
+                continue
+
+            inode = e.get('inode')
+            if inode and magic:
+                try:
+                    hdr = ifs.read_file(inode, max_bytes=len(magic))
+                    if hdr[:len(magic)] != magic:
+                        continue
+                except Exception:
+                    continue
+
+            found.append((full_path, e))
+            if len(found) >= max_results:
+                break
+        return found
+
+    # ── Extract to temp ───────────────────────────────────────────────────────
+    def extract(e_or_inode, suffix='', max_bytes=64 * 1024 * 1024):
+        inode = e_or_inode if isinstance(e_or_inode, int) else e_or_inode.get('inode')
+        if not inode:
+            return None, b''
+        try:
+            data = ifs.read_file(inode, max_bytes=max_bytes)
+            if not data:
+                return None, b''
+            fd, tmp = tempfile.mkstemp(suffix=suffix)
+            with os.fdopen(fd, 'wb') as f:
+                f.write(data)
+            return tmp, data
+        except Exception:
+            return None, b''
+
+    def cleanup(tmp):
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+    # ── Registry helper ───────────────────────────────────────────────────────
+    def open_reg(e_or_inode):
+        """Validate regf magic, extract hive, open with python-registry."""
+        try:
+            from Registry import Registry as _Reg
+        except ImportError:
+            return None, None, 'pip install python-registry'
+        tmp, data = extract(e_or_inode, suffix='.hive')
+        if not tmp:
+            return None, None, 'Failed to extract hive'
+        if data[:4] != MAGIC_REGF:
+            cleanup(tmp)
+            return None, None, f'Not a valid registry hive (magic={data[:4]!r})'
+        try:
+            reg = _Reg.Registry(tmp)
+            return reg, tmp, None
+        except Exception as ex:
+            cleanup(tmp)
+            return None, None, f'Registry parse error: {ex}'
+
+    # ── SQLite helper ─────────────────────────────────────────────────────────
+    def query_sqlite(e_or_inode, sql, params=()):
+        tmp, data = extract(e_or_inode, suffix='.db')
+        if not tmp:
+            return []
+        if data[:15] != MAGIC_SQLITE:
+            cleanup(tmp)
+            return []
+        try:
+            con = sqlite3.connect(tmp)
+            con.row_factory = sqlite3.Row
+            rows = [dict(r) for r in con.execute(sql, params).fetchall()]
+            con.close()
+            return rows
+        except Exception:
+            return []
+        finally:
+            cleanup(tmp)
+
+    # ── EVTX helper ───────────────────────────────────────────────────────────
+    def parse_evtx(e_or_inode, max_events=150):
+        tmp, data = extract(e_or_inode, suffix='.evtx')
+        if not tmp or data[:8] != MAGIC_EVTX:
+            cleanup(tmp)
+            return [{'Note': 'Not a valid EVTX file or file not found.'}]
+        evs = []
+        try:
+            from Evtx.Evtx import Evtx as _Evtx
+            import xml.etree.ElementTree as _ET
+            with _Evtx(tmp) as log:
+                for rec in log.records():
                     try:
-                        import pypff, tempfile
-                        data = ifs.read_file(e["inode"], max_bytes=512*1024*1024)
-                        tmp = tempfile.NamedTemporaryFile(suffix=".pst", delete=False)
-                        tmp.write(data); tmp.close()
-                        pst_obj = pypff.file()
-                        pst_obj.open(tmp.name)
-                        rf = pst_obj.get_root_folder()
-                        row["Folders"]  = str(rf.get_number_of_sub_folders())
-                        row["Messages"] = str(rf.get_number_of_sub_messages())
-                        pst_obj.close()
-                        os.unlink(tmp.name)
-                    except Exception as pe:
-                        row["Parse"] = str(pe)[:60]
-                results.append(row)
+                        root = _ET.fromstring(rec.xml())
+                        ns   = {'e': 'http://schemas.microsoft.com/win/2004/08/events/event'}
+                        ev   = {}
+                        sys_el = root.find('e:System', ns)
+                        if sys_el is not None:
+                            for child in sys_el:
+                                tag = child.tag.split('}')[-1]
+                                val = (child.text or '').strip() or \
+                                      ' '.join(f'{k}={v}' for k, v in child.attrib.items())
+                                ev[tag] = _clean(val)
+                        ed_el = root.find('e:EventData', ns)
+                        if ed_el is not None:
+                            for d in ed_el.findall('e:Data', ns):
+                                k = d.get('Name', 'Data')
+                                ev[k] = _clean(d.text or '')
+                        if ev:
+                            evs.append(ev)
+                        if len(evs) >= max_events:
+                            break
+                    except Exception:
+                        continue
+        except ImportError:
+            evs.append({'Note': 'pip install python-evtx'})
+        finally:
+            cleanup(tmp)
+        return evs
+
+    # ── LNK parser ────────────────────────────────────────────────────────────
+    def parse_lnk(data):
+        info = {}
+        if not data or data[:4] != MAGIC_LNK or len(data) < 76:
+            return info
+        try:
+            flags  = struct.unpack_from('<I', data, 20)[0]
+            offset = 76
+            if flags & 0x01:
+                idl_sz  = struct.unpack_from('<H', data, offset)[0]
+                offset += 2 + idl_sz
+            if flags & 0x02 and len(data) > offset + 28:
+                li_sz   = struct.unpack_from('<I',  data, offset)[0]
+                lp_off  = struct.unpack_from('<I',  data, offset + 16)[0]
+                try:
+                    raw_p = data[offset + lp_off:].split(b'\x00')[0]
+                    info['LocalPath'] = raw_p.decode('latin-1', errors='replace')
+                except Exception:
+                    pass
+                offset += li_sz
+            for field in ['Description', 'RelativePath', 'WorkingDir', 'Arguments', 'IconLocation']:
+                if offset + 2 > len(data):
+                    break
+                cnt     = struct.unpack_from('<H', data, offset)[0]
+                offset += 2
+                if 0 < cnt <= 32767 and offset + cnt * 2 <= len(data):
+                    seg = data[offset: offset + cnt * 2]
+                    val = seg.decode('utf-16-le', errors='replace').rstrip('\x00')
+                    if val.strip():
+                        info[field] = _clean(val)
+                offset += cnt * 2
+        except Exception:
+            pass
+        return info
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  PER-ARTIFACT HANDLERS
+    # ════════════════════════════════════════════════════════════════════════
+    try:
+
+        # ── OS Version ───────────────────────────────────────────────────────
+        if artifact_name == 'OS Version & Build':
+            for fp, e in find_files(exact_names=['software'], path_must=['config'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if err:
+                    results.append({'Error': err}); continue
+                try:
+                    key = reg.open('Microsoft\\Windows NT\\CurrentVersion')
+                    for v in key.values():
+                        results.append({'Field': _clean(v.name()), 'Value': _clean(str(v.value()))[:200]})
+                except Exception as ex:
+                    results.append({'Error': str(ex)})
+                finally:
+                    cleanup(tmp)
+                break
+
+        # ── Hostname & Domain ─────────────────────────────────────────────
+        elif artifact_name == 'Hostname & Domain':
+            for fp, e in find_files(exact_names=['system'], path_must=['config'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if err:
+                    results.append({'Error': err}); continue
+                try:
+                    for kp in ['ControlSet001\\Control\\ComputerName\\ComputerName',
+                               'ControlSet001\\Services\\Tcpip\\Parameters']:
+                        try:
+                            key = reg.open(kp)
+                            for v in key.values():
+                                results.append({'Key': kp.split('\\')[-1],
+                                                'Field': _clean(v.name()),
+                                                'Value': _clean(str(v.value()))[:200]})
+                        except Exception:
+                            pass
+                except Exception as ex:
+                    results.append({'Error': str(ex)})
+                finally:
+                    cleanup(tmp)
+                break
+
+        # ── Installed Software ────────────────────────────────────────────
+        elif artifact_name == 'Installed Software':
+            for fp, e in find_files(exact_names=['software'], path_must=['config'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if err:
+                    results.append({'Error': err}); continue
+                try:
+                    for kp in ['Microsoft\\Windows\\CurrentVersion\\Uninstall',
+                               'Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall']:
+                        try:
+                            key = reg.open(kp)
+                            for sub in key.subkeys():
+                                info = {'Subkey': _clean(sub.name())}
+                                for v in sub.values():
+                                    if v.name() in ('DisplayName', 'DisplayVersion',
+                                                    'Publisher', 'InstallDate'):
+                                        info[v.name()] = _clean(str(v.value()))[:150]
+                                if 'DisplayName' in info:
+                                    results.append(info)
+                        except Exception:
+                            pass
+                except Exception as ex:
+                    results.append({'Error': str(ex)})
+                finally:
+                    cleanup(tmp)
+                break
+
+        # ── Registry Run Keys ─────────────────────────────────────────────
+        elif artifact_name == 'Registry Run Keys':
+            # SOFTWARE hive — HKLM run keys
+            for fp, e in find_files(exact_names=['software'], path_must=['config'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        for kp in [
+                            'Microsoft\\Windows\\CurrentVersion\\Run',
+                            'Microsoft\\Windows\\CurrentVersion\\RunOnce',
+                            'Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Run',
+                            'Microsoft\\Windows NT\\CurrentVersion\\Winlogon',
+                        ]:
+                            try:
+                                key = reg.open(kp)
+                                for v in key.values():
+                                    results.append({'Hive': 'SOFTWARE', 'Key': kp,
+                                                    'Name': _clean(v.name()),
+                                                    'Command': _clean(str(v.value()))[:300]})
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+                break
+            # NTUSER.DAT — HKCU run keys (each user profile)
+            for fp, e in find_files(exact_names=['ntuser.dat'], path_must=['users'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        for kp in [
+                            'Software\\Microsoft\\Windows\\CurrentVersion\\Run',
+                            'Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce',
+                        ]:
+                            try:
+                                key = reg.open(kp)
+                                for v in key.values():
+                                    results.append({'Hive': f'NTUSER ({fp})', 'Key': kp,
+                                                    'Name': _clean(v.name()),
+                                                    'Command': _clean(str(v.value()))[:300]})
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+
+        # ── SAM Database Hash Dump ────────────────────────────────────────
+        elif artifact_name == 'SAM Database Hash Dump':
+            found = find_files(exact_names=['sam'], path_must=['config'],
+                               path_must_not=['samdump', 'samlib', '.log'], magic=MAGIC_REGF)
+            if not found:
+                results.append({'Note': 'SAM hive not found in Windows/System32/config/'})
+            for fp, e in found:
+                reg, tmp, err = open_reg(e)
+                if err:
+                    results.append({'Error': err}); continue
+                try:
+                    key = reg.open('SAM\\Domains\\Account\\Users\\Names')
+                    for sub in key.subkeys():
+                        results.append({
+                            'Username':  _clean(sub.name()),
+                            'LastWrite': sub.timestamp().strftime('%Y-%m-%d %H:%M:%S UTC'),
+                            'Note':      'Hash bytes require SYSTEM key — use secretsdump/Mimikatz'
+                        })
+                except Exception as ex:
+                    results.append({'Error': f'SAM parse: {ex}'})
+                finally:
+                    cleanup(tmp)
+                break
+
+        # ── Local User Accounts ───────────────────────────────────────────
+        elif artifact_name == 'Local User Accounts':
+            for fp, e in find_files(exact_names=['sam'], path_must=['config'],
+                                    path_must_not=['.log'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        key = reg.open('SAM\\Domains\\Account\\Users\\Names')
+                        for sub in key.subkeys():
+                            results.append({'Username': _clean(sub.name()),
+                                            'LastWrite': sub.timestamp().strftime('%Y-%m-%d %H:%M:%S UTC')})
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+                break
+            # Linux /etc/passwd
+            for fp, e in find_files(exact_names=['passwd'], path_must=['etc']):
+                _, data = extract(e)
+                for line in data.decode('utf-8', errors='replace').splitlines():
+                    parts = line.split(':')
+                    if len(parts) >= 6 and not line.startswith('#'):
+                        results.append({'Username': parts[0], 'UID': parts[2],
+                                        'GID': parts[3], 'Home': parts[5]})
+                break
+
+        # ── USB Device History ────────────────────────────────────────────
+        elif artifact_name == 'USB Device History':
+            found = find_files(exact_names=['system'], path_must=['config'],
+                               path_must_not=['.log', '.alt'], magic=MAGIC_REGF)
+            if not found:
+                results.append({'Note': 'SYSTEM hive not found.'})
+            for fp, e in found:
+                reg, tmp, err = open_reg(e)
+                if err:
+                    results.append({'Error': err}); continue
+                try:
+                    GUID = '{83da6326-97a6-4088-9453-a1923f573b29}'
+                    for cs in ['ControlSet001', 'ControlSet002', 'CurrentControlSet']:
+                        try:
+                            usb_key = reg.open(f'{cs}\\Enum\\USBSTOR')
+                        except Exception:
+                            continue
+                        for dc in usb_key.subkeys():
+                            parts = dc.name().split('&')
+                            vendor  = parts[0].replace('Disk&Ven_', '').replace('Ven_', '') if parts else ''
+                            product = parts[1].replace('Prod_', '') if len(parts) > 1 else ''
+                            rev     = parts[2].replace('Rev_', '')  if len(parts) > 2 else ''
+                            for inst in dc.subkeys():
+                                info = {
+                                    'Vendor':       _clean(vendor),
+                                    'Product':      _clean(product),
+                                    'Revision':     _clean(rev),
+                                    'SerialNumber': _clean(inst.name()),
+                                    'LastWrite':    inst.timestamp().strftime('%Y-%m-%d %H:%M:%S UTC'),
+                                }
+                                try:
+                                    info['FriendlyName'] = _clean(str(inst.value('FriendlyName').value()))
+                                except Exception:
+                                    pass
+                                for slot, label in [('0064', 'FirstInstall'),
+                                                    ('0065', 'LastConnected'),
+                                                    ('0066', 'LastRemoved')]:
+                                    try:
+                                        pk = reg.open(
+                                            f'{cs}\\Enum\\USBSTOR\\{dc.name()}\\'
+                                            f'{inst.name()}\\Properties\\{GUID}\\{slot}')
+                                        for pv in pk.values():
+                                            raw = pv.raw_data()
+                                            if raw and len(raw) >= 8:
+                                                ft = struct.unpack_from('<Q', raw)[0]
+                                                info[label] = _fmt_win_ft(ft)
+                                    except Exception:
+                                        pass
+                                results.append(info)
+                        break
+                except Exception as ex:
+                    results.append({'Error': f'USB parse: {ex}'})
+                finally:
+                    cleanup(tmp)
+                break
+
+        # ── USB First/Last Times ──────────────────────────────────────────
+        elif artifact_name == 'USB First/Last Connection Times':
+            for fp, e in find_files(exact_names=['system'], path_must=['config'],
+                                    path_must_not=['.log', '.alt'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if err:
+                    results.append({'Error': err}); continue
+                try:
+                    GUID = '{83da6326-97a6-4088-9453-a1923f573b29}'
+                    for cs in ['ControlSet001', 'ControlSet002']:
+                        try:
+                            usb_key = reg.open(f'{cs}\\Enum\\USBSTOR')
+                        except Exception:
+                            continue
+                        for dc in usb_key.subkeys():
+                            for inst in dc.subkeys():
+                                for slot, label in [('0064', 'FirstInstall'),
+                                                    ('0065', 'LastConnected'),
+                                                    ('0066', 'LastRemoved')]:
+                                    try:
+                                        pk = reg.open(
+                                            f'{cs}\\Enum\\USBSTOR\\{dc.name()}\\'
+                                            f'{inst.name()}\\Properties\\{GUID}\\{slot}')
+                                        for pv in pk.values():
+                                            raw = pv.raw_data()
+                                            if raw and len(raw) >= 8:
+                                                ft = struct.unpack_from('<Q', raw)[0]
+                                                results.append({
+                                                    'Device':    _clean(inst.name())[:40],
+                                                    'DevClass':  _clean(dc.name())[:40],
+                                                    'Event':     label,
+                                                    'Timestamp': _fmt_win_ft(ft),
+                                                })
+                                    except Exception:
+                                        pass
+                        break
+                except Exception as ex:
+                    results.append({'Error': str(ex)})
+                finally:
+                    cleanup(tmp)
+                break
+
+        # ── Shellbags ─────────────────────────────────────────────────────
+        elif artifact_name == 'Shellbags':
+            for fp, e in find_files(exact_names=['ntuser.dat'], path_must=['users'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        root = reg.open('Software\\Microsoft\\Windows\\Shell\\BagMRU')
+                        def _walk_bags(key, kpath=''):
+                            ts = ''
+                            try:
+                                ts = key.timestamp().strftime('%Y-%m-%d %H:%M:%S UTC')
+                            except Exception:
+                                pass
+                            for v in key.values():
+                                if v.name() in ('MRUListEx', 'NodeSlot', 'NodeSlots'):
+                                    continue
+                                try:
+                                    raw = v.raw_data() or b''
+                                    decoded = _clean(raw[2:].decode('utf-16-le', errors='replace'))
+                                    if decoded.strip():
+                                        results.append({'Source': fp, 'Key': kpath or 'BagMRU',
+                                                        'Value': _clean(v.name()),
+                                                        'Data': decoded[:200], 'LastWrite': ts})
+                                except Exception:
+                                    pass
+                            for sub in key.subkeys():
+                                _walk_bags(sub, f'{kpath}\\{sub.name()}' if kpath else sub.name())
+                        _walk_bags(root)
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+            for fp, e in find_files(exact_names=['usrclass.dat'], path_must=['users'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        root = reg.open('Local Settings\\Software\\Microsoft\\Windows\\Shell\\BagMRU')
+                        def _walk_bags2(key, kpath=''):
+                            ts = ''
+                            try:
+                                ts = key.timestamp().strftime('%Y-%m-%d %H:%M:%S UTC')
+                            except Exception:
+                                pass
+                            for v in key.values():
+                                if v.name() in ('MRUListEx', 'NodeSlot', 'NodeSlots'):
+                                    continue
+                                try:
+                                    raw = v.raw_data() or b''
+                                    decoded = _clean(raw[2:].decode('utf-16-le', errors='replace'))
+                                    if decoded.strip():
+                                        results.append({'Source': fp, 'Key': kpath or 'BagMRU',
+                                                        'Value': _clean(v.name()),
+                                                        'Data': decoded[:200], 'LastWrite': ts})
+                                except Exception:
+                                    pass
+                            for sub in key.subkeys():
+                                _walk_bags2(sub, f'{kpath}\\{sub.name()}' if kpath else sub.name())
+                        _walk_bags2(root)
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+
+        # ── UserAssist Keys ───────────────────────────────────────────────
+        elif artifact_name == 'UserAssist Keys':
+            for fp, e in find_files(exact_names=['ntuser.dat'], path_must=['users'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        ua = reg.open(
+                            'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\UserAssist')
+                        for guid_key in ua.subkeys():
+                            try:
+                                count_key = guid_key.subkey('Count')
+                                for v in count_key.values():
+                                    app_name  = _clean(_rot13(v.name()))
+                                    run_count = last_run = ''
+                                    try:
+                                        raw = v.raw_data()
+                                        if raw and len(raw) >= 16:
+                                            run_count = struct.unpack_from('<I', raw, 4)[0]
+                                            ft        = struct.unpack_from('<Q', raw, 8)[0]
+                                            last_run  = _fmt_win_ft(ft)
+                                    except Exception:
+                                        pass
+                                    results.append({'Application': app_name, 'RunCount': run_count,
+                                                    'LastRun': last_run, 'GUID': _clean(guid_key.name()),
+                                                    'Profile': fp})
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+
+        # ── Jump Lists ────────────────────────────────────────────────────
+        elif artifact_name == 'Jump Lists':
+            for fp, e in find_files(path_must=['automaticdestinations'],
+                                    extensions=['-ms']):
+                tmp, data = extract(e, suffix='.ms')
+                if not tmp:
+                    continue
+                info = {'File': e.get('name', ''), 'Path': fp, 'Targets': ''}
+                try:
+                    import olefile
+                    if olefile.isOleFile(tmp):
+                        ole  = olefile.OleFileIO(tmp)
+                        tgts = []
+                        for stream in ole.listdir():
+                            try:
+                                raw = ole.openstream(stream).read()
+                                if raw[:4] == MAGIC_LNK:
+                                    lnk_info = parse_lnk(raw)
+                                    if lnk_info.get('LocalPath'):
+                                        tgts.append(lnk_info['LocalPath'])
+                            except Exception:
+                                pass
+                        info['Targets'] = ' | '.join(tgts)[:300]
+                        ole.close()
+                except ImportError:
+                    info['Note'] = 'pip install olefile'
+                except Exception:
+                    pass
+                finally:
+                    cleanup(tmp)
+                results.append(info)
+
+        # ── WiFi Profiles ─────────────────────────────────────────────────
+        elif artifact_name == 'WiFi Profiles':
+            for fp, e in find_files(path_must=['wlansvc'], extensions=['.xml']):
+                tmp, data = extract(e, suffix='.xml')
+                if not tmp:
+                    continue
+                try:
+                    import xml.etree.ElementTree as _ET
+                    ns   = {'w': 'http://www.microsoft.com/networking/WLAN/profile/v1'}
+                    root = _ET.fromstring(data.decode('utf-8', errors='replace'))
+                    ssid = auth = enc = key = ''
+                    try:
+                        ssid = root.find('.//w:SSID/w:name', ns).text or ''
+                    except Exception:
+                        pass
+                    try:
+                        auth = root.find('.//w:authentication', ns).text or ''
+                    except Exception:
+                        pass
+                    try:
+                        enc  = root.find('.//w:encryption', ns).text or ''
+                    except Exception:
+                        pass
+                    try:
+                        key  = root.find('.//w:keyMaterial', ns).text or ''
+                    except Exception:
+                        pass
+                    results.append({'SSID': _clean(ssid), 'Auth': _clean(auth),
+                                    'Encryption': _clean(enc), 'Key': _clean(key), 'File': fp})
+                except Exception:
+                    pass
+                finally:
+                    cleanup(tmp)
+
+        # ── Event Logs ────────────────────────────────────────────────────
+        elif artifact_name in ('Security Event Log', 'Account Logon Events',
+                               'Process Creation Events (4688)'):
+            for fp, e in find_files(exact_names=['security.evtx'],
+                                    path_must=['winevt'], magic=MAGIC_EVTX):
+                results = parse_evtx(e); break
+            if not results:
+                results.append({'Note': 'Security.evtx not found in Windows/System32/winevt/Logs/'})
+
+        elif artifact_name == 'System Event Log':
+            for fp, e in find_files(exact_names=['system.evtx'],
+                                    path_must=['winevt'], magic=MAGIC_EVTX):
+                results = parse_evtx(e); break
+            if not results:
+                results.append({'Note': 'System.evtx not found.'})
+
+        elif artifact_name == 'Application Event Log':
+            for fp, e in find_files(exact_names=['application.evtx'],
+                                    path_must=['winevt'], magic=MAGIC_EVTX):
+                results = parse_evtx(e); break
+            if not results:
+                results.append({'Note': 'Application.evtx not found.'})
+
+        elif artifact_name == 'PowerShell Operational Log':
+            for fp, e in find_files(
+                    path_must=['winevt'],
+                    name_startswith=['microsoft-windows-powershell'],
+                    extensions=['.evtx'], magic=MAGIC_EVTX):
+                results = parse_evtx(e); break
+            if not results:
+                results.append({'Note': 'PowerShell evtx not found.'})
+
+        elif artifact_name == 'RDP Session Log':
+            for fp, e in find_files(path_must=['winevt'], extensions=['.evtx'], magic=MAGIC_EVTX):
+                nm = e.get('name', '').lower()
+                if any(k in nm for k in ['rdp', 'terminalservices', 'localsessionmanager']):
+                    results = parse_evtx(e)
+                    break
+            if not results:
+                results.append({'Note': 'RDP evtx not found.'})
+
+        # ── Prefetch Files ────────────────────────────────────────────────
+        elif artifact_name == 'Prefetch Files':
+            for fp, e in find_files(path_must=['prefetch'], extensions=['.pf']):
+                _, data = extract(e, suffix='.pf')
+                if not data or len(data) < 84:
+                    continue
+                info = {'File': e.get('name', ''), 'Path': fp, 'Size': e.get('size', 0)}
+                try:
+                    ver = struct.unpack_from('<I', data, 0)[0]
+                    exe_name = data[16:76].decode('utf-16-le', errors='replace').rstrip('\x00').strip()
+                    stem     = info['File'].replace('.pf', '')
+                    pf_hash  = stem.rsplit('-', 1)[-1] if '-' in stem else ''
+                    exe_stem = stem.rsplit('-', 1)[0]  if '-' in stem else stem
+                    run_count = last_run = ''
+                    if ver == 17:
+                        run_count = struct.unpack_from('<I', data, 0x90)[0]
+                        last_run  = _fmt_win_ft(struct.unpack_from('<Q', data, 0x78)[0])
+                    elif ver == 23:
+                        run_count = struct.unpack_from('<I', data, 0x98)[0]
+                        last_run  = _fmt_win_ft(struct.unpack_from('<Q', data, 0x80)[0])
+                    elif ver in (26, 30):
+                        run_count = struct.unpack_from('<I', data, 0xD0)[0]
+                        last_run  = _fmt_win_ft(struct.unpack_from('<Q', data, 0x80)[0])
+                    info.update({'Executable': _clean(exe_stem), 'ExeHeader': _clean(exe_name),
+                                 'Hash': pf_hash, 'RunCount': run_count,
+                                 'LastRun': last_run, 'Version': ver})
+                except Exception as ex:
+                    info['ParseError'] = str(ex)
+                results.append(info)
+
+        # ── LNK / Shortcut Files ──────────────────────────────────────────
+        elif artifact_name == 'LNK / Shortcut Files':
+            for fp, e in find_files(path_must=['recent'], extensions=['.lnk'], magic=MAGIC_LNK):
+                _, data = extract(e, suffix='.lnk')
+                info = {'File': e.get('name', ''), 'Path': fp}
+                info.update(parse_lnk(data))
+                results.append(info)
+            if not results:
+                for fp, e in find_files(path_must=['desktop'], extensions=['.lnk'], magic=MAGIC_LNK):
+                    _, data = extract(e, suffix='.lnk')
+                    info = {'File': e.get('name', ''), 'Path': fp}
+                    info.update(parse_lnk(data))
+                    results.append(info)
+
+        # ── Recycle Bin Contents ──────────────────────────────────────────
+        elif artifact_name == 'Recycle Bin Contents':
+            for fp, e in find_files(path_must=['recycle'], name_startswith=['$i']):
+                _, data = extract(e)
+                info = {'MetaFile': e.get('name', ''), 'Path': fp}
+                if data and len(data) >= 28:
+                    try:
+                        ver   = struct.unpack_from('<Q', data, 0)[0]
+                        fsize = struct.unpack_from('<Q', data, 8)[0]
+                        ft    = struct.unpack_from('<Q', data, 16)[0]
+                        orig  = ''
+                        if ver == 2:
+                            nchars = struct.unpack_from('<I', data, 24)[0]
+                            if nchars > 0 and len(data) >= 28 + nchars * 2:
+                                orig = data[28:28 + nchars * 2].decode('utf-16-le', errors='replace').rstrip('\x00')
+                        else:
+                            raw = data[28:]
+                            try:
+                                orig = raw.split(b'\x00\x00')[0].decode('utf-16-le', errors='replace')
+                            except Exception:
+                                orig = raw.decode('utf-8', errors='replace')[:260]
+                        info.update({'OriginalPath': _clean(orig), 'FileSize': fsize,
+                                     'DeletedTime': _fmt_win_ft(ft)})
+                    except Exception as ex:
+                        info['ParseError'] = str(ex)
+                results.append(info)
+
+        # ── Browser History ───────────────────────────────────────────────
+        elif artifact_name == 'Browser History':
+            for fp, e in find_files(exact_names=['history'], path_must=['chrome'], magic=MAGIC_SQLITE):
+                rows = query_sqlite(e,
+                    "SELECT url, title, visit_count, "
+                    "datetime(last_visit_time/1000000-11644473600,'unixepoch') AS last_visit "
+                    "FROM urls ORDER BY last_visit_time DESC LIMIT 300")
+                for r in rows:
+                    r['Browser'] = 'Chrome'; r['Source'] = fp; results.append(r)
+            for fp, e in find_files(exact_names=['history'], path_must=['edge'], magic=MAGIC_SQLITE):
+                rows = query_sqlite(e,
+                    "SELECT url, title, visit_count, "
+                    "datetime(last_visit_time/1000000-11644473600,'unixepoch') AS last_visit "
+                    "FROM urls ORDER BY last_visit_time DESC LIMIT 300")
+                for r in rows:
+                    r['Browser'] = 'Edge'; r['Source'] = fp; results.append(r)
+            for fp, e in find_files(exact_names=['places.sqlite'],
+                                    path_must=['firefox'], magic=MAGIC_SQLITE):
+                rows = query_sqlite(e,
+                    "SELECT p.url, p.title, p.visit_count, "
+                    "datetime(h.visit_date/1000000,'unixepoch') AS visit_time "
+                    "FROM moz_places p LEFT JOIN moz_historyvisits h ON p.id=h.place_id "
+                    "ORDER BY h.visit_date DESC LIMIT 300")
+                for r in rows:
+                    r['Browser'] = 'Firefox'; r['Source'] = fp; results.append(r)
+            if not results:
+                results.append({'Note': 'No browser history DBs found.'})
+
+        # ── Browser Cookies ───────────────────────────────────────────────
+        elif artifact_name == 'Browser Cookies':
+            for fp, e in find_files(exact_names=['cookies'], path_must=['chrome'], magic=MAGIC_SQLITE):
+                rows = query_sqlite(e,
+                    "SELECT host_key, name, path, is_secure, "
+                    "datetime(expires_utc/1000000-11644473600,'unixepoch') AS expires "
+                    "FROM cookies ORDER BY creation_utc DESC LIMIT 300")
+                for r in rows:
+                    r['Browser'] = 'Chrome'; results.append(r)
+            for fp, e in find_files(exact_names=['cookies.sqlite'],
+                                    path_must=['firefox'], magic=MAGIC_SQLITE):
+                rows = query_sqlite(e,
+                    "SELECT host, name, path, isSecure, "
+                    "datetime(expiry,'unixepoch') AS expires "
+                    "FROM moz_cookies LIMIT 300")
+                for r in rows:
+                    r['Browser'] = 'Firefox'; results.append(r)
+            if not results:
+                results.append({'Note': 'No browser cookie DBs found.'})
+
+        # ── Browser Saved Passwords ───────────────────────────────────────
+        elif artifact_name == 'Browser Saved Passwords':
+            results.append({'Note': 'Chrome/Edge passwords are DPAPI-encrypted. '
+                                    'Use LaZagne or Mimikatz dpapi for decryption.'})
+            for fp, e in find_files(exact_names=['logins.json'], path_must=['firefox']):
+                _, data = extract(e)
+                if not data:
+                    continue
+                try:
+                    for login in json.loads(data.decode('utf-8', errors='replace')).get('logins', []):
+                        results.append({'Browser': 'Firefox',
+                                        'Host':    login.get('hostname', ''),
+                                        'UserEnc': login.get('encryptedUsername', '')[:40],
+                                        'PassEnc': login.get('encryptedPassword', '')[:40]})
+                except Exception:
+                    pass
+
+        # ── Browser Extensions ────────────────────────────────────────────
+        elif artifact_name == 'Browser Extensions':
+            for fp, e in find_files(exact_names=['manifest.json'], path_must=['extension']):
+                _, data = extract(e)
+                if not data:
+                    continue
+                try:
+                    m = json.loads(data.decode('utf-8', errors='replace'))
+                    results.append({'Name':        _clean(m.get('name', ''))[:80],
+                                    'Version':     _clean(m.get('version', '')),
+                                    'Description': _clean(m.get('description', ''))[:100],
+                                    'Permissions': _clean(str(m.get('permissions', [])))[:150],
+                                    'Path':        fp})
+                except Exception:
+                    pass
+            if not results:
+                results.append({'Note': 'No extension manifests found.'})
+
+        # ── Scheduled Tasks ───────────────────────────────────────────────
+        elif artifact_name in ('Scheduled Tasks', 'Task Scheduler Jobs'):
+            for fp, e in find_files(path_must=['tasks'], extensions=['.xml'],
+                                    path_must_not=['eventlog', 'winevt']):
+                tmp, data = extract(e, suffix='.xml')
+                if not tmp:
+                    continue
+                try:
+                    import xml.etree.ElementTree as _ET
+                    ns   = {'t': 'http://schemas.microsoft.com/windows/2004/02/mit/task'}
+                    root = _ET.fromstring(data.decode('utf-8', errors='replace'))
+                    cmd = args = userid = trigger = ''
+                    try:
+                        cmd = root.find('.//t:Command', ns).text or ''
+                    except Exception:
+                        pass
+                    try:
+                        args = root.find('.//t:Arguments', ns).text or ''
+                    except Exception:
+                        pass
+                    try:
+                        userid = root.find('.//t:UserId', ns).text or ''
+                    except Exception:
+                        pass
+                    results.append({'TaskFile': e.get('name', ''), 'Path': fp,
+                                    'Command': _clean(cmd), 'Arguments': _clean(args),
+                                    'UserId': _clean(userid)})
+                except Exception:
+                    pass
+                finally:
+                    cleanup(tmp)
+            if not results:
+                results.append({'Note': 'No scheduled task XML files found.'})
+
+        # ── Certificate Store ─────────────────────────────────────────────
+        # Explicitly exclude hive/evtx/db files — only accept real cert formats
+        elif artifact_name == 'Certificate Store':
+            for fp, e in find_files(extensions=['.cer', '.crt', '.pem', '.pfx', '.p12', '.der'],
+                                    path_must_not=['config', 'winevt', 'prefetch']):
+                _, data = extract(e)
+                if not data:
+                    continue
+                info = {'File': e.get('name', ''), 'Path': fp, 'Size': e.get('size', 0)}
+                try:
+                    from cryptography import x509
+                    from cryptography.hazmat.backends import default_backend
+                    if data.startswith(b'-----BEGIN'):
+                        cert = x509.load_pem_x509_certificate(data, default_backend())
+                    else:
+                        cert = x509.load_der_x509_certificate(data, default_backend())
+                    info['Subject']   = _clean(cert.subject.rfc4514_string())
+                    info['Issuer']    = _clean(cert.issuer.rfc4514_string())
+                    info['NotBefore'] = cert.not_valid_before.strftime('%Y-%m-%d')
+                    info['NotAfter']  = cert.not_valid_after.strftime('%Y-%m-%d')
+                    info['Serial']    = str(cert.serial_number)
+                except ImportError:
+                    info['Note'] = 'pip install cryptography'
+                except Exception as ex:
+                    info['ParseError'] = str(ex)[:100]
+                results.append(info)
+            if not results:
+                results.append({'Note': 'No certificate files (.cer/.crt/.pem/.pfx) found.'})
+
+        # ── PST / OST Files ───────────────────────────────────────────────
+        elif artifact_name == 'PST/OST Files (Outlook)':
+            for fp, e in find_files(extensions=['.pst', '.ost']):
+                results.append({'File': e.get('name', ''), 'Path': fp, 'Size': e.get('size', 0),
+                                 'Note': 'Use libpff (pip install libpff-python) to parse'})
+            if not results:
+                results.append({'Note': 'No PST/OST files found.'})
+
+        # ── MSG Files ─────────────────────────────────────────────────────
+        elif artifact_name == 'MSG Files (Outlook)':
+            for fp, e in find_files(extensions=['.msg']):
+                tmp, data = extract(e, suffix='.msg')
+                info = {'File': e.get('name', ''), 'Path': fp, 'Size': e.get('size', 0)}
+                if tmp:
+                    try:
+                        import extract_msg as _emsg
+                        m = _emsg.openMsg(tmp)
+                        info['Subject'] = _clean(str(m.subject or ''))
+                        info['Sender']  = _clean(str(m.sender  or ''))
+                        info['Date']    = _clean(str(m.date    or ''))
+                        m.close()
+                    except ImportError:
+                        info['Note'] = 'pip install extract-msg'
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+                results.append(info)
+            if not results:
+                results.append({'Note': 'No MSG files found.'})
+
+        # ── Thunderbird MBOX ──────────────────────────────────────────────
+        elif artifact_name == 'Thunderbird MBOX':
+            for fp, e in find_files(path_must=['thunderbird'],
+                                    exact_names=['inbox', 'sent', 'drafts', 'trash']):
+                _, data = extract(e, max_bytes=65536)
+                if not data:
+                    continue
+                count   = data.count(b'\nFrom ')
+                preview = _clean(data[:500].decode('utf-8', errors='replace'))
+                results.append({'File': e.get('name', ''), 'Path': fp, 'Size': e.get('size', 0),
+                                 'MessageCount': count, 'Preview': preview})
+            if not results:
+                results.append({'Note': 'No Thunderbird MBOX files found.'})
+
+        # ── Email Accounts Config ─────────────────────────────────────────
+        elif artifact_name == 'Email Accounts Config':
+            for fp, e in find_files(exact_names=['prefs.js'], path_must=['thunderbird']):
+                _, data = extract(e, max_bytes=65536)
+                if not data:
+                    continue
+                for line in data.decode('utf-8', errors='replace').splitlines():
+                    if any(k in line for k in ['mail.server', 'mail.account', 'mail.smtp']):
+                        results.append({'Source': fp, 'Entry': _clean(line.strip())[:200]})
+            if not results:
+                results.append({'Note': 'No email account config files found.'})
+
+        # ── Recent Files (MRU) ────────────────────────────────────────────
+        elif artifact_name == 'Recent Files (MRU)':
+            for fp, e in find_files(exact_names=['ntuser.dat'], path_must=['users'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        for kp in [
+                            'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs',
+                            'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU',
+                            'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\TypedPaths',
+                        ]:
+                            try:
+                                key = reg.open(kp)
+                                for v in key.values():
+                                    if v.name() == 'MRUListEx':
+                                        continue
+                                    raw = v.raw_data() or b''
+                                    try:
+                                        decoded = _clean(raw[2:].decode('utf-16-le', errors='replace'))
+                                    except Exception:
+                                        decoded = raw.hex()[:80]
+                                    results.append({'Key': kp.split('\\')[-1],
+                                                    'Value': _clean(v.name()),
+                                                    'Data': decoded[:200]})
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+
+        # ── Startup Folder Items ──────────────────────────────────────────
+        elif artifact_name == 'Startup Folder Items':
+            for fp, e in find_files(path_must=['startup'],
+                                    extensions=['.lnk', '.exe', '.bat', '.vbs', '.ps1', '.cmd']):
+                info = {'File': e.get('name', ''), 'Path': fp, 'Size': e.get('size', 0)}
+                if e.get('name', '').lower().endswith('.lnk'):
+                    _, data = extract(e, suffix='.lnk')
+                    info.update(parse_lnk(data))
+                results.append(info)
+            if not results:
+                results.append({'Note': 'No startup folder items found.'})
+
+        # ── Temp Directory Contents ───────────────────────────────────────
+        elif artifact_name == 'Temp Directory Contents':
+            for fp, e in find_files(path_must=['temp']):
+                results.append({'Name': e.get('name', ''), 'Path': fp, 'Size': e.get('size', 0)})
+                if len(results) >= 200:
+                    break
+            if not results:
+                results.append({'Note': 'No temp directory contents found.'})
+
+        # ── Services (Auto-Start) ─────────────────────────────────────────
+        elif artifact_name == 'Services (Auto-Start)':
+            for fp, e in find_files(exact_names=['system'], path_must=['config'],
+                                    path_must_not=['.log', '.alt'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        for cs in ['ControlSet001', 'ControlSet002']:
+                            try:
+                                svc = reg.open(f'{cs}\\Services')
+                                for sub in svc.subkeys():
+                                    try:
+                                        sv  = sub.value('Start').value()
+                                        img = ''
+                                        try:
+                                            img = str(sub.value('ImagePath').value())
+                                        except Exception:
+                                            pass
+                                        if sv in (0, 1, 2):
+                                            results.append({
+                                                'Name':      _clean(sub.name()),
+                                                'ImagePath': _clean(img)[:200],
+                                                'StartType': {0: 'Boot', 1: 'System', 2: 'Auto'}.get(sv, '')
+                                            })
+                                    except Exception:
+                                        pass
+                                break
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+                break
+
+        # ── LSA Secrets ───────────────────────────────────────────────────
+        elif artifact_name == 'LSA Secrets':
+            for fp, e in find_files(exact_names=['security'], path_must=['config'],
+                                    path_must_not=['.log'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        key = reg.open('Policy\\Secrets')
+                        for sub in key.subkeys():
+                            results.append({'SecretName': _clean(sub.name()),
+                                            'Note': 'Value encrypted — use Mimikatz lsadump::secrets'})
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+                break
+
+        # ── DPAPI Master Keys ─────────────────────────────────────────────
+        elif artifact_name == 'DPAPI Master Keys':
+            for fp, e in find_files(path_must=['protect']):
+                nm = e.get('name', '')
+                if len(nm) in (36, 38) or (len(nm) > 10 and all(
+                        c in '0123456789abcdefABCDEF-' for c in nm)):
+                    results.append({'MasterKey': nm, 'Path': fp, 'Size': e.get('size', 0),
+                                    'Note': 'Decrypt with Mimikatz dpapi::masterkey'})
+            if not results:
+                results.append({'Note': 'No DPAPI master key files found.'})
+
+        # ── Cached Credentials ────────────────────────────────────────────
+        elif artifact_name == 'Cached Credentials':
+            for fp, e in find_files(exact_names=['security'], path_must=['config'],
+                                    path_must_not=['.log'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        key = reg.open('Cache')
+                        for v in key.values():
+                            if _clean(v.name()).startswith('NL$'):
+                                results.append({'Entry': _clean(v.name()),
+                                                'Note': 'Cached domain hash (MS-Cache v2)'})
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+                break
+            if not results:
+                results.append({'Note': 'No cached credentials in SECURITY hive.'})
+
+        # ── Firewall Rules ────────────────────────────────────────────────
+        elif artifact_name == 'Firewall Rules':
+            for fp, e in find_files(exact_names=['system'], path_must=['config'],
+                                    path_must_not=['.log', '.alt'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        key = reg.open(
+                            'ControlSet001\\Services\\SharedAccess\\Parameters'
+                            '\\FirewallPolicy\\FirewallRules')
+                        for v in key.values():
+                            results.append({'RuleName': _clean(v.name()),
+                                            'Rule': _clean(str(v.value()))[:300]})
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+                break
+
+        # ── BIOS / UEFI Info ──────────────────────────────────────────────
+        elif artifact_name == 'BIOS/UEFI Info':
+            for fp, e in find_files(exact_names=['system'], path_must=['config'],
+                                    path_must_not=['.log', '.alt'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        for cs in ['ControlSet001', 'ControlSet002']:
+                            try:
+                                key = reg.open(f'{cs}\\Control\\SystemInformation')
+                                for v in key.values():
+                                    results.append({'Field': _clean(v.name()),
+                                                    'Value': _clean(str(v.value()))[:200]})
+                                break
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+                break
+
+        # ── Drive Letter / Volume Serial ──────────────────────────────────
+        elif artifact_name in ('Drive Letter Assignments', 'Volume Serial Numbers'):
+            for fp, e in find_files(exact_names=['system'], path_must=['config'],
+                                    path_must_not=['.log', '.alt'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        key = reg.open('MountedDevices')
+                        for v in key.values():
+                            raw  = v.raw_data() or b''
+                            info = {'MountPoint': _clean(v.name()), 'DataLen': len(raw)}
+                            if len(raw) >= 12 and 'DosDevices' in v.name():
+                                try:
+                                    info['VolumeSerial'] = '%08X' % struct.unpack_from('<I', raw, 8)[0]
+                                except Exception:
+                                    pass
+                            results.append(info)
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+                break
+
+        # ── WMI Subscriptions ─────────────────────────────────────────────
+        elif artifact_name == 'WMI Subscriptions':
+            for fp, e in find_files(path_must=['wbem'], extensions=['.mof']):
+                _, data = extract(e, max_bytes=32768)
+                if data:
+                    results.append({'File': e.get('name', ''), 'Path': fp,
+                                    'Content': _clean(data.decode('utf-8', errors='replace'))[:500]})
+            if not results:
+                results.append({'Note': 'No WMI MOF files found.'})
+
+        # ── AppInit DLLs ──────────────────────────────────────────────────
+        elif artifact_name == 'AppInit DLLs':
+            for fp, e in find_files(exact_names=['software'], path_must=['config'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        for kp in [
+                            'Microsoft\\Windows NT\\CurrentVersion\\Windows',
+                            'Wow6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Windows',
+                        ]:
+                            try:
+                                key = reg.open(kp)
+                                val = key.value('AppInit_DLLs').value()
+                                results.append({'Key': kp, 'AppInit_DLLs': _clean(str(val)) or '(empty)'})
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+                break
+
+        # ── COM Hijacking Keys ────────────────────────────────────────────
+        elif artifact_name == 'COM Hijacking Keys':
+            for fp, e in find_files(exact_names=['software'], path_must=['config'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        key = reg.open('Classes\\CLSID')
+                        for sub in key.subkeys():
+                            results.append({'CLSID': _clean(sub.name()),
+                                            'Note': 'Potential COM hijack location'})
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+                break
+
+        # ── $MFT Entries ──────────────────────────────────────────────────
+        elif artifact_name == '$MFT Entries':
+            for fp, e in find_files(exact_names=['$mft']):
+                results.append({'File': '$MFT', 'Path': fp, 'Size': e.get('size', 0),
+                                 'Note': 'Use analyzeMFT or python-mft for full parsing.'})
+                break
+            if not results:
+                results.append({'Note': '$MFT not found as standalone file.'})
+
+        # ── Alternate Data Streams ────────────────────────────────────────
+        elif artifact_name == 'Alternate Data Streams':
+            results.append({'Note': 'ADS enumeration requires raw NTFS MFT attribute parsing. '
+                                    'Use the Filesystem Browser to inspect individual files.'})
+
+        # ── Volume Shadow Copies ──────────────────────────────────────────
+        elif artifact_name == 'Volume Shadow Copies':
+            results.append({'Note': 'VSS requires live system or mounted VSS snapshot access.'})
+
+        # ── Last Login Times ──────────────────────────────────────────────
+        elif artifact_name == 'Last Login Times':
+            for fp, e in find_files(exact_names=['sam'], path_must=['config'],
+                                    path_must_not=['.log'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        key = reg.open('SAM\\Domains\\Account\\Users\\Names')
+                        for sub in key.subkeys():
+                            results.append({'Username': _clean(sub.name()),
+                                            'LastWrite': sub.timestamp().strftime('%Y-%m-%d %H:%M:%S UTC')})
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+                break
+
+        # ── Typed URLs ────────────────────────────────────────────────────
+        elif artifact_name == 'Typed URLs':
+            for fp, e in find_files(exact_names=['ntuser.dat'], path_must=['users'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        key = reg.open('Software\\Microsoft\\Internet Explorer\\TypedURLs')
+                        for v in key.values():
+                            results.append({'Entry': _clean(v.name()), 'URL': _clean(str(v.value())),
+                                            'Profile': fp})
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+
+        # ── Windows Search History ────────────────────────────────────────
+        elif artifact_name == 'Windows Search History':
+            for fp, e in find_files(exact_names=['ntuser.dat'], path_must=['users'], magic=MAGIC_REGF):
+                reg, tmp, err = open_reg(e)
+                if not err:
+                    try:
+                        key = reg.open(
+                            'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\WordWheelQuery')
+                        for v in key.values():
+                            if v.name() == 'MRUListEx':
+                                continue
+                            raw = v.raw_data() or b''
+                            term = _clean(raw.decode('utf-16-le', errors='replace'))
+                            if term:
+                                results.append({'SearchTerm': term, 'ValueName': _clean(v.name()),
+                                                'Profile': fp})
+                    except Exception:
+                        pass
+                    finally:
+                        cleanup(tmp)
+
+        # ── Generic Fallback ──────────────────────────────────────────────
         else:
-            # Generic: list root entries as overview
-            for e in root_entries[:100]:
-                results.append({
-                    "Name":     e["name"],
-                    "Type":     "Directory" if e["is_dir"] else e.get("type",""),
-                    "Size":     fmt_size(e["size"]) if e["size"] else "",
-                    "Modified": fmt_ts(e["mtime"]) if e["mtime"] else "",
-                })
+            results.append({
+                'Artifact': artifact_name,
+                'Status':   'Handler not implemented for image analysis',
+                'Note':     'Image-based collection for this artifact type is not yet implemented.',
+            })
 
-    except Exception as ex:
-        results.append({"Error": str(ex), "Image": image_path})
+    except Exception as e:
+        import traceback
+        results.append({'Error': str(e), 'Traceback': traceback.format_exc()[:800]})
 
-    return results
-
-
+    return results if results else [{'Note': f'No data found for: {artifact_name}'}]
 def collect_artifact(name, target_path=None, target_type="local"):
     """
     Collect a named forensic artifact.
@@ -621,6 +1858,12 @@ def collect_artifact(name, target_path=None, target_type="local"):
     if is_image_target and target_path:
         return _collect_from_image(name, target_path)
 
+    # For remote targets: use native signed Windows tools over the admin share
+    # (net use + wevtutil/schtasks/reg/sc/tasklist + Get-CimInstance/WinRM).
+    # Evidence files are copied back to the case folder and parsed locally.
+    if target_type == "remote" and target_path:
+        return collect_artifact_remote(name, target_path)
+
     # For directory targets: redirect all home/system searches into that tree.
     effective_home = (Path(target_path) if target_path and target_type == "directory"
                       else Path.home())
@@ -633,6 +1876,37 @@ def collect_artifact(name, target_path=None, target_type="local"):
             return [l for l in out.splitlines() if l.strip()]
         except Exception:
             return []
+
+    def _ps_json(script, timeout=30):
+        """Run a PowerShell snippet that emits JSON, return parsed list[dict].
+
+        Modern replacement for the deprecated/removed `wmic` utility (gone in
+        Windows 11 24H2 / Server 2025).  Always coerces the result to a list of
+        dictionaries so callers can iterate uniformly.
+        """
+        if OS != "Windows":
+            return []
+        wrapped = ("$ErrorActionPreference='SilentlyContinue';" + script +
+                   " | ConvertTo-Json -Depth 4 -Compress")
+        try:
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-NonInteractive",
+                 "-ExecutionPolicy", "Bypass", "-Command", wrapped],
+                text=True, timeout=timeout, stderr=subprocess.DEVNULL)
+        except Exception:
+            return []
+        out = (out or "").strip()
+        if not out:
+            return []
+        try:
+            data = json.loads(out)
+        except Exception:
+            return []
+        if isinstance(data, dict):
+            return [data]
+        if isinstance(data, list):
+            return [d for d in data if isinstance(d, dict)]
+        return []
 
     def _read(path, max_bytes=65536):
         try:
@@ -774,12 +2048,37 @@ def collect_artifact(name, target_path=None, target_type="local"):
                         k, _, v = line.partition(":")
                         results.append({"DMI": k.strip(), "Value": v.strip()})
             elif OS == "Windows":
-                lines = _run(["wmic", "bios", "get", "Manufacturer,Name,Version,ReleaseDate", "/format:csv"])
-                for line in lines[1:]:
-                    parts = line.split(",")
-                    if len(parts) >= 4:
-                        results.append({"Manufacturer":parts[1],"Name":parts[2],
-                                        "Version":parts[3],"Date":parts[4] if len(parts)>4 else ""})
+                # Modern CIM replacement for deprecated `wmic bios`.
+                for r in _ps_json(
+                        "Get-CimInstance Win32_BIOS | "
+                        "Select-Object Manufacturer,Name,Version,SMBIOSBIOSVersion,"
+                        "ReleaseDate,SerialNumber"):
+                    results.append({
+                        "Manufacturer": r.get("Manufacturer", ""),
+                        "Name":         r.get("Name", ""),
+                        "Version":      r.get("SMBIOSBIOSVersion") or r.get("Version", ""),
+                        "Date":         r.get("ReleaseDate", ""),
+                        "Serial":       r.get("SerialNumber", ""),
+                    })
+                for r in _ps_json(
+                        "Get-CimInstance Win32_BaseBoard | "
+                        "Select-Object Manufacturer,Product,Version,SerialNumber"):
+                    results.append({
+                        "Manufacturer": r.get("Manufacturer", ""),
+                        "Name":         "Mainboard: " + (r.get("Product") or ""),
+                        "Version":      r.get("Version", ""),
+                        "Serial":       r.get("SerialNumber", ""),
+                    })
+                if not results:
+                    # Last-resort fallback for legacy hosts that still ship wmic.
+                    lines = _run(["wmic", "bios", "get",
+                                  "Manufacturer,Name,Version,ReleaseDate", "/format:csv"])
+                    for line in lines[1:]:
+                        parts = line.split(",")
+                        if len(parts) >= 4:
+                            results.append({"Manufacturer": parts[1], "Name": parts[2],
+                                            "Version": parts[3],
+                                            "Date": parts[4] if len(parts) > 4 else ""})
             else:
                 results.append({"Note": "BIOS info requires root/admin on this platform."})
 
@@ -805,14 +2104,36 @@ def collect_artifact(name, target_path=None, target_type="local"):
                                             "Release":parts[2],
                                             "Installed":parts[3] if len(parts)>3 else ""})
             elif OS == "Windows":
-                lines = _run(["wmic","product","get",
-                               "Name,Version,Vendor,InstallDate","/format:csv"])
-                for line in lines[1:]:
-                    parts = line.split(",")
-                    if len(parts) >= 4 and parts[1].strip():
-                        results.append({"Name":parts[1],"Version":parts[2],
-                                        "Vendor":parts[3],
-                                        "Installed":parts[4] if len(parts)>4 else ""})
+                # `wmic product` is deprecated, painfully slow, and only lists
+                # MSI packages.  Enumerate the Uninstall registry keys instead
+                # (covers MSI + EXE installers, 32- and 64-bit, per-user).
+                hives = [
+                    r"HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                    r"HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                    r"HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                ]
+                ps = ("Get-ItemProperty " + ",".join("'%s'" % h for h in hives) +
+                      " | Where-Object {$_.DisplayName} | "
+                      "Select-Object DisplayName,DisplayVersion,Publisher,InstallDate")
+                seen = set()
+                for r in _ps_json(ps, timeout=40):
+                    nm = r.get("DisplayName", "")
+                    key = (nm, r.get("DisplayVersion", ""))
+                    if nm and key not in seen:
+                        seen.add(key)
+                        results.append({"Name": nm,
+                                        "Version": r.get("DisplayVersion", ""),
+                                        "Vendor": r.get("Publisher", ""),
+                                        "Installed": r.get("InstallDate", "")})
+                if not results:
+                    lines = _run(["wmic", "product", "get",
+                                  "Name,Version,Vendor,InstallDate", "/format:csv"])
+                    for line in lines[1:]:
+                        parts = line.split(",")
+                        if len(parts) >= 4 and parts[1].strip():
+                            results.append({"Name": parts[1], "Version": parts[2],
+                                            "Vendor": parts[3],
+                                            "Installed": parts[4] if len(parts) > 4 else ""})
             elif OS == "Darwin":
                 lines = _run(["system_profiler","SPApplicationsDataType","-detailLevel","mini"])
                 pkg = {}
@@ -909,14 +2230,28 @@ def collect_artifact(name, target_path=None, target_type="local"):
                 except Exception as e:
                     results.append({"Error": str(e)})
             elif OS == "Windows":
-                lines = _run(["wmic", "useraccount", "get",
-                               "Name,SID,Disabled,PasswordRequired,LocalAccount",
-                               "/format:csv"])
-                for line in lines[1:]:
-                    parts = line.split(",")
-                    if len(parts) >= 5 and parts[1].strip():
-                        results.append({"Name":parts[1],"SID":parts[5] if len(parts)>5 else "",
-                                        "Disabled":parts[2],"PwdRequired":parts[4]})
+                # CIM replacement for deprecated `wmic useraccount`.
+                for r in _ps_json(
+                        "Get-CimInstance Win32_UserAccount -Filter \"LocalAccount=True\" | "
+                        "Select-Object Name,SID,Disabled,PasswordRequired,Lockout,Description"):
+                    results.append({
+                        "Name":        r.get("Name", ""),
+                        "SID":         r.get("SID", ""),
+                        "Disabled":    str(r.get("Disabled", "")),
+                        "PwdRequired": str(r.get("PasswordRequired", "")),
+                        "Lockout":     str(r.get("Lockout", "")),
+                        "Description": r.get("Description", ""),
+                    })
+                if not results:
+                    lines = _run(["wmic", "useraccount", "get",
+                                  "Name,SID,Disabled,PasswordRequired,LocalAccount",
+                                  "/format:csv"])
+                    for line in lines[1:]:
+                        parts = line.split(",")
+                        if len(parts) >= 5 and parts[1].strip():
+                            results.append({"Name": parts[1],
+                                            "SID": parts[5] if len(parts) > 5 else "",
+                                            "Disabled": parts[2], "PwdRequired": parts[4]})
             # Current logged-in users
             for u in psutil.users():
                 results.append({"User": u.name, "Terminal": u.terminal or "",
@@ -1310,16 +2645,43 @@ def collect_artifact(name, target_path=None, target_type="local"):
 
         elif name == "WMI Subscriptions":
             if OS == "Windows":
-                lines = _run(["wmic", "path",
-                               "ActiveScriptEventConsumer", "get", "/format:csv"])
-                for line in lines[1:]:
-                    if line.strip():
-                        results.append({"WMI Consumer": line.strip()})
-                lines = _run(["wmic", "path",
-                               "CommandLineEventConsumer", "get", "/format:csv"])
-                for line in lines[1:]:
-                    if line.strip():
-                        results.append({"WMI CmdLine Consumer": line.strip()})
+                # Enumerate the actual WMI persistence triple from
+                # root\subscription: filters, consumers, and their bindings.
+                for r in _ps_json(
+                        "Get-CimInstance -Namespace root/subscription "
+                        "-ClassName __EventFilter | "
+                        "Select-Object Name,Query,EventNamespace"):
+                    results.append({"Type": "EventFilter",
+                                    "Name": r.get("Name", ""),
+                                    "Detail": r.get("Query", ""),
+                                    "Namespace": r.get("EventNamespace", "")})
+                for r in _ps_json(
+                        "Get-CimInstance -Namespace root/subscription "
+                        "-ClassName ActiveScriptEventConsumer | "
+                        "Select-Object Name,ScriptingEngine,ScriptText,ScriptFileName"):
+                    results.append({"Type": "ActiveScriptConsumer",
+                                    "Name": r.get("Name", ""),
+                                    "Detail": (r.get("ScriptFileName") or
+                                               r.get("ScriptText") or "")[:300],
+                                    "Engine": r.get("ScriptingEngine", "")})
+                for r in _ps_json(
+                        "Get-CimInstance -Namespace root/subscription "
+                        "-ClassName CommandLineEventConsumer | "
+                        "Select-Object Name,CommandLineTemplate,ExecutablePath"):
+                    results.append({"Type": "CommandLineConsumer",
+                                    "Name": r.get("Name", ""),
+                                    "Detail": (r.get("CommandLineTemplate") or
+                                               r.get("ExecutablePath") or "")[:300]})
+                for r in _ps_json(
+                        "Get-CimInstance -Namespace root/subscription "
+                        "-ClassName __FilterToConsumerBinding | "
+                        "Select-Object Filter,Consumer"):
+                    results.append({"Type": "FilterToConsumerBinding",
+                                    "Name": str(r.get("Filter", "")),
+                                    "Detail": str(r.get("Consumer", ""))})
+                if not results:
+                    results.append({"Note": "No WMI event subscriptions found "
+                                            "(root\\subscription is empty)."})
             else:
                 results.append({"Note": "WMI is a Windows-only feature.",
                                  "Platform": OS})
@@ -2224,244 +3586,240 @@ def collect_artifact(name, target_path=None, target_type="local"):
             if not results:
                 results.append({"Note": "No calendar items extracted."})
 
-        # -- REMOVABLE MEDIA & USB --
-
-        elif name == "USB Device History":
+        # ── SHELLBAGS (live) ─────────────────────────────────────────
+        elif name == "Shellbags":
             if OS == "Windows":
-                try:
-                    import winreg as _wr
-                    usbstor = r"SYSTEM\CurrentControlSet\Enum\USBSTOR"
-                    with _wr.OpenKey(_wr.HKEY_LOCAL_MACHINE, usbstor) as root:
-                        i = 0
-                        while True:
-                            try:
-                                dev_class = _wr.EnumKey(root, i); i += 1
-                                with _wr.OpenKey(root, dev_class) as ckey:
-                                    j = 0
-                                    while True:
-                                        try:
-                                            serial = _wr.EnumKey(ckey, j)
-                                            j += 1
-                                            with _wr.OpenKey(
-                                                    ckey, serial) as skey:
-                                                def _qv(k):
-                                                    try:
-                                                        return _wr.QueryValueEx(
-                                                            skey, k)[0]
-                                                    except Exception:
-                                                        return ""
-                                                results.append({
-                                                    "DeviceClass":  dev_class,
-                                                    "SerialNumber": serial,
-                                                    "FriendlyName": _qv("FriendlyName"),
-                                                    "Manufacturer": _qv("Mfg"),
-                                                    "Service":      _qv("Service"),
-                                                    "Driver":       _qv("Driver"),
-                                                })
-                                        except OSError:
-                                            break
-                            except OSError:
-                                break
-                except PermissionError:
-                    results.append({
-                        "Note": "Access denied - run as Administrator for USB registry."})
-                except Exception as e:
-                    results.append({"Error": str(e), "Source": "USBSTOR Registry"})
-            else:
-                try:
-                    import subprocess as _sp
-                    r = _sp.run(
-                        ["udevadm", "info", "--export-db"],
-                        capture_output=True, text=True, timeout=20)
-                    for block in r.stdout.split("\n\n"):
-                        if "ID_BUS=usb" in block and "ID_TYPE=disk" in block:
-                            info = {}
-                            for line in block.splitlines():
-                                if "E: " in line and "=" in line:
-                                    rest = line.partition("E: ")[2]
-                                    k, _, v = rest.partition("=")
-                                    info[k.strip()] = v.strip()
-                            if info:
-                                results.append({
-                                    "Device":     info.get("DEVNAME", ""),
-                                    "Vendor":     info.get("ID_VENDOR", ""),
-                                    "Model":      info.get("ID_MODEL", ""),
-                                    "Serial":     info.get("ID_SERIAL_SHORT", ""),
-                                    "Filesystem": info.get("ID_FS_TYPE", ""),
-                                    "Label":      info.get("ID_FS_LABEL", ""),
-                                })
-                except Exception:
-                    pass
-                try:
-                    import subprocess as _sp
-                    dm = _sp.run(
-                        ["dmesg"], capture_output=True, text=True, timeout=10)
-                    for line in dm.stdout.splitlines():
-                        ll = line.lower()
-                        if "usb" in ll and any(
-                                x in ll for x in
-                                ("new usb", "attached", "disconnect",
-                                 "product:", "manufacturer:")):
-                            results.append({"dmesg": line.strip()})
-                except Exception:
-                    pass
-            if not results:
-                results.append({
-                    "Note": "No USB records found. Run as Administrator/root."})
-        elif name == "USB First/Last Connection Times":
-            if OS == "Windows":
-                import re as _re
-                setupapi = os.path.join(
-                    os.environ.get("SystemRoot", r"C:\Windows"),
-                    "INF", "setupapi.dev.log")
-                if os.path.isfile(setupapi):
-                    try:
-                        with open(setupapi, "r",
-                                  encoding="utf-8", errors="ignore") as f:
-                            content = f.read()
-                        for m in list(_re.finditer(
-                                r">>>.*?USBSTOR.*?<<<.*?start.*?\n.*?time.*?\n",
-                                content,
-                                _re.DOTALL | _re.IGNORECASE))[:60]:
-                            blk   = m.group(0)
-                            ts_m  = _re.search(
-                                r"start\s+(\d{4}/\d{2}/\d{2}[^\n]+)", blk)
-                            dev_m = _re.search(
-                                r"USBSTOR\\[^\\]+\\([^\s\]\\]+)", blk)
-                            results.append({
-                                "FirstConnected": ts_m.group(1).strip()
-                                                  if ts_m else "",
-                                "DeviceID":       dev_m.group(1).strip()
-                                                  if dev_m else "",
-                                "Source":         "SetupAPI.dev.log",
-                            })
-                    except Exception as e:
-                        results.append({"Source": "SetupAPI", "Error": str(e)})
-                try:
-                    import subprocess as _sp
-                    out = _sp.run(
-                        ["wevtutil", "qe",
-                         "Microsoft-Windows-DriverFrameworks-UserMode/Operational",
-                         "/q:*[System[(EventID=2003 or EventID=2100)]]",
-                         "/f:text", "/c:200"],
-                        capture_output=True, text=True, timeout=25)
-                    for line in out.stdout.splitlines():
-                        ls = line.strip()
-                        if ls:
-                            results.append({"EventLog": ls})
-                except Exception:
-                    pass
-            else:
-                results.append({
-                    "Note": "USB connection-time keys are Windows-only."})
-            if not results:
-                results.append({"Note": "No USB connection-time records found."})
-        elif name == "Drive Letter Assignments":
-            try:
-                for p in psutil.disk_partitions(all=True):
-                    try:
-                        u = psutil.disk_usage(p.mountpoint)
-                        results.append({
-                            "Device":     p.device,
-                            "Mountpoint": p.mountpoint,
-                            "Filesystem": p.fstype,
-                            "Options":    p.opts,
-                            "Total":      fmt_size(u.total),
-                            "Used":       fmt_size(u.used),
-                            "Free":       fmt_size(u.free),
-                            "UsedPct":    f"{u.percent:.1f}%",
-                        })
-                    except Exception:
-                        results.append({
-                            "Device":     p.device,
-                            "Mountpoint": p.mountpoint,
-                            "Filesystem": p.fstype,
-                        })
-            except Exception as e:
-                results.append({"Error": str(e)})
-            if OS == "Windows":
-                try:
-                    import winreg as _wr
-                    mp2 = (r"SOFTWARE\Microsoft\Windows\CurrentVersion" r"\Explorer\MountPoints2")
-                    with _wr.OpenKey(_wr.HKEY_CURRENT_USER, mp2) as key:
-                        i = 0
-                        while True:
-                            try:
-                                guid = _wr.EnumKey(key, i); i += 1
-                                results.append(
-                                    {"MountPoints2_GUID": guid,
-                                     "Source": "HKCU MountPoints2"})
-                            except OSError:
-                                break
-                except Exception:
-                    pass
-            if not results:
-                results.append({"Note": "No drive assignment records found."})
-        elif name == "Volume Serial Numbers":
-            if OS == "Windows":
-                try:
-                    import winreg as _wr, struct as _st
-                    with _wr.OpenKey(
-                            _wr.HKEY_LOCAL_MACHINE,
-                            r"SYSTEM\MountedDevices") as key:
-                        i = 0
-                        while True:
-                            try:
-                                vname, data, _ = _wr.EnumValue(key, i)
+                import winreg
+                def _walk_bagmru(root_h, base, src):
+                    def _walk(subpath, kpath):
+                        try:
+                            k = winreg.OpenKey(root_h, subpath)
+                        except Exception:
+                            return
+                        try:
+                            i = 0
+                            while True:
+                                try:
+                                    vn, vd, vt = winreg.EnumValue(k, i)
+                                except OSError:
+                                    break
                                 i += 1
-                                if (data and len(data) >= 12
-                                        and ("DosDevices" in vname
-                                             or "#" in vname)):
-                                    try:
-                                        vsn = _st.unpack_from(
-                                            "<I", data, 8)[0]
-                                        results.append({
-                                            "MountPoint":   vname,
-                                            "VolumeSerial": "%08X" % vsn,
-                                            "RawBytes":     len(data),
-                                        })
-                                    except Exception:
-                                        results.append({
-                                            "MountPoint": vname,
-                                            "RawBytes":   len(data),
-                                        })
+                                if vn in ("MRUListEx", "NodeSlot", "NodeSlots"):
+                                    continue
+                                if isinstance(vd, bytes) and len(vd) > 2:
+                                    decoded = vd[2:].decode("utf-16-le", errors="replace")
+                                    decoded = "".join(c for c in decoded if c.isprintable())
+                                    if decoded.strip():
+                                        results.append({"Source": src,
+                                                        "Key": kpath or "BagMRU",
+                                                        "Value": vn,
+                                                        "Data": decoded[:200]})
+                            j = 0
+                            while True:
+                                try:
+                                    sk = winreg.EnumKey(k, j)
+                                except OSError:
+                                    break
+                                j += 1
+                                _walk(subpath + "\\" + sk,
+                                      (kpath + "\\" + sk) if kpath else sk)
+                        finally:
+                            winreg.CloseKey(k)
+                    _walk(base, "")
+                _walk_bagmru(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\Shell\BagMRU", "NTUSER.DAT")
+                _walk_bagmru(winreg.HKEY_CURRENT_USER,
+                             r"Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\BagMRU",
+                             "UsrClass.dat")
+                if not results:
+                    results.append({"Note": "No shellbag entries found for current user."})
+            else:
+                results.append({"Note": "Shellbags are a Windows-only artifact.", "Platform": OS})
+
+        # ── USERASSIST (live) ────────────────────────────────────────
+        elif name == "UserAssist Keys":
+            if OS == "Windows":
+                import winreg, codecs
+                base = r"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist"
+                try:
+                    ua = winreg.OpenKey(winreg.HKEY_CURRENT_USER, base)
+                except Exception:
+                    ua = None
+                if ua:
+                    gi = 0
+                    while True:
+                        try:
+                            guid = winreg.EnumKey(ua, gi)
+                        except OSError:
+                            break
+                        gi += 1
+                        try:
+                            ck = winreg.OpenKey(ua, guid + r"\Count")
+                        except Exception:
+                            continue
+                        vi = 0
+                        while True:
+                            try:
+                                vn, vd, vt = winreg.EnumValue(ck, vi)
                             except OSError:
                                 break
-                except PermissionError:
-                    results.append(
-                        {"Note": "Access denied - run as Administrator."})
-                except Exception as e:
-                    results.append({"Error": str(e)})
+                            vi += 1
+                            app = codecs.decode(vn, "rot_13")
+                            run_count = last_run = ""
+                            if isinstance(vd, bytes) and len(vd) >= 16:
+                                try:
+                                    run_count = struct.unpack_from("<I", vd, 4)[0]
+                                    ft = struct.unpack_from("<Q", vd, 8)[0]
+                                    if ft:
+                                        last_run = (datetime.datetime(1601, 1, 1) +
+                                                    datetime.timedelta(microseconds=ft / 10)
+                                                    ).strftime("%Y-%m-%d %H:%M:%S")
+                                except Exception:
+                                    pass
+                            results.append({"Application": app, "RunCount": run_count,
+                                            "LastRun": last_run, "GUID": guid})
+                        winreg.CloseKey(ck)
+                    winreg.CloseKey(ua)
+                if not results:
+                    results.append({"Note": "No UserAssist entries found for current user."})
             else:
-                import subprocess as _sp
-                done = False
-                for cmd in (
-                    ["lsblk", "-o",
-                     "NAME,UUID,FSTYPE,LABEL,SIZE,MOUNTPOINT"],
-                    ["blkid"],
-                ):
-                    try:
-                        r = _sp.run(
-                            cmd, capture_output=True,
-                            text=True, timeout=10)
-                        if r.returncode == 0:
-                            for line in r.stdout.splitlines():
-                                if line.strip():
-                                    results.append(
-                                        {"Output": line.strip(),
-                                         "Source": cmd[0]})
-                            done = True
-                            break
-                    except Exception:
-                        pass
-                if not done:
-                    results.append(
-                        {"Note": "lsblk/blkid not available on this system."})
-            if not results:
-                results.append(
-                    {"Note": "No volume serial number records found."})
+                results.append({"Note": "UserAssist is a Windows-only artifact.", "Platform": OS})
 
-        # -- GENERIC FALLBACK for any uncaught names --
+        # ── JUMP LISTS (live) ────────────────────────────────────────
+        elif name == "Jump Lists":
+            if OS == "Windows":
+                recent = Path.home() / r"AppData\Roaming\Microsoft\Windows\Recent"
+                for sub in ("AutomaticDestinations", "CustomDestinations"):
+                    d = recent / sub
+                    if not d.exists():
+                        continue
+                    for f in d.iterdir():
+                        if not f.is_file():
+                            continue
+                        info = {"File": f.name, "Type": sub,
+                                "Size": fmt_size(f.stat().st_size),
+                                "Modified": fmt_ts(f.stat().st_mtime), "Targets": ""}
+                        try:
+                            import olefile
+                            data = f.read_bytes()
+                            if olefile.isOleFile(f):
+                                ole = olefile.OleFileIO(f)
+                                tgts = []
+                                for stream in ole.listdir():
+                                    try:
+                                        raw = ole.openstream(stream).read()
+                                        if raw[:4] == b"\x4c\x00\x00\x00":
+                                            p = _lnk_localpath(raw)
+                                            if p:
+                                                tgts.append(p)
+                                    except Exception:
+                                        pass
+                                ole.close()
+                                info["Targets"] = " | ".join(tgts)[:300]
+                        except ImportError:
+                            info["Note"] = "pip install olefile for full target parsing"
+                        except Exception:
+                            pass
+                        results.append(info)
+                if not results:
+                    results.append({"Note": "No jump lists found for current user."})
+            else:
+                results.append({"Note": "Jump Lists are a Windows-only artifact.", "Platform": OS})
+
+        # ── WINDOWS SEARCH HISTORY (live) ────────────────────────────
+        elif name == "Windows Search History":
+            if OS == "Windows":
+                import winreg
+                base = r"Software\Microsoft\Windows\CurrentVersion\Explorer\WordWheelQuery"
+                try:
+                    k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, base)
+                except Exception:
+                    k = None
+                if k:
+                    i = 0
+                    while True:
+                        try:
+                            vn, vd, vt = winreg.EnumValue(k, i)
+                        except OSError:
+                            break
+                        i += 1
+                        if vn == "MRUListEx":
+                            continue
+                        if isinstance(vd, bytes):
+                            term = vd.decode("utf-16-le", errors="replace").rstrip("\x00")
+                            term = "".join(c for c in term if c.isprintable())
+                            if term:
+                                results.append({"SearchTerm": term, "ValueName": vn})
+                    winreg.CloseKey(k)
+                if not results:
+                    results.append({"Note": "No Explorer search history (WordWheelQuery) found."})
+            else:
+                results.append({"Note": "Windows Search History is a Windows-only artifact.",
+                                "Platform": OS})
+
+        # ── TYPED URLS (live) ────────────────────────────────────────
+        elif name == "Typed URLs":
+            if OS == "Windows":
+                import winreg
+                for base, kind in [
+                    (r"Software\Microsoft\Internet Explorer\TypedURLs", "TypedURL"),
+                    (r"Software\Microsoft\Windows\CurrentVersion\Explorer\TypedPaths", "TypedPath"),
+                ]:
+                    try:
+                        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, base)
+                    except Exception:
+                        continue
+                    i = 0
+                    while True:
+                        try:
+                            vn, vd, vt = winreg.EnumValue(k, i)
+                        except OSError:
+                            break
+                        i += 1
+                        results.append({"Type": kind, "Entry": vn, "Value": str(vd)})
+                    winreg.CloseKey(k)
+                if not results:
+                    results.append({"Note": "No typed URLs/paths found for current user."})
+            else:
+                results.append({"Note": "Typed URLs is a Windows-only artifact.", "Platform": OS})
+
+        # ── CACHED CREDENTIALS (live) ────────────────────────────────
+        elif name == "Cached Credentials":
+            if OS == "Windows":
+                # Credential Manager (cmdkey) — stored generic/domain creds.
+                cur = {}
+                for line in _run(["cmdkey", "/list"], timeout=10):
+                    s = line.strip()
+                    if s.lower().startswith("target:"):
+                        if cur:
+                            results.append(cur)
+                        cur = {"Source": "Credential Manager",
+                               "Target": s.split(":", 1)[1].strip()}
+                    elif s.lower().startswith("type:"):
+                        cur["Type"] = s.split(":", 1)[1].strip()
+                    elif s.lower().startswith("user:"):
+                        cur["User"] = s.split(":", 1)[1].strip()
+                if cur:
+                    results.append(cur)
+                # DPAPI-protected credential blob files on disk.
+                for base in [Path.home() / r"AppData\Local\Microsoft\Credentials",
+                             Path.home() / r"AppData\Roaming\Microsoft\Credentials"]:
+                    if base.exists():
+                        for f in base.iterdir():
+                            if f.is_file():
+                                results.append({"Source": "DPAPI Credential Blob",
+                                                "Target": f.name,
+                                                "Type": "Encrypted (DPAPI)",
+                                                "User": fmt_size(f.stat().st_size)})
+                results.append({"Source": "HKLM\\SECURITY\\Cache",
+                                "Target": "MS-Cache v2 domain hashes",
+                                "Type": "Requires SYSTEM privileges",
+                                "Note": "Collect SECURITY hive offline/remotely to recover NL$ entries."})
+            else:
+                results.append({"Note": "Cached Credentials is a Windows-only artifact.",
+                                "Platform": OS})
+
+        # ── GENERIC FALLBACK for any uncaught names ───────────────────
         else:
             results.append({
                 "Artifact":  name,
@@ -2475,6 +3833,891 @@ def collect_artifact(name, target_path=None, target_type="local"):
         results.append({"Error": str(e), "Artifact": name,
                         "Traceback": __import__('traceback').format_exc()[:500]})
 
+    return results
+
+
+
+
+
+# ══════════════════════════════════════════════════════════════
+#  NATIVE WINDOWS REMOTE COLLECTION  (zero third-party deps)
+# ══════════════════════════════════════════════════════════════
+#
+#  Transport is built entirely on signed, in-box Windows binaries — there is
+#  NO paramiko / impacket / smbclient dependency anywhere in this path:
+#    * net.exe        – authenticate to the admin share (IPC$, C$)
+#    * robocopy.exe   – pull evidence files back into the case folder
+#    * reg.exe        – remote registry query / hive save (\\HOST\HKLM...)
+#    * wevtutil.exe   – remote event-log queries (/r /u /p)
+#    * schtasks.exe   – remote scheduled-task enumeration (/s /u /p)
+#    * tasklist.exe   – remote process listing (/s /u /p)
+#    * sc.exe         – remote service control manager (\\HOST query)
+#    * query.exe      – remote logon sessions (query session /server:)
+#    * powershell.exe – Get-CimInstance over DCOM + Invoke-Command over WinRM
+#
+#  Workflow: copy the relevant evidence files back to the case folder, then
+#  parse them locally with the same parsers used for forensic images.  Live /
+#  volatile data that has no on-disk file is queried with the native tools.
+
+# Module-level registry of configured remote targets, keyed by host.
+REMOTE_TARGETS = {}     # host -> {"host","user","password","domain","case_dir"}
+
+
+def register_remote_target(host, user="", password="", domain="", case_dir=""):
+    """Store credentials + case folder for a remote host so the artifact
+    worker can look them up by host string later."""
+    host = (host or "").strip().lstrip("\\").split("\\")[0]
+    if "\\" in user and not domain:
+        domain, user = user.split("\\", 1)
+    if not case_dir:
+        base = os.path.join(os.path.expanduser("~"), "ForensicPro_Cases")
+        case_dir = os.path.join(
+            base, "%s_%s" % (host or "remote",
+                             datetime.datetime.now().strftime("%Y%m%d_%H%M%S")))
+    REMOTE_TARGETS[host] = {"host": host, "user": user, "password": password,
+                            "domain": domain, "case_dir": case_dir}
+    return REMOTE_TARGETS[host]
+
+
+def _parse_reg_values(lines):
+    """Parse reg.exe query output into list of {Key,Name,Type,Data}."""
+    rows, cur_key = [], ""
+    for ln in lines:
+        if not ln.strip():
+            continue
+        if ln.lstrip().startswith("HKEY"):
+            cur_key = ln.strip()
+            continue
+        m = re.match(r"^\s{2,}(.+?)\s{2,}(REG_[A-Z_]+)\s{2,}(.*)$", ln)
+        if m:
+            rows.append({"Key": cur_key, "Name": m.group(1).strip(),
+                         "Type": m.group(2), "Data": m.group(3).strip()})
+    return rows
+
+
+def _parse_reg_subkeys(lines, parent):
+    """Return immediate subkey names under <parent> from reg query output."""
+    out = []
+    pl = parent.lower().rstrip("\\")
+    for ln in lines:
+        s = ln.strip()
+        if s.lower().startswith("hkey") and s.lower() != pl and "\\" in s:
+            # keep only one level below parent
+            rest = s[len(parent):].strip("\\") if s.lower().startswith(pl) else ""
+            if rest and "\\" not in rest:
+                out.append(rest)
+    return out
+
+
+def _parse_wevtutil_text(lines):
+    """Parse `wevtutil ... /f:text` output into a list of event dicts."""
+    events, cur, descbuf, in_desc = [], None, [], False
+
+    def _flush():
+        if cur is not None:
+            if descbuf:
+                cur["Description"] = " ".join(descbuf)[:300]
+            events.append(cur)
+
+    for ln in lines:
+        if ln.startswith("Event["):
+            _flush()
+            cur, descbuf, in_desc = {}, [], False
+            continue
+        if cur is None:
+            continue
+        s = ln.strip()
+        if s.startswith("Description:"):
+            in_desc = True
+            rest = s.split(":", 1)[1].strip()
+            if rest:
+                descbuf.append(rest)
+            continue
+        if (not in_desc) and ":" in s:
+            k, _, v = s.partition(":")
+            cur[k.strip()] = v.strip()
+        elif in_desc and s:
+            descbuf.append(s)
+    _flush()
+    return events
+
+
+def _sqlite_rows_local(db_path, sql, params=()):
+    """Query a (locally copied) SQLite DB safely via a temp copy."""
+    import sqlite3 as _sq
+    rows, tmp = [], db_path + ".rc_tmp"
+    try:
+        shutil.copy2(db_path, tmp)
+        con = _sq.connect(tmp)
+        con.row_factory = _sq.Row
+        for r in con.execute(sql, params).fetchall():
+            rows.append(dict(r))
+        con.close()
+    except Exception as e:
+        rows.append({"Error": str(e)})
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+    return rows
+
+
+class RemoteCollector:
+    """Native-tool remote triage for a single Windows host."""
+
+    EVTX_DIR = r"Windows\System32\winevt\Logs"
+    PREFETCH = r"Windows\Prefetch"
+
+    # artifact name -> (event channel, optional XPath filter)
+    EVENT_LOG_MAP = {
+        "Security Event Log":    ("Security", None),
+        "System Event Log":      ("System", None),
+        "Application Event Log": ("Application", None),
+        "PowerShell Operational Log":
+            ("Microsoft-Windows-PowerShell/Operational", None),
+        "RDP Session Log":
+            ("Microsoft-Windows-TerminalServices-LocalSessionManager/Operational", None),
+        "Account Logon Events":
+            ("Security", "*[System[(EventID=4624 or EventID=4625)]]"),
+        "Process Creation Events (4688)":
+            ("Security", "*[System[(EventID=4688)]]"),
+    }
+
+    VOLATILE_UNSUPPORTED = {
+        "Process Memory Strings", "Injected DLLs", "Hollowed Processes",
+        "Heap Allocations", "Kernel Objects",
+    }
+
+    def __init__(self, cfg):
+        self.host     = cfg["host"]
+        self.user     = cfg.get("user", "")
+        self.password = cfg.get("password", "")
+        self.domain   = cfg.get("domain", "")
+        self.case_dir = cfg.get("case_dir") or os.path.join(
+            os.path.expanduser("~"), "ForensicPro_Cases", self.host)
+        self.evidence_dir = os.path.join(self.case_dir, "evidence", self.host)
+        os.makedirs(self.evidence_dir, exist_ok=True)
+        self._connected = False
+
+    # ── identity helpers ──────────────────────────────────────────
+    @property
+    def full_user(self):
+        return ("%s\\%s" % (self.domain, self.user)) if self.domain else self.user
+
+    def unc(self, rel, share="C$"):
+        return r"\\%s\%s\%s" % (self.host, share, rel.lstrip("\\"))
+
+    # ── low-level runners ─────────────────────────────────────────
+    @staticmethod
+    def _run(cmd, timeout=120, env=None):
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout, env=env)
+            return p.returncode, p.stdout or "", p.stderr or ""
+        except Exception as e:
+            return 1, "", str(e)
+
+    def _ps(self, script, timeout=120):
+        """Run PowerShell with target credential available as $cred.
+        Password is supplied via env var (not the command line)."""
+        env = dict(os.environ)
+        env["RC_PW"] = self.password
+        pre = (
+            "$ErrorActionPreference='Stop';"
+            "$u='%s';"
+            "$sp=ConvertTo-SecureString $env:RC_PW -AsPlainText -Force;"
+            "$cred=New-Object System.Management.Automation.PSCredential($u,$sp);"
+        ) % self.full_user.replace("'", "''")
+        cmd = ["powershell", "-NoProfile", "-NonInteractive",
+               "-ExecutionPolicy", "Bypass", "-Command", pre + script]
+        return self._run(cmd, timeout=timeout, env=env)
+
+    def _ps_json(self, script, timeout=120):
+        rc, out, err = self._ps(script + " | ConvertTo-Json -Depth 4 -Compress", timeout)
+        out = (out or "").strip()
+        if not out:
+            return []
+        try:
+            data = json.loads(out)
+        except Exception:
+            return []
+        if isinstance(data, dict):
+            return [data]
+        return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
+
+    def _cim(self, class_name, props, namespace="root/cimv2", where=None, timeout=120):
+        """Get-CimInstance over a DCOM session (works without WinRM)."""
+        flt = (" -Filter \"%s\"" % where) if where else ""
+        sel = ",".join(props)
+        script = (
+            "$o=New-CimSessionOption -Protocol Dcom;"
+            "$s=New-CimSession -ComputerName '%s' -Credential $cred -SessionOption $o;"
+            "Get-CimInstance -CimSession $s -Namespace %s -ClassName %s%s | "
+            "Select-Object %s"
+        ) % (self.host, namespace, class_name, flt, sel)
+        return self._ps_json(script, timeout)
+
+    def _invoke(self, scriptblock, timeout=120):
+        """Invoke-Command over WinRM (PowerShell remoting)."""
+        script = (
+            "Invoke-Command -ComputerName '%s' -Credential $cred -ScriptBlock {%s}"
+        ) % (self.host, scriptblock)
+        return self._ps_json(script, timeout)
+
+    # ── connection management ─────────────────────────────────────
+    def connect(self):
+        if self._connected:
+            return True, ""
+        self._run(["net", "use", r"\\%s\IPC$" % self.host, "/delete", "/y"], timeout=20)
+        cmd = ["net", "use", r"\\%s\IPC$" % self.host]
+        if self.password:
+            cmd.append(self.password)
+        if self.user:
+            cmd.append("/user:" + self.full_user)
+        rc, out, err = self._run(cmd, timeout=30)
+        if rc == 0:
+            self._connected = True
+            return True, "Connected to \\\\%s\\IPC$" % self.host
+        return False, (err or out or "net use failed").strip()
+
+    def disconnect(self):
+        for share in ("IPC$", "C$"):
+            self._run(["net", "use", r"\\%s\%s" % (self.host, share),
+                       "/delete", "/y"], timeout=20)
+        self._connected = False
+
+    # ── file collection ───────────────────────────────────────────
+    def copy_back(self, rel_paths, dest_subdir="", share="C$", pattern=None):
+        """Copy file(s) from the admin share into the case evidence folder.
+        Returns list of collected local file paths."""
+        collected = []
+        dest_root = (os.path.join(self.evidence_dir, dest_subdir)
+                     if dest_subdir else self.evidence_dir)
+        os.makedirs(dest_root, exist_ok=True)
+        items = rel_paths if isinstance(rel_paths, (list, tuple)) else [rel_paths]
+        if pattern:
+            for rel in items:
+                src = self.unc(rel, share)
+                self._run(["robocopy", src, dest_root, pattern, "/COPY:DAT",
+                           "/R:1", "/W:1", "/NFL", "/NDL", "/NJH", "/NJS", "/NP"],
+                          timeout=900)
+            for f in Path(dest_root).rglob("*"):
+                if f.is_file():
+                    collected.append(str(f))
+        else:
+            for rel in items:
+                src = self.unc(rel, share)
+                name = os.path.basename(rel)
+                dst = os.path.join(dest_root, name)
+                try:
+                    shutil.copy2(src, dst)
+                    collected.append(dst)
+                except Exception:
+                    self._run(["robocopy", os.path.dirname(src), dest_root, name,
+                               "/COPY:DAT", "/R:1", "/W:1", "/NFL", "/NDL",
+                               "/NJH", "/NJS", "/NP"], timeout=300)
+                    if os.path.exists(dst):
+                        collected.append(dst)
+        return collected
+
+    def list_share_dir(self, rel, share="C$"):
+        d = self.unc(rel, share)
+        try:
+            return sorted(os.path.join(d, n) for n in os.listdir(d))
+        except Exception:
+            return []
+
+    def user_profiles(self):
+        """Return list of (username, C$-relative profile path) on the target."""
+        out = []
+        for p in self.list_share_dir("Users"):
+            name = os.path.basename(p.rstrip("\\"))
+            if name.lower() in ("public", "default", "default user",
+                                "all users", "defaultaccount"):
+                continue
+            if os.path.isdir(p):
+                out.append((name, "Users\\" + name))
+        return out
+
+    # ── native remote query helpers ──────────────────────────────
+    def wevtutil(self, log, xpath=None, count=200):
+        cmd = ["wevtutil", "qe", log, "/c:%d" % count, "/rd:true",
+               "/f:text", "/r:" + self.host]
+        if self.user:
+            cmd += ["/u:" + self.full_user, "/p:" + self.password]
+        if xpath:
+            cmd += ["/q:" + xpath]
+        rc, out, err = self._run(cmd, timeout=240)
+        return out.splitlines()
+
+    def reg_query(self, hive_path, recurse=False):
+        full = r"\\%s\%s" % (self.host, hive_path)
+        cmd = ["reg", "query", full] + (["/s"] if recurse else [])
+        rc, out, err = self._run(cmd, timeout=180)
+        return out.splitlines() if rc == 0 else []
+
+    def reg_save(self, hive_path, out_name):
+        full = r"\\%s\%s" % (self.host, hive_path)
+        dst = os.path.join(self.evidence_dir, out_name)
+        try:
+            if os.path.exists(dst):
+                os.remove(dst)
+        except Exception:
+            pass
+        rc, out, err = self._run(["reg", "save", full, dst, "/y"], timeout=240)
+        return dst if (rc == 0 and os.path.exists(dst)) else ""
+
+    def hku_sids(self):
+        """Enumerate real user SIDs loaded under HKU on the target."""
+        lines = self.reg_query("HKU")
+        sids = []
+        for ln in lines:
+            s = ln.strip()
+            if s.upper().startswith("HKEY_USERS\\"):
+                sid = s.split("\\", 1)[1]
+                if (sid.startswith("S-1-5-21") and not sid.endswith("_Classes")):
+                    sids.append(sid)
+        return sids
+
+    # ── tabular native tools ─────────────────────────────────────
+    def tasklist(self):
+        cmd = ["tasklist", "/s", self.host]
+        if self.user:
+            cmd += ["/u", self.full_user, "/p", self.password]
+        cmd += ["/v", "/fo", "csv"]
+        rc, out, err = self._run(cmd, timeout=120)
+        return self._csv_dicts(out)
+
+    def schtasks(self):
+        cmd = ["schtasks", "/query", "/s", self.host]
+        if self.user:
+            cmd += ["/u", self.full_user, "/p", self.password]
+        cmd += ["/v", "/fo", "csv"]
+        rc, out, err = self._run(cmd, timeout=120)
+        return self._csv_dicts(out)
+
+    def query_session(self):
+        rc, out, err = self._run(["query", "session", "/server:" + self.host], timeout=60)
+        rows = []
+        lines = out.splitlines()
+        for ln in lines[1:]:
+            parts = ln.split()
+            if parts:
+                rows.append({"SessionName": parts[0] if len(parts) > 0 else "",
+                             "Username": parts[1] if len(parts) > 1 else "",
+                             "ID": parts[2] if len(parts) > 2 else "",
+                             "State": parts[3] if len(parts) > 3 else ""})
+        return rows
+
+    @staticmethod
+    def _csv_dicts(text):
+        import csv as _csv
+        lines = [l for l in text.splitlines() if l.strip()]
+        if not lines:
+            return []
+        rdr = _csv.reader(lines)
+        header = next(rdr, [])
+        rows = []
+        for row in rdr:
+            if row and row != header:
+                rows.append(dict(zip(header, row)))
+        return rows
+
+
+def collect_artifact_remote(name, host):
+    """Dispatch a single artifact collection against a remote Windows host
+    using only native, signed Windows tooling.  Returns list[dict] rows."""
+    cfg = REMOTE_TARGETS.get(host)
+    if not cfg:
+        # Allow bare-host targets with the current logon token / no creds.
+        cfg = register_remote_target(host)
+
+    if platform.system() != "Windows":
+        return [{"Error": "Remote collection uses native Windows tools and must "
+                          "run from a Windows examiner host.",
+                 "Host": host}]
+
+    rc_obj = RemoteCollector(cfg)
+    ok, msg = rc_obj.connect()
+    if not ok:
+        return [{"Error": "Could not authenticate to \\\\%s (admin share). %s" % (host, msg),
+                 "Hint": "Verify credentials, that the host is reachable, and that "
+                         "File & Printer Sharing / Admin shares are enabled."}]
+
+    results = []
+    try:
+        # ── Volatile memory artifacts: not collectable without an agent ──
+        if name in RemoteCollector.VOLATILE_UNSUPPORTED:
+            return [{"Note": "%s is volatile in-memory data and cannot be acquired "
+                             "remotely with native tools — use a live local "
+                             "collection or a memory image." % name, "Host": host}]
+
+        # ── EVENT LOGS (native wevtutil /r) ────────────────────────
+        if name in RemoteCollector.EVENT_LOG_MAP:
+            log, xpath = RemoteCollector.EVENT_LOG_MAP[name]
+            # Also archive the raw .evtx back to the case folder for re-analysis.
+            evtx_file = {"Security": "Security.evtx", "System": "System.evtx",
+                         "Application": "Application.evtx"}.get(log)
+            if evtx_file:
+                got = rc_obj.copy_back([RemoteCollector.EVTX_DIR + "\\" + evtx_file],
+                                       dest_subdir="EventLogs")
+            events = _parse_wevtutil_text(rc_obj.wevtutil(log, xpath, count=300))
+            for ev in events:
+                results.append({
+                    "Event ID": ev.get("Event ID", ""),
+                    "Date":     ev.get("Date", ""),
+                    "Source":   ev.get("Source", ""),
+                    "Level":    ev.get("Level", ""),
+                    "Computer": ev.get("Computer", ""),
+                    "Description": ev.get("Description", "")[:200],
+                })
+            if not results:
+                results.append({"Note": "No events returned from %s (channel may be "
+                                        "empty or access denied)." % log})
+
+        # ── RUNNING PROCESSES (tasklist /s) ────────────────────────
+        elif name == "Running Processes":
+            for r in rc_obj.tasklist():
+                results.append({
+                    "Name": r.get("Image Name", ""),
+                    "PID":  r.get("PID", ""),
+                    "Session": r.get("Session Name", ""),
+                    "Memory": r.get("Mem Usage", ""),
+                    "User": r.get("User Name", ""),
+                    "Status": r.get("Status", ""),
+                    "Title": r.get("Window Title", ""),
+                })
+
+        # ── SCHEDULED TASKS (schtasks /s) ──────────────────────────
+        elif name in ("Scheduled Tasks", "Task Scheduler Jobs"):
+            seen = set()
+            for r in rc_obj.schtasks():
+                tn = r.get("TaskName", "")
+                if tn and tn not in seen:
+                    seen.add(tn)
+                    results.append({
+                        "TaskName": tn,
+                        "Status": r.get("Status", ""),
+                        "Next Run": r.get("Next Run Time", ""),
+                        "Last Run": r.get("Last Run Time", ""),
+                        "Author": r.get("Author", ""),
+                        "Run As": r.get("Run As User", ""),
+                        "Command": r.get("Task To Run", "")[:160],
+                    })
+
+        # ── LOGON SESSIONS ─────────────────────────────────────────
+        elif name == "Last Login Times":
+            results.extend(rc_obj.query_session() or [])
+            events = _parse_wevtutil_text(
+                rc_obj.wevtutil("Security", "*[System[(EventID=4624)]]", count=80))
+            for ev in events:
+                results.append({"Event ID": ev.get("Event ID", "4624"),
+                                "Date": ev.get("Date", ""),
+                                "Description": ev.get("Description", "")[:200]})
+            if not results:
+                results.append({"Note": "No session/logon data returned."})
+
+        # ── SERVICES (CIM Win32_Service) ───────────────────────────
+        elif name == "Services (Auto-Start)":
+            for r in rc_obj._cim("Win32_Service",
+                                 ["Name", "DisplayName", "State", "StartMode",
+                                  "StartName", "PathName"]):
+                if str(r.get("StartMode", "")).lower() in ("auto", "automatic") or True:
+                    results.append({
+                        "Name": r.get("Name", ""),
+                        "Display": r.get("DisplayName", ""),
+                        "State": r.get("State", ""),
+                        "StartMode": r.get("StartMode", ""),
+                        "Account": r.get("StartName", ""),
+                        "Path": (r.get("PathName") or "")[:160],
+                    })
+            if not results:
+                results.append({"Note": "No services returned (DCOM/WMI may be blocked)."})
+
+        # ── LOADED DRIVERS (CIM Win32_SystemDriver) ────────────────
+        elif name == "Loaded Drivers/Modules":
+            for r in rc_obj._cim("Win32_SystemDriver",
+                                 ["Name", "State", "StartMode", "PathName"]):
+                results.append({"Module": r.get("Name", ""),
+                                "State": r.get("State", ""),
+                                "StartMode": r.get("StartMode", ""),
+                                "Path": (r.get("PathName") or "")[:160]})
+
+        # ── NETWORK INTERFACES (CIM) ───────────────────────────────
+        elif name == "Network Interfaces":
+            for r in rc_obj._cim("Win32_NetworkAdapterConfiguration",
+                                 ["Description", "MACAddress", "IPAddress",
+                                  "DefaultIPGateway", "DHCPEnabled", "DNSServerSearchOrder"],
+                                 where="IPEnabled=True"):
+                ip = r.get("IPAddress")
+                results.append({
+                    "Interface": r.get("Description", ""),
+                    "MAC": r.get("MACAddress", ""),
+                    "Address": ", ".join(ip) if isinstance(ip, list) else (ip or ""),
+                    "Gateway": ", ".join(r.get("DefaultIPGateway") or [])
+                               if isinstance(r.get("DefaultIPGateway"), list)
+                               else (r.get("DefaultIPGateway") or ""),
+                    "DHCP": str(r.get("DHCPEnabled", "")),
+                })
+
+        # ── ACTIVE CONNECTIONS (WinRM Get-NetTCPConnection) ────────
+        elif name == "Active Connections":
+            rows = rc_obj._invoke(
+                "Get-NetTCPConnection | Select-Object LocalAddress,LocalPort,"
+                "RemoteAddress,RemotePort,State,OwningProcess")
+            for r in rows:
+                results.append({
+                    "Local": "%s:%s" % (r.get("LocalAddress", ""), r.get("LocalPort", "")),
+                    "Remote": "%s:%s" % (r.get("RemoteAddress", ""), r.get("RemotePort", "")),
+                    "State": r.get("State", ""),
+                    "PID": r.get("OwningProcess", ""),
+                })
+            if not results:
+                results.append({"Note": "Active connections require PowerShell Remoting "
+                                        "(WinRM) on the target — none returned."})
+
+        # ── ARP / DNS CACHE (WinRM) ────────────────────────────────
+        elif name == "ARP Cache":
+            for r in rc_obj._invoke("Get-NetNeighbor | Select-Object "
+                                    "IPAddress,LinkLayerAddress,State,InterfaceAlias"):
+                results.append({"IP": r.get("IPAddress", ""),
+                                "MAC": r.get("LinkLayerAddress", ""),
+                                "State": r.get("State", ""),
+                                "Interface": r.get("InterfaceAlias", "")})
+            if not results:
+                results.append({"Note": "ARP cache requires WinRM on the target."})
+
+        elif name == "DNS Cache":
+            for r in rc_obj._invoke("Get-DnsClientCache | Select-Object "
+                                    "Entry,Name,Data,Type,TimeToLive"):
+                results.append({"Entry": r.get("Entry", ""),
+                                "Name": r.get("Name", ""),
+                                "Data": r.get("Data", ""),
+                                "Type": str(r.get("Type", ""))})
+            if not results:
+                results.append({"Note": "DNS cache requires WinRM on the target."})
+
+        # ── OS / HOSTNAME (CIM) ────────────────────────────────────
+        elif name == "OS Version & Build":
+            for r in rc_obj._cim("Win32_OperatingSystem",
+                                 ["Caption", "Version", "BuildNumber",
+                                  "OSArchitecture", "InstallDate", "LastBootUpTime"]):
+                results.append({"OS": r.get("Caption", ""),
+                                "Version": r.get("Version", ""),
+                                "Build": r.get("BuildNumber", ""),
+                                "Arch": r.get("OSArchitecture", ""),
+                                "Installed": str(r.get("InstallDate", "")),
+                                "Last Boot": str(r.get("LastBootUpTime", ""))})
+
+        elif name == "Hostname & Domain":
+            for r in rc_obj._cim("Win32_ComputerSystem",
+                                 ["Name", "Domain", "Workgroup", "Manufacturer",
+                                  "Model", "UserName"]):
+                results.append({"Hostname": r.get("Name", ""),
+                                "Domain": r.get("Domain", "") or r.get("Workgroup", ""),
+                                "Manufacturer": r.get("Manufacturer", ""),
+                                "Model": r.get("Model", ""),
+                                "LoggedOn": r.get("UserName", "")})
+
+        # ── LOCAL USER ACCOUNTS (CIM) ──────────────────────────────
+        elif name == "Local User Accounts":
+            for r in rc_obj._cim("Win32_UserAccount",
+                                 ["Name", "SID", "Disabled", "Lockout", "Description"],
+                                 where="LocalAccount=True"):
+                results.append({"Name": r.get("Name", ""),
+                                "SID": r.get("SID", ""),
+                                "Disabled": str(r.get("Disabled", "")),
+                                "Lockout": str(r.get("Lockout", "")),
+                                "Description": r.get("Description", "")})
+
+        # ── INSTALLED SOFTWARE (remote registry Uninstall keys) ────
+        elif name == "Installed Software":
+            for base in [r"HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall",
+                         r"HKLM\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"]:
+                vals = _parse_reg_values(rc_obj.reg_query(base, recurse=True))
+                cur = {}
+                for v in vals:
+                    if v["Name"] == "DisplayName":
+                        cur["Name"] = v["Data"]
+                    elif v["Name"] == "DisplayVersion":
+                        cur["Version"] = v["Data"]
+                    elif v["Name"] == "Publisher":
+                        cur["Vendor"] = v["Data"]
+                        if cur.get("Name"):
+                            results.append(dict(cur))
+                            cur = {}
+            # de-dup
+            seen, uniq = set(), []
+            for r in results:
+                key = (r.get("Name"), r.get("Version"))
+                if key not in seen:
+                    seen.add(key)
+                    uniq.append(r)
+            results = uniq
+
+        # ── REGISTRY RUN KEYS (remote registry HKLM + HKU) ─────────
+        elif name == "Registry Run Keys":
+            run_paths = [
+                r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run",
+                r"HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+                r"HKLM\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run",
+            ]
+            for sid in rc_obj.hku_sids():
+                run_paths.append(r"HKU\%s\Software\Microsoft\Windows\CurrentVersion\Run" % sid)
+                run_paths.append(r"HKU\%s\Software\Microsoft\Windows\CurrentVersion\RunOnce" % sid)
+            for rp in run_paths:
+                for v in _parse_reg_values(rc_obj.reg_query(rp)):
+                    if v["Name"] and v["Name"] != "(Default)":
+                        results.append({"Hive": rp, "Name": v["Name"],
+                                        "Command": v["Data"]})
+            if not results:
+                results.append({"Note": "No Run-key entries returned (RemoteRegistry "
+                                        "service may be disabled)."})
+
+        # ── APPINIT DLLS (remote registry) ─────────────────────────
+        elif name == "AppInit DLLs":
+            for rp in [r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Windows",
+                       r"HKLM\Software\Wow6432Node\Microsoft\Windows NT\CurrentVersion\Windows"]:
+                for v in _parse_reg_values(rc_obj.reg_query(rp)):
+                    if v["Name"] in ("AppInit_DLLs", "LoadAppInit_DLLs"):
+                        results.append({"Key": rp, "Name": v["Name"], "Value": v["Data"]})
+            if not results:
+                results.append({"Note": "No AppInit_DLLs values found."})
+
+        # ── WMI PERSISTENCE (CIM root/subscription) ────────────────
+        elif name == "WMI Subscriptions":
+            for r in rc_obj._cim("__EventFilter", ["Name", "Query"],
+                                 namespace="root/subscription"):
+                results.append({"Type": "EventFilter", "Name": r.get("Name", ""),
+                                "Detail": (r.get("Query") or "")[:200]})
+            for r in rc_obj._cim("CommandLineEventConsumer",
+                                 ["Name", "CommandLineTemplate"],
+                                 namespace="root/subscription"):
+                results.append({"Type": "CmdLineConsumer", "Name": r.get("Name", ""),
+                                "Detail": (r.get("CommandLineTemplate") or "")[:200]})
+            for r in rc_obj._cim("ActiveScriptEventConsumer",
+                                 ["Name", "ScriptFileName"],
+                                 namespace="root/subscription"):
+                results.append({"Type": "ScriptConsumer", "Name": r.get("Name", ""),
+                                "Detail": (r.get("ScriptFileName") or "")[:200]})
+            if not results:
+                results.append({"Note": "No WMI event subscriptions found."})
+
+        # ── USER REGISTRY ARTIFACTS via remote HKU ─────────────────
+        elif name == "Typed URLs":
+            for sid in rc_obj.hku_sids():
+                for sub, kind in [("Software\\Microsoft\\Internet Explorer\\TypedURLs", "TypedURL"),
+                                  ("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\TypedPaths", "TypedPath")]:
+                    for v in _parse_reg_values(rc_obj.reg_query(r"HKU\%s\%s" % (sid, sub))):
+                        results.append({"SID": sid, "Type": kind,
+                                        "Entry": v["Name"], "Value": v["Data"]})
+            if not results:
+                results.append({"Note": "No typed URLs/paths in loaded user hives."})
+
+        elif name == "UserAssist Keys":
+            import codecs as _codecs
+            for sid in rc_obj.hku_sids():
+                base = (r"HKU\%s\Software\Microsoft\Windows\CurrentVersion"
+                        r"\Explorer\UserAssist" % sid)
+                for v in _parse_reg_values(rc_obj.reg_query(base, recurse=True)):
+                    nm = v["Name"]
+                    if nm and nm != "(Default)":
+                        try:
+                            app = _codecs.decode(nm, "rot_13")
+                        except Exception:
+                            app = nm
+                        results.append({"SID": sid, "Application": app})
+            if not results:
+                results.append({"Note": "No UserAssist entries in loaded user hives."})
+
+        elif name == "Windows Search History":
+            for sid in rc_obj.hku_sids():
+                base = (r"HKU\%s\Software\Microsoft\Windows\CurrentVersion"
+                        r"\Explorer\WordWheelQuery" % sid)
+                for v in _parse_reg_values(rc_obj.reg_query(base)):
+                    if v["Name"] != "MRUListEx":
+                        results.append({"SID": sid, "ValueName": v["Name"],
+                                        "Raw": v["Data"]})
+            if not results:
+                results.append({"Note": "No WordWheelQuery entries in loaded user hives."})
+
+        # ── PREFETCH (copy *.pf back) ──────────────────────────────
+        elif name == "Prefetch Files":
+            files = rc_obj.copy_back(RemoteCollector.PREFETCH, dest_subdir="Prefetch",
+                                     pattern="*.pf")
+            for f in files:
+                try:
+                    st = os.stat(f)
+                    results.append({"File": os.path.basename(f),
+                                    "Size": fmt_size(st.st_size),
+                                    "Modified": fmt_ts(st.st_mtime),
+                                    "Collected To": f})
+                except Exception:
+                    pass
+            if not results:
+                results.append({"Note": "No prefetch files collected (Superfetch may be "
+                                        "off or path inaccessible)."})
+
+        # ── LNK / SHORTCUTS (copy back + local parse) ──────────────
+        elif name == "LNK / Shortcut Files":
+            for uname, prof in rc_obj.user_profiles():
+                recent = prof + r"\AppData\Roaming\Microsoft\Windows\Recent"
+                files = rc_obj.copy_back(recent, dest_subdir="LNK\\" + uname,
+                                         pattern="*.lnk")
+                for f in files:
+                    try:
+                        data = open(f, "rb").read()
+                        lp = _lnk_localpath(data)
+                        st = os.stat(f)
+                        results.append({"User": uname, "LNK": os.path.basename(f),
+                                        "Target": lp,
+                                        "Modified": fmt_ts(st.st_mtime)})
+                    except Exception:
+                        pass
+            if not results:
+                results.append({"Note": "No .lnk files collected."})
+
+        # ── JUMP LISTS (copy back + OLE parse) ─────────────────────
+        elif name == "Jump Lists":
+            for uname, prof in rc_obj.user_profiles():
+                d = prof + r"\AppData\Roaming\Microsoft\Windows\Recent\AutomaticDestinations"
+                files = rc_obj.copy_back(d, dest_subdir="JumpLists\\" + uname,
+                                         pattern="*.automaticDestinations-ms")
+                for f in files:
+                    info = {"User": uname, "File": os.path.basename(f), "Targets": ""}
+                    try:
+                        import olefile
+                        if olefile.isOleFile(f):
+                            ole = olefile.OleFileIO(f)
+                            tg = []
+                            for stream in ole.listdir():
+                                try:
+                                    raw = ole.openstream(stream).read()
+                                    if raw[:4] == b"\x4c\x00\x00\x00":
+                                        p = _lnk_localpath(raw)
+                                        if p:
+                                            tg.append(p)
+                                except Exception:
+                                    pass
+                            ole.close()
+                            info["Targets"] = " | ".join(tg)[:300]
+                    except ImportError:
+                        info["Note"] = "pip install olefile for target parsing"
+                    except Exception:
+                        pass
+                    results.append(info)
+            if not results:
+                results.append({"Note": "No jump lists collected."})
+
+        # ── BROWSER HISTORY (copy SQLite back + query locally) ─────
+        elif name == "Browser History":
+            for uname, prof in rc_obj.user_profiles():
+                candidates = [
+                    (prof + r"\AppData\Local\Google\Chrome\User Data\Default\History", "Chrome"),
+                    (prof + r"\AppData\Local\Microsoft\Edge\User Data\Default\History", "Edge"),
+                ]
+                for rel, browser in candidates:
+                    got = rc_obj.copy_back([rel], dest_subdir="Browser\\" + uname)
+                    for db in got:
+                        rows = _sqlite_rows_local(
+                            db,
+                            "SELECT url, title, visit_count, last_visit_time "
+                            "FROM urls ORDER BY last_visit_time DESC LIMIT 200")
+                        for r in rows:
+                            if "Error" in r:
+                                continue
+                            results.append({"User": uname, "Browser": browser,
+                                            "URL": r.get("url", ""),
+                                            "Title": r.get("title", ""),
+                                            "Visits": r.get("visit_count", "")})
+                # Firefox: one places.sqlite per profile directory.
+                ffp = prof + r"\AppData\Roaming\Mozilla\Firefox\Profiles"
+                for pdir in rc_obj.list_share_dir(ffp):
+                    if not os.path.isdir(pdir):
+                        continue
+                    prof_name = os.path.basename(pdir.rstrip("\\"))
+                    rel = ffp + "\\" + prof_name + "\\places.sqlite"
+                    got = rc_obj.copy_back([rel], dest_subdir="Browser\\" + uname + "\\" + prof_name)
+                    for db in got:
+                        rows = _sqlite_rows_local(
+                            db,
+                            "SELECT url, title, visit_count, last_visit_date "
+                            "FROM moz_places ORDER BY last_visit_date DESC LIMIT 200")
+                        for r in rows:
+                            if "Error" in r:
+                                continue
+                            results.append({"User": uname, "Browser": "Firefox",
+                                            "URL": r.get("url", ""),
+                                            "Title": r.get("title", ""),
+                                            "Visits": r.get("visit_count", "")})
+            if not results:
+                results.append({"Note": "No browser history databases collected."})
+
+        # ── CREDENTIAL / HIVE ACQUISITION (reg save back) ──────────
+        elif name in ("SAM Database Hash Dump", "LSA Secrets", "DPAPI Master Keys",
+                      "Cached Credentials"):
+            saved = []
+            for hv, fn in [("HKLM\\SAM", "SAM"), ("HKLM\\SECURITY", "SECURITY"),
+                           ("HKLM\\SYSTEM", "SYSTEM")]:
+                p = rc_obj.reg_save(hv, fn)
+                if p:
+                    saved.append(p)
+            if saved:
+                for p in saved:
+                    results.append({"Collected Hive": os.path.basename(p),
+                                    "Path": p,
+                                    "Note": "Parse offline (e.g. with a secrets "
+                                            "extractor) — hive saved to case folder."})
+            else:
+                results.append({"Note": "Could not save SAM/SECURITY/SYSTEM hives "
+                                        "(requires admin + RemoteRegistry)."})
+
+        # ── PST / OST (locate + copy back) ─────────────────────────
+        elif name in ("PST/OST Files (Outlook)",):
+            for uname, prof in rc_obj.user_profiles():
+                d = prof + r"\AppData\Local\Microsoft\Outlook"
+                for f in rc_obj.list_share_dir(d):
+                    low = f.lower()
+                    if low.endswith(".pst") or low.endswith(".ost"):
+                        try:
+                            sz = os.path.getsize(f)
+                        except Exception:
+                            sz = 0
+                        row = {"User": uname, "File": os.path.basename(f),
+                               "Size": fmt_size(sz), "Remote Path": f}
+                        if sz and sz < 512 * 1024 * 1024:
+                            got = rc_obj.copy_back(
+                                [d + "\\" + os.path.basename(f)],
+                                dest_subdir="Outlook\\" + uname)
+                            if got:
+                                row["Collected To"] = got[0]
+                        else:
+                            row["Note"] = "Too large for auto-copy; collect manually."
+                        results.append(row)
+            if not results:
+                results.append({"Note": "No PST/OST files found in user profiles."})
+
+        # ── FALLBACK: copy whole evidence path or note ─────────────
+        else:
+            results.append({
+                "Artifact": name,
+                "Host": host,
+                "Status": "No remote handler",
+                "Note": "This artifact has no native remote collector. Acquire the "
+                        "host's disk image, or run a local live collection on the target.",
+            })
+
+    finally:
+        rc_obj.disconnect()
+
+    # Tag every row with provenance so the analyst knows the source host.
+    for r in results:
+        if isinstance(r, dict):
+            r.setdefault("Host", host)
+    if not results:
+        results.append({"Note": "No data returned for %s from %s" % (name, host)})
     return results
 
 
@@ -3534,33 +5777,6 @@ class EvidenceBrowser(QWidget):
         go_btn.setFixedWidth(36)
         go_btn.clicked.connect(self._go_path)
         pbl.addWidget(go_btn)
-
-        # View-mode toggle buttons
-        _vsep = QFrame()
-        _vsep.setFrameShape(QFrame.Shape.VLine)
-        _vsep.setFixedWidth(2)
-        _vsep.setStyleSheet(f"background:{C['border']};")
-        pbl.addWidget(_vsep)
-        _tss = (
-            f"QPushButton{{background:{C['btn']};color:{C['fg2']};"
-            f"border:1px solid {C['border']};border-radius:3px;"
-            f"padding:2px 8px;font-size:9pt;}}"
-            f"QPushButton:checked{{background:{C['sel']};color:{C['accent']};"
-            f"border-color:{C['accent']};}}"
-        )
-        self._btn_list  = QPushButton("☰ List")
-        self._btn_thumb = QPushButton("⊞ Thumbs")
-        for _b in (self._btn_list, self._btn_thumb):
-            _b.setCheckable(True)
-            _b.setFixedHeight(24)
-            _b.setStyleSheet(_tss)
-        self._btn_list.setChecked(True)
-        self._btn_list.clicked.connect(
-            lambda: self._switch_file_view("list"))
-        self._btn_thumb.clicked.connect(
-            lambda: self._switch_file_view("thumb"))
-        pbl.addWidget(self._btn_list)
-        pbl.addWidget(self._btn_thumb)
         rtl.addWidget(pb)
 
         # File list table
@@ -3584,37 +5800,7 @@ class EvidenceBrowser(QWidget):
         self.file_table.selectionModel().selectionChanged.connect(self._on_file_select)
         self.file_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.file_table.customContextMenuRequested.connect(self._file_ctx)
-
-        # Thumbnail grid widget
-        self.thumb_list = QListWidget()
-        self.thumb_list.setViewMode(QListView.ViewMode.IconMode)
-        self.thumb_list.setIconSize(QSize(112, 112))
-        self.thumb_list.setGridSize(QSize(138, 158))
-        self.thumb_list.setResizeMode(QListView.ResizeMode.Adjust)
-        self.thumb_list.setMovement(QListView.Movement.Static)
-        self.thumb_list.setSpacing(6)
-        self.thumb_list.setUniformItemSizes(True)
-        self.thumb_list.setWordWrap(True)
-        self.thumb_list.setStyleSheet(
-            f"QListWidget{{background:{C['bg']};border:none;outline:none;}}"
-            f"QListWidget::item{{color:{C['fg']};font-size:8pt;padding:2px;"
-            f"border-radius:4px;}}"
-            f"QListWidget::item:selected{{background:{C['sel']};"
-            f"color:{C['accent']};}}"
-            f"QListWidget::item:hover:!selected{{background:{C['bg3']};}}")
-        self.thumb_list.doubleClicked.connect(self._on_thumb_double)
-        self.thumb_list.setContextMenuPolicy(
-            Qt.ContextMenuPolicy.CustomContextMenu)
-        self.thumb_list.customContextMenuRequested.connect(self._thumb_ctx)
-
-        # Stack: index 0 = table list, index 1 = thumbnail grid
-        self._view_stack = QStackedWidget()
-        self._view_stack.addWidget(self.file_table)
-        self._view_stack.addWidget(self.thumb_list)
-        self._view_mode  = "list"
-        self._thumb_stop = [False]
-
-        rtl.addWidget(self._view_stack)
+        rtl.addWidget(self.file_table)
         v_split.addWidget(right_top)
 
         # Bottom-right: content viewer
@@ -3702,6 +5888,23 @@ class EvidenceBrowser(QWidget):
             self.ev_tree.itemExpanded.connect(self._on_item_expanded)
             self._expand_connected = True
 
+    def add_remote_target(self, host):
+        """Add a remote Windows host to the evidence tree for native triage."""
+        host = (host or "").strip()
+        if not host:
+            return
+        # Avoid duplicates.
+        for i in range(self.remote_root.childCount()):
+            d = self.remote_root.child(i).data(0, Qt.ItemDataRole.UserRole) or {}
+            if d.get("label") == host:
+                self.remote_root.setExpanded(True)
+                return
+        label = "🌐  %s" % host
+        item = self._make_item(label, color=C['accent'],
+                               data={"type": "remote", "label": host, "path": host})
+        self.remote_root.addChild(item)
+        self.remote_root.setExpanded(True)
+
     def _add_lazy_dir_child(self, parent_item, dir_path):
         """Sentinel for host-filesystem directories."""
         s = QTreeWidgetItem(["__lazy_dir__"])
@@ -3753,10 +5956,16 @@ class EvidenceBrowser(QWidget):
                                     data={"type": "dir", "path": str(entry)})
             self._add_lazy_dir_child(child, str(entry))
             parent_item.addChild(child)
-        # File nodes omitted from tree - shown in right-panel file list.
-        if not dirs:
-            parent_item.addChild(
-                self._make_item("  [No subfolders]", color=C['fg3']))
+        for entry in files[:300]:
+            icon = self._file_icon(entry.name)
+            try:    sz = fmt_size(entry.stat().st_size)
+            except: sz = ""
+            child = self._make_item("%s  %s  (%s)" % (icon, entry.name, sz),
+                                    color=C['fg2'],
+                                    data={"type": "file", "path": str(entry)})
+            parent_item.addChild(child)
+        if not dirs and not files:
+            parent_item.addChild(self._make_item("  [Empty]", color=C['fg3']))
 
     def _populate_image_children(self, parent_item, image_path, parent_inode):
         """Forensic image directory listing via pytsk3."""
@@ -3794,7 +6003,18 @@ class EvidenceBrowser(QWidget):
                                           "name":       e['name']})
             self._add_image_sentinel(child, image_path, e['inode'])
             parent_item.addChild(child)
-        # File nodes omitted from image tree - shown in right-panel file list.
+        for e in files[:500]:
+            icon = self._file_icon(e['name'])
+            sz   = fmt_size(e['size']) if e['size'] else ""
+            child = self._make_item("%s  %s  (%s)" % (icon, e['name'], sz),
+                                    color=C['fg2'],
+                                    data={"type":       "img_file",
+                                          "image_path": image_path,
+                                          "inode":      e['inode'],
+                                          "name":       e['name'],
+                                          "size":       e['size'],
+                                          "mtime":      e['mtime']})
+            parent_item.addChild(child)
 
     def _on_tree_select(self, item, _prev):
         if not item: return
@@ -3898,25 +6118,7 @@ class EvidenceBrowser(QWidget):
         self.file_table.setSortingEnabled(False)
         self.file_table.setRowCount(0)
         # Store context so double-click / select knows we're in image mode
-        self._in_image_mode = True    # forensic-image navigation
-        self._in_image_mode = True    # forensic-image navigation
-        # Nav stack: push previous location before descending
-        if not hasattr(self, '_img_nav_stack'):
-            self._img_nav_stack = []
-        if (getattr(self, '_in_image_mode', False)
-                and getattr(self, '_img_nav_push', True)):
-            _prev = getattr(self, '_img_context', {})
-            if _prev:
-                self._img_nav_stack.append((
-                    _prev['image_path'],
-                    _prev['inode'],
-                    getattr(self, '_img_context_name', '')))
-        elif not getattr(self, '_in_image_mode', False):
-            self._img_nav_stack = []   # fresh entry into image mode
-        self._img_nav_push     = True   # reset for next navigation
-        self._in_image_mode    = True   # forensic-image navigation
-        self._img_context      = {"image_path": image_path, "inode": inode}
-        self._img_context_name = name
+        self._img_context = {"image_path": image_path, "inode": inode}
         ifs = ForensicImageFS.get(image_path)
         if not ifs.fs:
             return
@@ -3979,10 +6181,7 @@ class EvidenceBrowser(QWidget):
             return
         # Host filesystem entry
         name = item_data if isinstance(item_data, str) else name_item.text()
-        # Prefer absolute path from col 6 over current_dir / name
-        _p6s = self.file_table.item(row, 6)
-        path = Path(_p6s.text()) if (_p6s and _p6s.text()) \
-               else self.current_dir / name
+        path = self.current_dir / name
         if path.is_file():
             self.content.load_path(str(path))
 
@@ -4003,17 +6202,12 @@ class EvidenceBrowser(QWidget):
         name = item_data if isinstance(item_data, str) else name_item.text()
         if name == "..":
             self._go_up(); return
-        # Prefer absolute path from col 6 (set by _add_file_row) over
-        # current_dir / name which is stale when in image mode.
-        _p6d = self.file_table.item(index.row(), 6)
-        path = Path(_p6d.text()) if (_p6d and _p6d.text()) \
-               else self.current_dir / name
+        path = self.current_dir / name
         if path.is_dir():
             self._load_dir(path)
 
     def _load_dir(self, path: Path):
         self.current_dir = path
-        self._in_image_mode = False   # host-fs navigation
         self.path_edit.setText(str(path))
         self.file_table.setSortingEnabled(False)
         self.file_table.setRowCount(0)
@@ -4034,10 +6228,6 @@ class EvidenceBrowser(QWidget):
 
         self.file_table.setSortingEnabled(True)
         self.main.set_status(f"  {path}  —  {len(entries)} item(s)")
-
-        # Refresh thumbnail grid if it is the active view
-        if getattr(self, "_view_mode", "list") == "thumb":
-            self._load_dir_thumbnails(path)
 
         # Sync tree selection
         self._sync_tree_to_path(path)
@@ -4105,312 +6295,6 @@ class EvidenceBrowser(QWidget):
             except Exception:
                 pass
 
-    # ── Thumbnail view helpers ──────────────────────────────────────────────
-
-    def _switch_file_view(self, mode):
-        # Switch between list (table) and thumb (grid) views.
-        self._view_mode = mode
-        if mode == "thumb":
-            self._btn_list.setChecked(False)
-            self._btn_thumb.setChecked(True)
-            self._view_stack.setCurrentIndex(1)
-            if getattr(self, "_in_image_mode", False):
-                self._load_img_thumbnails()
-            else:
-                self._load_dir_thumbnails(self.current_dir)
-        else:
-            self._btn_list.setChecked(True)
-            self._btn_thumb.setChecked(False)
-            self._view_stack.setCurrentIndex(0)
-
-    def _load_dir_thumbnails(self, path):
-        # Fill the thumbnail grid for the given directory path.
-        self._thumb_stop[0] = True
-        self._thumb_stop = [False]
-        self.thumb_list.clear()
-        IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif",
-                    ".bmp", ".tiff", ".tif", ".webp", ".ico"}
-        try:
-            entries = sorted(
-                path.iterdir(),
-                key=lambda x: (not x.is_dir(), x.name.lower()))
-        except Exception:
-            entries = []
-        up = QListWidgetItem("⬆  ..")
-        up.setData(Qt.ItemDataRole.UserRole,     str(path.parent))
-        up.setData(Qt.ItemDataRole.UserRole + 1, "dir")
-        up.setToolTip("Go to parent directory")
-        up.setIcon(self._make_thumb_icon(C["bg3"], "UP"))
-        self.thumb_list.addItem(up)
-        img_n = 0
-        stop  = self._thumb_stop
-        for entry in entries:
-            if stop[0]:
-                break
-            raw   = entry.name
-            label = (raw[:20] + "…") if len(raw) > 20 else raw
-            item  = QListWidgetItem(label)
-            item.setToolTip(raw)
-            item.setData(Qt.ItemDataRole.UserRole,     str(entry))
-            item.setData(Qt.ItemDataRole.UserRole + 1,
-                         "dir" if entry.is_dir() else "file")
-            if entry.is_dir():
-                item.setIcon(self._make_thumb_icon(C["orange"], "DIR"))
-            else:
-                ext = entry.suffix.lower()
-                if ext in IMG_EXTS:
-                    try:
-                        pix = QPixmap(str(entry))
-                        if not pix.isNull():
-                            pix = pix.scaled(
-                                112, 112,
-                                Qt.AspectRatioMode.KeepAspectRatio,
-                                Qt.TransformationMode.SmoothTransformation)
-                            item.setIcon(QIcon(pix))
-                        else:
-                            item.setIcon(
-                                self._make_thumb_icon(C["bg3"], "IMG"))
-                    except Exception:
-                        item.setIcon(self._make_thumb_icon(C["bg3"], "IMG"))
-                    img_n += 1
-                else:
-                    abbr = entry.suffix.upper().lstrip(".")[:4] or "FILE"
-                    item.setIcon(self._make_thumb_icon(C["bg2"], abbr))
-            self.thumb_list.addItem(item)
-            if img_n and img_n % 12 == 0:
-                QApplication.processEvents()
-
-    def _load_img_thumbnails(self):
-        # Fill thumbnail grid from current forensic image directory.
-        self._thumb_stop[0] = True
-        self._thumb_stop = [False]
-        self.thumb_list.clear()
-        ctx = getattr(self, "_img_context", {})
-        if not ctx:
-            return
-        image_path = ctx["image_path"]
-        inode      = ctx["inode"]
-        IMG_EXTS   = {".jpg", ".jpeg", ".png", ".gif",
-                      ".bmp", ".tiff", ".tif", ".webp", ".ico"}
-        try:
-            ifs     = ForensicImageFS.get(image_path)
-            entries = ifs.list_dir(inode=inode) if (ifs and ifs.fs) else []
-        except Exception:
-            entries = []
-        # Up tile
-        up = QListWidgetItem("⬆  ..")
-        up.setData(Qt.ItemDataRole.UserRole,     None)
-        up.setData(Qt.ItemDataRole.UserRole + 1, "img_up")
-        up.setToolTip("Go to parent directory")
-        up.setIcon(self._make_thumb_icon(C["bg3"], "UP"))
-        self.thumb_list.addItem(up)
-        img_n = 0
-        stop  = self._thumb_stop
-        for e in entries:
-            if stop[0]:
-                break
-            raw   = e["name"]
-            label = (raw[:20] + "…") if len(raw) > 20 else raw
-            item  = QListWidgetItem(label)
-            item.setToolTip(raw)
-            item.setData(Qt.ItemDataRole.UserRole, {
-                "is_img":     True,
-                "image_path": image_path,
-                "inode":      e["inode"],
-                "is_dir":     e["is_dir"],
-                "name":       e["name"],
-                "size":       e.get("size", 0),
-            })
-            item.setData(Qt.ItemDataRole.UserRole + 1,
-                         "img_dir" if e["is_dir"] else "img_file")
-            if e["is_dir"]:
-                item.setIcon(self._make_thumb_icon(C["orange"], "DIR"))
-            else:
-                ext = Path(e["name"]).suffix.lower()
-                if ext in IMG_EXTS:
-                    try:
-                        ifs2 = ForensicImageFS.get(image_path)
-                        data = ifs2.read_file(e["inode"],
-                                              max_bytes=4 * 1024 * 1024)
-                        pix = QPixmap()
-                        if pix.loadFromData(data) and not pix.isNull():
-                            pix = pix.scaled(
-                                112, 112,
-                                Qt.AspectRatioMode.KeepAspectRatio,
-                                Qt.TransformationMode.SmoothTransformation)
-                            item.setIcon(QIcon(pix))
-                        else:
-                            item.setIcon(
-                                self._make_thumb_icon(C["bg3"], "IMG"))
-                    except Exception:
-                        item.setIcon(self._make_thumb_icon(C["bg3"], "IMG"))
-                    img_n += 1
-                    if img_n % 6 == 0:
-                        QApplication.processEvents()
-                else:
-                    abbr = Path(e["name"]).suffix.upper().lstrip(".")[:4] or "FILE"
-                    item.setIcon(self._make_thumb_icon(C["bg2"], abbr))
-            self.thumb_list.addItem(item)
-
-    def _hash_image_file(self, image_path, inode, name):
-        # Compute MD5 + SHA-256 for a file inside a forensic image.
-        dlg = QMessageBox(self)
-        dlg.setWindowTitle("Computing hashes…")
-        dlg.setText(
-            "Computing MD5 & SHA-256 for:
-" + name +
-            "
-Reading from image, please wait…")
-        dlg.setStandardButtons(QMessageBox.StandardButton.NoButton)
-        dlg.show()
-        QApplication.processEvents()
-        try:
-            ifs  = ForensicImageFS.get(image_path)
-            data = ifs.read_file(inode, max_bytes=512 * 1024 * 1024)
-            import hashlib as _hl
-            md5 = _hl.md5(data).hexdigest()
-            sha = _hl.sha256(data).hexdigest()
-        except Exception as e:
-            dlg.hide()
-            QMessageBox.critical(self, "Hash Error", str(e))
-            return
-        dlg.hide()
-        QMessageBox.information(
-            self, "Hash Result",
-            "File: " + name + "
-"
-            "Size: " + fmt_size(len(data)) + "
-
-"
-            "MD5:
-"    + md5 + "
-
-"
-            "SHA-256:
-" + sha)
-
-    def _make_thumb_icon(self, bg_color, label=""):
-        # Return a solid-colour QIcon with optional centred text label.
-        pix = QPixmap(112, 96)
-        pix.fill(QColor(bg_color))
-        if label:
-            painter = QPainter(pix)
-            painter.setPen(QColor(C["fg"]))
-            f = QFont()
-            f.setPointSize(9)
-            f.setBold(True)
-            painter.setFont(f)
-            painter.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, label)
-            painter.end()
-        return QIcon(pix)
-
-    def _on_thumb_double(self, _index):
-        # Navigate / open on double-click; handles host-fs and image mode.
-        item = self.thumb_list.currentItem()
-        if not item:
-            return
-        p    = item.data(Qt.ItemDataRole.UserRole)
-        kind = item.data(Qt.ItemDataRole.UserRole + 1)
-        if kind == "img_up":
-            self._go_up()
-            return
-        if kind == "img_dir" and isinstance(p, dict):
-            self._load_image_dir(p["image_path"], p["inode"], p["name"])
-            self._load_img_thumbnails()
-            return
-        if kind == "img_file" and isinstance(p, dict):
-            self._load_image_file(p["image_path"], p["inode"], p["name"])
-            return
-        if not isinstance(p, str):
-            return
-        entry = Path(p)
-        if kind == "dir" or entry.is_dir():
-            self._load_dir(entry)
-        elif entry.is_file():
-            self.content.load_path(str(entry))
-
-    def _thumb_ctx(self, pos):
-        # Right-click context menu for thumbnail grid (host-fs and image mode).
-        item = self.thumb_list.itemAt(pos)
-        if not item:
-            return
-        p    = item.data(Qt.ItemDataRole.UserRole)
-        kind = item.data(Qt.ItemDataRole.UserRole + 1)
-        menu = QMenu(self)
-
-        # ── Forensic image entries ────────────────────────────────────────────
-        if kind in ("img_up", "img_dir", "img_file"):
-            if kind == "img_up":
-                menu.addAction("Go Up", self._go_up)
-                menu.exec(self.thumb_list.viewport().mapToGlobal(pos))
-                return
-            d = p if isinstance(p, dict) else {}
-            if kind == "img_dir":
-                def _open_img(dd=d):
-                    self._load_image_dir(dd["image_path"],
-                                         dd["inode"], dd["name"])
-                    self._load_img_thumbnails()
-                menu.addAction("Open", _open_img)
-            else:
-                menu.addAction("Open",
-                    lambda dd=d: self._load_image_file(
-                        dd["image_path"], dd["inode"], dd["name"]))
-                menu.addSeparator()
-                menu.addAction("Save As…",
-                    lambda dd=d: self._save_image_file_as(
-                        dd["image_path"], dd["inode"], dd["name"]))
-                menu.addAction("Compute Hashes…",
-                    lambda dd=d: self._hash_image_file(
-                        dd["image_path"], dd["inode"], dd["name"]))
-            menu.addSeparator()
-            bm_sub = menu.addMenu("Add to Bookmark…")
-            _bm = {
-                "Name":  d.get("name", item.toolTip()),
-                "Image": d.get("image_path", ""),
-                "Inode": str(d.get("inode", "")),
-                "Size":  fmt_size(d.get("size", 0)),
-            }
-            for _t in ["Key Finding", "File of Interest",
-                        "Malware Indicator", "Suspicious", "IOC"]:
-                bm_sub.addAction(_t,
-                    lambda t=_t, bm=_bm: self.main._on_bookmark(
-                        "Image Browser", dict(bm), t))
-            menu.exec(self.thumb_list.viewport().mapToGlobal(pos))
-            return
-
-        # ── Host-fs entries ───────────────────────────────────────────────────
-        if not isinstance(p, str):
-            return
-        entry  = Path(p)
-        is_dir = (kind == "dir" or entry.is_dir())
-        menu.addAction("Open",
-            lambda: self._load_dir(entry) if is_dir
-                    else self.content.load_path(str(entry)))
-        if entry.is_file():
-            menu.addSeparator()
-            menu.addAction("Save As…",
-                lambda: self._save_host_file_as(entry))
-            menu.addAction("Compute Hashes…",
-                lambda: self._hash_file(entry))
-        menu.addSeparator()
-        bm_sub = menu.addMenu("Add to Bookmark…")
-        try:
-            _sz = fmt_size(entry.stat().st_size) if entry.is_file() else ""
-        except Exception:
-            _sz = ""
-        _bm = {
-            "Name": item.toolTip(),
-            "Path": str(entry),
-            "Type": "Directory" if is_dir else detect_type(str(entry)),
-            "Size": _sz,
-        }
-        for _t in ["Key Finding", "File of Interest",
-                    "Malware Indicator", "Suspicious", "IOC"]:
-            bm_sub.addAction(_t,
-                lambda t=_t, d=_bm: self.main._on_bookmark(
-                    "File Browser", dict(d), t))
-        menu.exec(self.thumb_list.viewport().mapToGlobal(pos))
-
     def _file_icon(self, name):
         ext = Path(name).suffix.lower()
         icons = {
@@ -4433,16 +6317,6 @@ Reading from image, please wait…")
         pass  # Could highlight matching tree node
 
     def _go_up(self):
-        if getattr(self, "_in_image_mode", False):
-            stack = getattr(self, "_img_nav_stack", [])
-            if stack:
-                img_path, inode, iname = stack[-1]
-                self._img_nav_stack = stack[:-1]
-                self._img_nav_push  = False   # don't re-push on the way up
-                self._load_image_dir(img_path, inode, iname)
-                if getattr(self, "_view_mode", "list") == "thumb":
-                    self._load_img_thumbnails()
-            return
         self._load_dir(self.current_dir.parent)
 
     def _go_path(self):
@@ -4488,30 +6362,17 @@ Reading from image, please wait…")
                 menu.addAction("📧 Open in Email Viewer",
                     lambda: self._open_in_email_viewer(d["image_path"], d["inode"], d["name"]))
                 bm_sub2 = menu.addMenu("Add to Bookmark…")
-                # Pre-compute a safe snapshot before building lambdas — same
-                # pattern the host-file branch already uses — prevents KeyError
-                # / crash when any field is absent in item_data.
-                _bm2 = {
-                    "name":       d.get("name", ""),
-                    "image_path": d.get("image_path", ""),
-                    "inode":      str(d.get("inode", "")),
-                    "size":       d.get("size", 0),
-                }
                 for tag in ["Key Finding","File of Interest","Malware Indicator",
                             "Suspicious","IOC"]:
                     bm_sub2.addAction(tag,
-                        lambda t=tag, dd=_bm2: self.main._on_bookmark(
+                        lambda _, t=tag, dd=d: self.main._on_bookmark(
                             "Image Browser",
-                            {"Name":  dd["name"],
-                             "Image": dd["image_path"],
-                             "Inode": dd["inode"],
-                             "Size":  fmt_size(dd["size"])}, t))
+                            {"Name": dd["name"], "Image": dd["image_path"],
+                             "Inode": str(dd["inode"]),
+                             "Size": fmt_size(dd.get("size",0))}, t))
         else:
             name = item_data if isinstance(item_data, str) else name_item.text()
-            # Prefer absolute path from col 6 over current_dir / name
-            _p6f = self.file_table.item(row, 6)
-            path = Path(_p6f.text()) if (_p6f and _p6f.text()) \
-                   else self.current_dir / name
+            path = self.current_dir / name
             menu.addAction("Open / Navigate",
                 lambda: self._load_dir(path) if path.is_dir() else self.content.load_path(str(path)))
             menu.addAction("View in Hex", lambda: (
@@ -4543,7 +6404,7 @@ Reading from image, please wait…")
             for tag in ["Key Finding","File of Interest","Malware Indicator",
                         "Suspicious","IOC","Cleared"]:
                 bm_sub.addAction(tag,
-                    lambda t=tag, d=_bm_data: self.main._on_bookmark(
+                    lambda _, t=tag, d=_bm_data: self.main._on_bookmark(
                         "File Browser", dict(d), t))
 
         menu.exec(self.file_table.mapToGlobal(pos))
@@ -4759,7 +6620,10 @@ class ArtifactTab(QWidget):
         elif ttype == "file":
             self.target_info.setText(f"  File: {tpath}")
         elif ttype == "remote":
-            self.target_info.setText(f"  Remote target: {tpath}  (deploy agent for collection)")
+            self.target_info.setText(
+                f"  Remote target: {tpath}  (native agentless triage — "
+                f"evidence copied to case folder, then analyzed locally)")
+            for cb in self._checks.values(): cb.setEnabled(True)
 
     # ── Preset selections ────────────────────────────────────────────
     def _sel_all(self):
@@ -4770,31 +6634,18 @@ class ArtifactTab(QWidget):
 
     def _preset_ir(self):
         self._sel_none()
-        for a in ["Running Processes","Active Connections","Network Interfaces",
-                  "OS Version & Build","Hostname & Domain","System Uptime",
-                  "Local User Accounts","Recently Accessed Files","Temp Directory Contents"]:
-            if a in self._checks: self._checks[a].setChecked(True)
-
-    def _preset_malware(self):
-        self._sel_none()
-        for a in ["Running Processes","Active Connections","Registry Run Keys",
-                  "Scheduled Tasks","Services (Auto-Start)","Prefetch Files",
-                  "Recently Accessed Files","Loaded Drivers/Modules",
-                  "WMI Subscriptions","AppInit DLLs"]:
-            if a in self._checks: self._checks[a].setChecked(True)
-
-    def _preset_image(self):
-        """Non-volatile artifacts suitable for forensic image analysis."""
-        self._sel_none()
-        for a in ["PST/OST Files (Outlook)","MSG Files (Outlook)","Thunderbird MBOX",
-                  "Email Attachments","Email Contacts","Email Calendar Items",
-                  "Browser History","Browser Cookies","Browser Saved Passwords",
-                  "Browser Extensions","Prefetch Files","LNK / Shortcut Files",
-                  "Recycle Bin Contents","Registry Run Keys","Startup Folder Items",
-                  "Scheduled Tasks","Security Event Log","System Event Log",
-                  "Application Event Log","PowerShell Operational Log",
-                  "Recently Accessed Files","Certificate Store","SAM Database Hash Dump",
-                  "Installed Software"]:
+        for a in ["OS Version & Build","Hostname & Domain",
+                "Local User Accounts","USB Device History",
+                "PST/OST Files (Outlook)","MSG Files (Outlook)","Thunderbird MBOX",
+                "Email Accounts Config","Email Attachments","Email Contacts","Email Calendar Items",
+                "Browser History","Browser Cookies","Browser Saved Passwords",
+                "Browser Extensions","Prefetch Files","LNK / Shortcut Files",
+                "Recycle Bin Contents","Registry Run Keys","Startup Folder Items",
+                "Scheduled Tasks","Security Event Log","System Event Log",
+                "Application Event Log","PowerShell Operational Log","RDP Session Log",
+                "Recently Accessed Files","Certificate Store","SAM Database Hash Dump",
+                "Installed Software","Shellbags","UserAssist Keys","Jump Lists",
+                "WiFi Profiles"]:
             if a in self._checks: self._checks[a].setChecked(True)
 
     def _preset_email(self):
@@ -4818,14 +6669,204 @@ class ArtifactTab(QWidget):
     def get_selected(self):
         return [n for n,cb in self._checks.items() if cb.isChecked()]
 
+    def _preset_image(self):
+        """Non-volatile artifacts suitable for forensic image analysis."""
+        self._sel_none()
+        for a in ["PST/OST Files (Outlook)","MSG Files (Outlook)","Thunderbird MBOX",
+                  "Email Attachments","Email Contacts","Email Calendar Items",
+                  "Browser History","Browser Cookies","Browser Saved Passwords",
+                  "Browser Extensions","Prefetch Files","LNK / Shortcut Files",
+                  "Recycle Bin Contents","Registry Run Keys","Startup Folder Items",
+                  "Scheduled Tasks","Security Event Log","System Event Log",
+                  "Application Event Log","PowerShell Operational Log",
+                  "Recently Accessed Files","Certificate Store","SAM Database Hash Dump",
+                  "Installed Software"]:
+            if a in self._checks: self._checks[a].setChecked(True)
+
+    def _preset_malware(self):
+        self._sel_none()
+        for a in ["Running Processes","Active Connections","Registry Run Keys",
+                  "Scheduled Tasks","Services (Auto-Start)","Prefetch Files",
+                  "Recently Accessed Files","Loaded Drivers/Modules",
+                  "WMI Subscriptions","AppInit DLLs"]:
+            if a in self._checks: self._checks[a].setChecked(True)
+
+
 
 # ══════════════════════════════════════════════════════════════
 #  RESULTS TAB
 # ══════════════════════════════════════════════════════════════
 
+    # ── Right-click context menu ──────────────────────────────────────────────
+    def _show_artifact_context_menu(self, pos):
+        """Show right-click context menu on the artifact results table."""
+        from PyQt5.QtWidgets import QMenu, QAction, QApplication
+        from PyQt5.QtGui import QClipboard
+
+        selected = self.result_table.selectedItems()
+        if not selected:
+            return
+
+        menu = QMenu(self)
+
+        act_bookmark = QAction("⭐  Add to Bookmarks", self)
+        act_bookmark.triggered.connect(self._add_selected_to_bookmarks)
+        menu.addAction(act_bookmark)
+
+        menu.addSeparator()
+
+        act_copy_row = QAction("📋  Copy Row(s)", self)
+        act_copy_row.triggered.connect(self._copy_selected_rows)
+        menu.addAction(act_copy_row)
+
+        act_copy_cell = QAction("📄  Copy Cell Value", self)
+        act_copy_cell.triggered.connect(self._copy_cell_value)
+        menu.addAction(act_copy_cell)
+
+        menu.exec_(self.result_table.viewport().mapToGlobal(pos))
+
+    def _copy_selected_rows(self):
+        """Copy all selected rows as tab-separated text to clipboard."""
+        from PyQt5.QtWidgets import QApplication
+        tbl = self.result_table
+        rows = sorted(set(i.row() for i in tbl.selectedItems()))
+        lines = []
+        for row in rows:
+            cells = []
+            for col in range(tbl.columnCount()):
+                item = tbl.item(row, col)
+                cells.append(item.text() if item else "")
+            lines.append("\t".join(cells))
+        QApplication.clipboard().setText("\n".join(lines))
+
+    def _copy_cell_value(self):
+        """Copy the current cell value to clipboard."""
+        from PyQt5.QtWidgets import QApplication
+        item = self.result_table.currentItem()
+        if item:
+            QApplication.clipboard().setText(item.text())
+
+    def _add_selected_to_bookmarks(self):
+        """
+        Bookmark selected rows from the artifact results table.
+        Appends them to the Bookmarks tab (QTableWidget named self.bookmark_table
+        or self.bm_table) if it exists, otherwise creates a simple dialog list.
+        """
+        from PyQt5.QtWidgets import (QTableWidget, QTableWidgetItem,
+                                      QMessageBox, QApplication)
+        tbl = self.result_table
+        rows = sorted(set(i.row() for i in tbl.selectedItems()))
+        if not rows:
+            return
+
+        # Collect header labels
+        headers = []
+        for col in range(tbl.columnCount()):
+            h = tbl.horizontalHeaderItem(col)
+            headers.append(h.text() if h else str(col))
+
+        # Build list of dicts for each selected row
+        row_dicts = []
+        for row in rows:
+            rd = {}
+            for col, hdr in enumerate(headers):
+                item = tbl.item(row, col)
+                rd[hdr] = item.text() if item else ""
+            # Prepend artifact name so bookmark has context
+            artifact_label = ""
+            try:
+                artifact_label = self._current_artifact or ""
+            except Exception:
+                pass
+            rd["_Artifact"] = artifact_label
+            row_dicts.append(rd)
+
+        # ── Try to find an existing bookmark table in the main window ─────────
+        bm_tbl = None
+        bm_candidates = ["bookmark_table", "bm_table", "bookmarks_table",
+                          "tbl_bookmarks", "tbl_bookmark"]
+        # Walk up to MainWindow
+        parent = self.parent()
+        while parent:
+            for cand in bm_candidates:
+                if hasattr(parent, cand):
+                    bm_tbl = getattr(parent, cand)
+                    break
+            if bm_tbl:
+                break
+            parent = parent.parent() if hasattr(parent, "parent") else None
+
+        if bm_tbl and isinstance(bm_tbl, QTableWidget):
+            # Append rows to existing bookmark table
+            for rd in row_dicts:
+                row_pos = bm_tbl.rowCount()
+                bm_tbl.insertRow(row_pos)
+                # Ensure enough columns
+                if bm_tbl.columnCount() == 0:
+                    bm_tbl.setColumnCount(len(rd))
+                    bm_tbl.setHorizontalHeaderLabels(list(rd.keys()))
+                for col, (k, v) in enumerate(rd.items()):
+                    if col < bm_tbl.columnCount():
+                        bm_tbl.setItem(row_pos, col,
+                                       QTableWidgetItem(str(v)))
+            QMessageBox.information(
+                self, "Bookmarks",
+                f"{len(row_dicts)} row(s) added to Bookmarks tab.")
+        else:
+            # ── Fallback: store in self._bookmarks list and show count ─────────
+            if not hasattr(self, "_bookmarks"):
+                self._bookmarks = []
+            self._bookmarks.extend(row_dicts)
+            # Try to find a tab widget and switch to bookmarks tab
+            switched = False
+            parent = self.parent()
+            while parent and not switched:
+                from PyQt5.QtWidgets import QTabWidget
+                if isinstance(parent, QTabWidget):
+                    for i in range(parent.count()):
+                        if "bookmark" in parent.tabText(i).lower():
+                            parent.setCurrentIndex(i)
+                            switched = True
+                            break
+                parent = parent.parent() if hasattr(parent, "parent") else None
+
+            QMessageBox.information(
+                self, "Bookmarks",
+                f"{len(row_dicts)} row(s) bookmarked "
+                f"(total: {len(self._bookmarks)}).\n\n"
+                f"No dedicated Bookmark table found — rows stored internally.\n"
+                f"Export via File → Export Bookmarks if supported.")
+
+    # ── End right-click context menu ──────────────────────────────────────────
+
 class ResultsTab(QWidget):
     # Emits (artifact_name, row_dict, tag) when user bookmarks a row
-    bookmark_requested = pyqtSignal(str, dict, str)
+    bookmark_requested = pyqtSignal(str, object, str)
+
+
+    def _preset_image(self):
+        """Non-volatile artifacts suitable for forensic image analysis."""
+        self._sel_none()
+        for a in ["PST/OST Files (Outlook)","MSG Files (Outlook)","Thunderbird MBOX",
+                  "Email Attachments","Email Contacts","Email Calendar Items",
+                  "Browser History","Browser Cookies","Browser Saved Passwords",
+                  "Browser Extensions","Prefetch Files","LNK / Shortcut Files",
+                  "Recycle Bin Contents","Registry Run Keys","Startup Folder Items",
+                  "Scheduled Tasks","Security Event Log","System Event Log",
+                  "Application Event Log","PowerShell Operational Log",
+                  "Recently Accessed Files","Certificate Store","SAM Database Hash Dump",
+                  "Installed Software"]:
+            if a in self._checks: self._checks[a].setChecked(True)
+
+
+    def _preset_malware(self):
+        self._sel_none()
+        for a in ["Running Processes","Active Connections","Registry Run Keys",
+                  "Scheduled Tasks","Services (Auto-Start)","Prefetch Files",
+                  "Recently Accessed Files","Loaded Drivers/Modules",
+                  "WMI Subscriptions","AppInit DLLs"]:
+            if a in self._checks: self._checks[a].setChecked(True)
+
 
     def __init__(self):
         super().__init__()
@@ -5014,6 +7055,114 @@ class ResultsTab(QWidget):
             btn.setChecked(m == mode)
         self._refresh_preview(self._current_row_data)
 
+    def _table_ctx(self, pos):
+        """Right-click context menu on the artifact result table."""
+        try:
+            from PyQt6.QtWidgets import QMenu, QInputDialog, QApplication
+            table = self.result_table
+            row   = table.rowAt(pos.y())
+            col   = table.columnAt(pos.x())
+            if row < 0:
+                return
+
+            menu       = QMenu(table)
+            act_bm     = menu.addAction("  Add to Bookmarks")
+            menu.addSeparator()
+            act_row    = menu.addAction("  Copy Row(s)")
+            act_cell   = menu.addAction("  Copy Cell Value")
+            menu.addSeparator()
+            act_all    = menu.addAction("  Copy All Rows (TSV)")
+
+            action = menu.exec(table.viewport().mapToGlobal(pos))
+
+            if action == act_bm:
+                self._ctx_add_bookmark(row)
+            elif action == act_row:
+                self._ctx_copy_rows()
+            elif action == act_cell:
+                it = table.item(row, col)
+                if it:
+                    QApplication.clipboard().setText(it.text())
+            elif action == act_all:
+                self._ctx_copy_all()
+        except Exception as e:
+            import traceback; traceback.print_exc()
+
+    def _ctx_add_bookmark(self, clicked_row):
+        """Emit bookmark_requested for every selected row (or clicked row)."""
+        try:
+            from PyQt6.QtWidgets import QInputDialog, QApplication
+            from PyQt6.QtCore import Qt
+            table   = self.result_table
+            rows    = sorted(set(i.row() for i in table.selectedItems()))
+            if not rows:
+                rows = [clicked_row]
+
+            tag, ok = QInputDialog.getText(
+                self, "Add to Bookmarks",
+                f"Tag / note for {len(rows)} row(s):",
+                text=getattr(self, '_current_name', ''))
+            if not ok:
+                return
+
+            artifact_name = getattr(self, '_current_name', 'Unknown Artifact')
+            for r in rows:
+                row_data = {}
+                for c in range(table.columnCount()):
+                    h  = table.horizontalHeaderItem(c)
+                    it = table.item(r, c)
+                    key = h.text() if h else str(c)
+                    row_data[key] = it.text() if it else ''
+                try:
+                    self.bookmark_requested.emit(artifact_name, row_data, tag or artifact_name)
+                except Exception:
+                    # Fallback: store locally
+                    if not hasattr(self, '_local_bookmarks'):
+                        self._local_bookmarks = []
+                    self._local_bookmarks.append({'artifact': artifact_name,
+                                                  'tag': tag, 'data': row_data})
+        except Exception as e:
+            import traceback; traceback.print_exc()
+
+    def _ctx_copy_rows(self):
+        try:
+            from PyQt6.QtWidgets import QApplication
+            table = self.result_table
+            rows  = sorted(set(i.row() for i in table.selectedItems()))
+            if not rows:
+                return
+            headers = [table.horizontalHeaderItem(c).text()
+                       if table.horizontalHeaderItem(c) else str(c)
+                       for c in range(table.columnCount())]
+            lines = ['\t'.join(headers)]
+            for r in rows:
+                cells = []
+                for c in range(table.columnCount()):
+                    it = table.item(r, c)
+                    cells.append(it.text() if it else '')
+                lines.append('\t'.join(cells))
+            QApplication.clipboard().setText('\n'.join(lines))
+        except Exception:
+            pass
+
+    def _ctx_copy_all(self):
+        try:
+            from PyQt6.QtWidgets import QApplication
+            table = self.result_table
+            headers = [table.horizontalHeaderItem(c).text()
+                       if table.horizontalHeaderItem(c) else str(c)
+                       for c in range(table.columnCount())]
+            lines = ['\t'.join(headers)]
+            for r in range(table.rowCount()):
+                cells = []
+                for c in range(table.columnCount()):
+                    it = table.item(r, c)
+                    cells.append(it.text() if it else '')
+                lines.append('\t'.join(cells))
+            QApplication.clipboard().setText('\n'.join(lines))
+        except Exception:
+            pass
+
     def _on_cell_changed(self, row, col, prow, pcol):
         if row < 0 or row >= self.result_table.rowCount(): return
         n = self.result_table.columnCount()
@@ -5109,45 +7258,6 @@ class ResultsTab(QWidget):
                     f"<p>No accessible path in this row.</p>{fields}</div>")
 
     # ── Table right-click ─────────────────────────────────────────────
-    def _table_ctx(self, pos):
-        row = self.result_table.rowAt(pos.y())
-        if row < 0: return
-        n = self.result_table.columnCount()
-        hdrs = [self.result_table.horizontalHeaderItem(c).text()
-                if self.result_table.horizontalHeaderItem(c) else str(c)
-                for c in range(n)]
-        rd = {hdrs[c]: (self.result_table.item(row,c).text()
-              if self.result_table.item(row,c) else "") for c in range(n)}
-        first_val = next(iter(rd.values()),"")
-
-        menu = QMenu(self)
-        menu.addAction("Copy Row (Tab-separated)",
-            lambda: QApplication.clipboard().setText("\t".join(rd.values())))
-        menu.addAction("Copy Row (JSON)",
-            lambda: QApplication.clipboard().setText(json.dumps(rd,default=str)))
-        menu.addAction(f'Copy First Value  "{first_val[:40]}"',
-            lambda: QApplication.clipboard().setText(first_val))
-        menu.addSeparator()
-
-        bm = menu.addMenu("Add to Bookmark...")
-        for tag in ["Key Finding","Malware Indicator","Suspicious","Cleared",
-                    "IOC","File of Interest","User Activity","Network Activity"]:
-            bm.addAction(tag,
-                lambda t=tag: self.bookmark_requested.emit(
-                    self._current_name, dict(rd), t))
-
-        menu.addSeparator()
-        p = next((rd[k] for k in ("Path","path","Exe","exe","File","file") if k in rd and rd[k]),"")
-        if p and os.path.exists(p):
-            menu.addAction("Open Containing Folder", lambda: self._open_folder(p))
-            if os.path.isfile(p):
-                menu.addAction("Save File As...", lambda: self._save_file(p))
-        menu.addSeparator()
-        menu.addAction("Filter to This Value",
-            lambda: self.filter_edit.setText(first_val[:50]))
-        menu.addAction("Clear Filter", self.filter_edit.clear)
-        menu.exec(self.result_table.mapToGlobal(pos))
-
     def _open_folder(self, p):
         d = os.path.dirname(p) if os.path.isfile(p) else p
         if platform.system()=="Windows": os.startfile(d)
@@ -5393,144 +7503,40 @@ class TimelineTab(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════
-#  REMOTE AGENT TAB
+#  REMOTE TRIAGE TAB  (native, agentless)
 # ══════════════════════════════════════════════════════════════
 
-AGENT_TEMPLATE = '''#!/usr/bin/env python3
-"""
-ForensicPro Remote Collection Agent  v{version}
-Generated : {timestamp}
-Case      : {case_name}  ({case_id})
-Examiner  : {examiner}
-Artifacts : {artifacts_brief}
----
-Deploy on remote host with administrator/root privileges.
-Usage: python3 forensic_agent.py
-"""
-import os, sys, json, socket, hashlib, datetime, platform, subprocess, zipfile, tempfile
-import psutil
-
-ARTIFACTS   = {artifacts_json}
-OUTPUT_DIR  = r"{output_dir}"
-SERVER      = "{server}"
-CASE_ID     = "{case_id}"
-VERSION     = "{version}"
-
-def fmt(n):
-    for u in ["B","KB","MB","GB","TB"]:
-        if n < 1024: return f"{{n:.1f}} {{u}}"
-        n /= 1024
-    return f"{{n:.1f}} PB"
-
-def sysinfo():
-    u = platform.uname(); m = psutil.virtual_memory()
-    return {{"hostname":u.node,"os":u.system,"release":u.release,
-             "version":u.version,"ram":fmt(m.total),"cpu":psutil.cpu_count()}}
-
-def processes():
-    out = []
-    for p in psutil.process_iter(['pid','name','username','status','exe']):
-        try: out.append(p.info)
-        except: pass
-    return out
-
-def connections():
-    out = []
-    for c in psutil.net_connections(kind='inet'):
-        try:
-            out.append({{"pid":c.pid,"status":c.status,
-                "local":f"{{c.laddr.ip}}:{{c.laddr.port}}" if c.laddr else "",
-                "remote":f"{{c.raddr.ip}}:{{c.raddr.port}}" if c.raddr else ""}})
-        except: pass
-    return out
-
-def users():
-    try: return [{{"name":u.name,"terminal":u.terminal,"host":u.host,"started":u.started}}
-                 for u in psutil.users()]
-    except: return []
-
-def disks():
-    out = []
-    for p in psutil.disk_partitions():
-        try:
-            u = psutil.disk_usage(p.mountpoint)
-            out.append({{"device":p.device,"mount":p.mountpoint,"fs":p.fstype,
-                         "total":fmt(u.total),"used":fmt(u.used),"free":fmt(u.free)}})
-        except: pass
-    return out
-
-COLLECTORS = {{
-    "Running Processes": processes,
-    "Active Connections": connections,
-    "OS Version & Build": sysinfo,
-    "Local User Accounts": users,
-    "Hardware Profile": disks,
-}}
-
-def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    report = {{"case_id":CASE_ID,"agent_version":VERSION,
-               "collected_at":datetime.datetime.now().isoformat(),
-               "host":socket.gethostname(),"artifacts":{{}}}}
-
-    for art in ARTIFACTS:
-        print(f"[*] {{art}}")
-        try:
-            fn = COLLECTORS.get(art, lambda: {{"status":"collected","note":"requires OS integration"}})
-            report["artifacts"][art] = fn()
-            print(f"[+] done")
-        except Exception as e:
-            report["artifacts"][art] = {{"error":str(e)}}
-            print(f"[-] {{e}}")
-
-    ts  = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out = os.path.join(OUTPUT_DIR, f"forensic_{{CASE_ID}}_{{ts}}.json")
-    with open(out,"w") as f: json.dump(report, f, indent=2, default=str)
-
-    zpath = out.replace(".json",".zip")
-    with zipfile.ZipFile(zpath,"w",zipfile.ZIP_DEFLATED) as z:
-        z.write(out, os.path.basename(out))
-
-    print(f"[+] Saved: {{out}}")
-    print(f"[+] Archive: {{zpath}}")
-
-    if SERVER:
-        try:
-            host, port = SERVER.split(":")
-            s = __import__("socket").socket()
-            s.connect((host, int(port)))
-            data = open(zpath,"rb").read()
-            s.sendall(len(data).to_bytes(8,"big") + data)
-            s.close()
-            print(f"[+] Sent to {{SERVER}}")
-        except Exception as e:
-            print(f"[-] Send failed: {{e}}")
-
-if __name__ == "__main__":
-    main()
-'''
 
 class AgentTab(QWidget):
+    """Native (agentless) remote triage panel.
+
+    Collection is performed with signed in-box Windows tools only — no SSH,
+    paramiko, impacket or smbclient.  Evidence files are copied back to the
+    case folder and analysed locally; live data is queried with native tools.
+    """
+    triage_requested = pyqtSignal(list, str, str)   # names, host, "remote"
+    target_added     = pyqtSignal(dict)             # registered target cfg
+    _msg             = pyqtSignal(str, str, bool)    # title, text, is_error
+
     def __init__(self, art_tab):
         super().__init__()
         self.art_tab = art_tab
-        self._code   = ""
         self._setup()
+        self._msg.connect(self._show_msg)
 
     def _setup(self):
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(0,0,0,0)
+        lay.setContentsMargins(0, 0, 0, 0)
         split = QSplitter(Qt.Orientation.Horizontal)
         split.setHandleWidth(2)
 
-        # Left config panel
         cfg_scroll = QScrollArea()
         cfg_scroll.setWidgetResizable(True)
-        cfg_scroll.setMinimumWidth(310); cfg_scroll.setMaximumWidth(400)
+        cfg_scroll.setMinimumWidth(320); cfg_scroll.setMaximumWidth(420)
         cfg_scroll.setStyleSheet(f"QScrollArea{{border:none;background:{C['bg2']}}}")
         cfg = QWidget(); cfg.setStyleSheet(f"background:{C['bg2']};")
-        cl  = QVBoxLayout(cfg)
-        cl.setContentsMargins(12,12,12,12); cl.setSpacing(5)
+        cl = QVBoxLayout(cfg)
+        cl.setContentsMargins(12, 12, 12, 12); cl.setSpacing(5)
 
         def section(title):
             l = QLabel(title)
@@ -5539,485 +7545,240 @@ class AgentTab(QWidget):
                 f"border-bottom:1px solid {C['border']};padding-bottom:4px;margin-top:10px;")
             cl.addWidget(l)
 
-        def field(label, attr, default="", password=False):
+        def field(label, attr, default="", password=False, placeholder=""):
             cl.addWidget(QLabel(label))
             le = QLineEdit(default)
+            if placeholder:
+                le.setPlaceholderText(placeholder)
             if password:
                 le.setEchoMode(QLineEdit.EchoMode.Password)
             setattr(self, attr, le)
             cl.addWidget(le)
 
         section("CASE INFORMATION")
-        field("Case Name",      "f_case_name", "Investigation-001")
-        field("Case ID",        "f_case_id",   "FC-2025-001")
-        field("Examiner",       "f_examiner",  "")
+        field("Case Name", "f_case_name", "Investigation-001")
+        field("Case ID",   "f_case_id",   "FC-2025-001")
+        field("Examiner",  "f_examiner",  "")
 
-        section("AGENT OUTPUT")
-        field("Remote Output Dir",               "f_output_dir", "/tmp/forensic_out")
-        field("C2 Server (host:port, optional)", "f_server",     "")
+        section("REMOTE WINDOWS TARGET")
+        field("Host (name or IP)", "f_host", "", placeholder="e.g. WKS-1234 or 10.0.0.5")
+        field("Username", "f_user", "", placeholder="DOMAIN\\user or user")
+        field("Password", "f_pass", "", password=True)
 
-        section("SSH DEPLOYMENT")
-        field("SSH Target (user@host)",    "f_ssh_target", "")
-        field("SSH Password / Key Path",   "f_ssh_pass",   "", password=True)
+        section("EVIDENCE / CASE FOLDER")
+        field("Case Folder (collected evidence)", "f_output_dir", "",
+              placeholder="defaults to ~/ForensicPro_Cases/<host>_<ts>")
 
-        section("SMB DEPLOYMENT  (Windows targets)")
-        field("SMB Host (IP or hostname)", "f_smb_host",  "")
-        field("SMB Username (DOMAIN\\user or user)", "f_smb_user", "")
-        field("SMB Password",              "f_smb_pass",  "", password=True)
-        field("SMB Share\\SubPath (e.g. C$\\Temp)", "f_smb_rpath", "C$\\Temp")
-
-        section("AGENT OPTIONS")
-        cl.addWidget(QLabel("Artifact Preset"))
+        section("ARTIFACT PRESET")
         self.f_preset = QComboBox()
         self.f_preset.addItems([
             "Use Current Selection", "Quick Triage",
             "Full Collection", "Incident Response", "Malware Hunt"])
         cl.addWidget(self.f_preset)
 
-        cl.addWidget(QLabel("Agent Format"))
-        self.f_format = QComboBox()
-        self.f_format.addItems([
-            "🐍  Python Script  (.py)   — universal",
-            "📜  Shell Script   (.sh)   — Linux / macOS",
-            "📜  Batch Script   (.bat)  — Windows",
-            "📜  PowerShell     (.ps1)  — Windows",
-            "⚡  Windows EXE    (.exe)  — via PyInstaller",
-        ])
-        cl.addWidget(self.f_format)
-
         section("ACTIONS")
         for label, method, accent in [
-            ("\u2699  Generate Agent Code",   self._generate,      True),
-            ("\U0001f4be  Save Agent File\u2026",    self._save,          False),
-            ("\U0001f680  Deploy via SSH",          self._deploy_ssh,    False),
-            ("\U0001f5a5\ufe0f  Deploy via SMB",         self._deploy_smb,    False),
-            ("\U0001f4e5  Import Agent Results\u2026", self._import_results, False),
+            ("\u2795  Add as Evidence Target",      self._add_target,     False),
+            ("\U0001f50c  Test Connection",          self._test_connection, False),
+            ("\u26a1  Run Native Triage Now",        self._run_triage,     True),
+            ("\U0001f4c1  Open Case Folder",          self._open_case_folder, False),
+            ("\U0001f4e5  Import Results\u2026",       self._import_results, False),
         ]:
             btn = QPushButton(label)
             btn.setFixedHeight(32)
             if accent:
                 btn.setObjectName("accent")
-            btn.clicked.connect(lambda _=False, m=method: m())
+            btn.clicked.connect(method)
             cl.addWidget(btn)
 
         cl.addStretch()
         cfg_scroll.setWidget(cfg)
         split.addWidget(cfg_scroll)
 
-        # Right: code preview
         right = QWidget()
         rl = QVBoxLayout(right)
-        rl.setContentsMargins(0,0,0,0); rl.setSpacing(0)
+        rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(0)
         hdr_w = QWidget()
         hdr_w.setStyleSheet(f"background:{C['bg3']};border-bottom:1px solid {C['border']};")
-        hdrl  = QHBoxLayout(hdr_w)
-        hdrl.setContentsMargins(8,4,8,4)
-        hdrl.addWidget(QLabel("  GENERATED AGENT CODE"))
+        hdrl = QHBoxLayout(hdr_w)
+        hdrl.setContentsMargins(8, 4, 8, 4)
+        hdrl.addWidget(QLabel("  REMOTE TRIAGE  —  NATIVE WINDOWS TOOLS (agentless)"))
         self._status_lbl = QLabel("")
         self._status_lbl.setStyleSheet(f"color:{C['green']};font-size:8pt;")
         hdrl.addWidget(self._status_lbl)
         hdrl.addStretch()
         rl.addWidget(hdr_w)
         self.code_edit = QPlainTextEdit()
+        self.code_edit.setReadOnly(True)
         self.code_edit.setStyleSheet(
-            f"background:{C['bg']};color:{C['green']};"
+            f"background:{C['bg']};color:{C['fg2']};"
             f"font-family:'Consolas','Cascadia Code','Courier New',monospace;"
             f"font-size:9pt;border:none;padding:8px;")
-        self.code_edit.setPlainText("# Configure settings on the left, then click Generate.\n")
+        self.code_edit.setPlainText(
+            "Native remote triage — no third-party dependencies.\n\n"
+            "Transport (signed, in-box Windows binaries only):\n"
+            "  net.exe       authenticate to admin share (IPC$/C$)\n"
+            "  robocopy.exe  copy evidence files back to the case folder\n"
+            "  reg.exe       remote registry query / hive save (\\\\HOST\\HKLM...)\n"
+            "  wevtutil.exe  remote event-log queries (/r /u /p)\n"
+            "  schtasks.exe  remote scheduled tasks (/s /u /p)\n"
+            "  tasklist.exe  remote process list (/s /u /p)\n"
+            "  sc.exe        remote services (\\\\HOST query)\n"
+            "  query.exe     remote logon sessions (query session /server:)\n"
+            "  powershell    Get-CimInstance (DCOM) + Invoke-Command (WinRM)\n\n"
+            "Workflow:\n"
+            "  1. Fill in host + credentials + (optional) case folder.\n"
+            "  2. Add as Evidence Target (or just Run Native Triage Now).\n"
+            "  3. Selected artifacts are collected; files land in the case\n"
+            "     folder and are analysed locally. Results appear in the\n"
+            "     Analysis Results tab.\n")
         rl.addWidget(self.code_edit)
         split.addWidget(right)
-        split.setSizes([360, 900])
+        split.setSizes([380, 880])
         lay.addWidget(split)
+
+    # ── helpers ───────────────────────────────────────────────────
+    def _log(self, text):
+        self.code_edit.appendPlainText(text)
+
+    @pyqtSlot(str, str, bool)
+    def _show_msg(self, title, text, is_error):
+        if is_error:
+            QMessageBox.critical(self, title, text)
+        else:
+            QMessageBox.information(self, title, text)
+
+    def load_target(self, cfg):
+        """Populate the form from a registered remote-target cfg."""
+        try:
+            self.f_host.setText(cfg.get("host", ""))
+            u = cfg.get("user", "")
+            if cfg.get("domain"):
+                u = cfg["domain"] + "\\" + u
+            self.f_user.setText(u)
+            self.f_pass.setText(cfg.get("password", ""))
+            self.f_output_dir.setText(cfg.get("case_dir", ""))
+            self._status_lbl.setText("\u2713 Target loaded: " + cfg.get("host", ""))
+        except Exception:
+            pass
 
     def _get_artifacts(self):
         preset = self.f_preset.currentText()
         if preset == "Quick Triage":
-            return ["OS Version & Build","Running Processes","Active Connections","Local User Accounts"]
+            return ["OS Version & Build", "Running Processes",
+                    "Active Connections", "Local User Accounts"]
         elif preset == "Full Collection":
             return [a for cat in ARTIFACT_CATEGORIES.values() for a in cat]
         elif preset == "Incident Response":
-            return ["Running Processes","Active Connections","Network Interfaces",
-                    "OS Version & Build","Hostname & Domain","System Uptime",
-                    "Local User Accounts","Recently Accessed Files","Temp Directory Contents"]
+            return ["Running Processes", "Active Connections", "Network Interfaces",
+                    "OS Version & Build", "Hostname & Domain",
+                    "Local User Accounts", "Scheduled Tasks", "Services (Auto-Start)",
+                    "Registry Run Keys", "Security Event Log", "Prefetch Files"]
         elif preset == "Malware Hunt":
-            return ["Running Processes","Active Connections","Registry Run Keys",
-                    "Scheduled Tasks","Loaded Drivers/Modules","Services (Auto-Start)",
-                    "WMI Subscriptions","AppInit DLLs","Recently Accessed Files","Prefetch Files"]
+            return ["Running Processes", "Active Connections", "Registry Run Keys",
+                    "Scheduled Tasks", "Loaded Drivers/Modules", "Services (Auto-Start)",
+                    "WMI Subscriptions", "AppInit DLLs", "Prefetch Files",
+                    "Process Creation Events (4688)"]
         else:
             arts = self.art_tab.get_selected()
-            return arts or ["OS Version & Build","Running Processes"]
+            return arts or ["OS Version & Build", "Running Processes"]
 
-    def _generate(self):
+    def _build_cfg(self):
+        host = self.f_host.text().strip()
+        if not host:
+            self._msg.emit("Remote Target", "Enter a host name or IP.", True)
+            return None
+        user = self.f_user.text().strip()
+        domain = ""
+        if "\\" in user:
+            domain, user = user.split("\\", 1)
+        cfg = register_remote_target(
+            host, user=user, password=self.f_pass.text(),
+            domain=domain, case_dir=self.f_output_dir.text().strip())
+        self.f_output_dir.setText(cfg["case_dir"])
+        return cfg
+
+    def _add_target(self):
+        cfg = self._build_cfg()
+        if not cfg:
+            return
+        self.target_added.emit(cfg)
+        self._status_lbl.setText("\u2713 Target added: " + cfg["host"])
+        self._log("[+] Registered remote target %s (case: %s)" %
+                  (cfg["host"], cfg["case_dir"]))
+
+    def _test_connection(self):
+        cfg = self._build_cfg()
+        if not cfg:
+            return
+        self._log("[*] Testing connection to %s ..." % cfg["host"])
+
+        def run():
+            try:
+                rc = RemoteCollector(cfg)
+                ok, msg = rc.connect()
+                rc.disconnect()
+                if ok:
+                    self._msg.emit("Connection OK",
+                                   "Authenticated to \\\\%s admin share.\n%s" %
+                                   (cfg["host"], msg), False)
+                else:
+                    self._msg.emit("Connection Failed",
+                                   "Could not connect to \\\\%s.\n%s" %
+                                   (cfg["host"], msg), True)
+            except Exception as e:
+                self._msg.emit("Connection Error", str(e), True)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _run_triage(self):
+        cfg = self._build_cfg()
+        if not cfg:
+            return
         arts = self._get_artifacts()
-        if not arts:
-            QMessageBox.warning(self, "No Artifacts",
-                "No artifacts selected. Choose a preset or visit Artifact Selection tab.")
-            return
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            self._code = AGENT_TEMPLATE.format(
-                version         = APP_VERSION,
-                timestamp       = ts,
-                case_name       = self.f_case_name.text() or "Case",
-                case_id         = self.f_case_id.text()   or "FC-001",
-                examiner        = self.f_examiner.text()  or "Examiner",
-                artifacts_brief = (", ".join(arts[:5]) +
-                                   (" +%d more" % (len(arts)-5) if len(arts)>5 else "")),
-                artifacts_json  = json.dumps(arts),
-                output_dir      = self.f_output_dir.text() or "/tmp/forensic_out",
-                server          = self.f_server.text() or "",
-            )
-            self.code_edit.setPlainText(self._code)
-            self._status_lbl.setText(
-                "Generated: %d artifacts, %d lines" % (
-                    len(arts), len(self._code.splitlines())))
-            self._status_lbl.setStyleSheet(f"color:{C['green']};font-size:8pt;")
-        except Exception as e:
-            import traceback
-            print("[_generate]", traceback.format_exc())
-            self._status_lbl.setText("Error: " + str(e)[:60])
-            self._status_lbl.setStyleSheet(f"color:{C['red']};font-size:8pt;")
-            QMessageBox.critical(self, "Generate Error", str(e))
+        self.target_added.emit(cfg)
+        self._log("[*] Starting native triage of %s — %d artifact(s) → %s" %
+                  (cfg["host"], len(arts), cfg["case_dir"]))
+        self._status_lbl.setText("\u26a1 Triage started (%d artifacts)" % len(arts))
+        # Hand off to the main window's collection pipeline (target_type=remote).
+        self.triage_requested.emit(arts, cfg["host"], "remote")
 
-    def _save(self):
-        """Save the generated agent in the format chosen by the Agent Format combo."""
-        if not self._code:
-            QMessageBox.warning(self, "Generate First",
-                "Generate the agent code first.")
-            return
-        fmt = getattr(self, "f_format", None)
-        fmt_idx = fmt.currentIndex() if fmt else 0   # default: Python
-        cid = (self.f_case_id.text() or "FC001").replace(" ", "_")
-        ver = APP_VERSION
-        _meta = {
-            0: ("forensic_agent_%s.py"  % cid, "Python Script (*.py);;All (*)"),
-            1: ("forensic_agent_%s.sh"  % cid, "Shell Script (*.sh);;All (*)"),
-            2: ("forensic_agent_%s.bat" % cid, "Batch Script (*.bat);;All (*)"),
-            3: ("forensic_agent_%s.ps1" % cid, "PowerShell (*.ps1);;All (*)"),
-            4: ("forensic_agent_%s.exe" % cid, "Windows EXE (*.exe);;All (*)"),
-        }
-        default_name, filt = _meta.get(fmt_idx, _meta[0])
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Agent", default_name, filt)
+    def _open_case_folder(self):
+        path = self.f_output_dir.text().strip()
+        if not path:
+            cfg = self._build_cfg()
+            path = cfg["case_dir"] if cfg else ""
         if not path:
             return
+        os.makedirs(path, exist_ok=True)
         try:
-            if fmt_idx == 0:
-                content = self._code
-            elif fmt_idx == 1:
-                content = self._make_sh_wrapper(self._code, cid, ver)
-            elif fmt_idx == 2:
-                content = self._make_bat_wrapper(self._code, cid, ver)
-            elif fmt_idx == 3:
-                content = self._make_ps1_wrapper(self._code, cid, ver)
-            elif fmt_idx == 4:
-                self._compile_exe(path, cid)
-                return   # _compile_exe shows its own dialog
-            # Write text content (use newline="" to preserve \r\n in BAT wrappers)
-            with open(path, "w", encoding="utf-8", newline="") as f:
-                f.write(content)
-            try:
-                shutil.copy(path,
-                    "/mnt/user-data/outputs/" + os.path.basename(path))
-            except Exception:
-                pass
-            QMessageBox.information(self, "Saved", "Agent saved:\n" + path)
-        except Exception as ex:
-            QMessageBox.critical(self, "Save Error", str(ex))
-
-    # ── Agent format wrapper / compile helpers ────────────────────────────────
-
-    def _make_sh_wrapper(self, python_code, case_id, version):
-        """
-        Embed the Python source in a self-executing shell script via heredoc.
-        The heredoc delimiter uses a unique case-based string to avoid conflicts.
-        Deploy on Linux/macOS as root:  sh <script>
-        """
-        delim = "FORENSICPRO_%s_HEREDOC_END" % case_id.replace("-", "_").upper()
-        return (
-            "#!/bin/sh\n"
-            "# ForensicPro Remote Agent Launcher  [Shell Script]\n"
-            "# Generated by ForensicPro v%s  |  Case: %s\n"
-            "# Deploy on Linux / macOS target (run as root):\n"
-            "#   chmod +x <script> && ./<script>\n"
-            "_TMP=$(mktemp /tmp/fpa_XXXX.py 2>/dev/null"
-            " || echo /tmp/fpa_%s_$$.py)\n"
-            "cat > \"$_TMP\" <<'%s'\n"
-            "%s\n"
-            "%s\n"
-            "python3 \"$_TMP\" \"$@\"\n"
-            "_rc=$?; rm -f \"$_TMP\"; exit $_rc\n"
-        ) % (version, case_id, case_id, delim, python_code, delim)
-
-    def _make_bat_wrapper(self, python_code, case_id, version):
-        """
-        Embed base64-encoded Python in a Windows Batch launcher.
-        Uses PowerShell (available on Win 7+) to decode and write the .py file.
-        Deploy on Windows (run as Administrator):  cmd /c <script>
-        """
-        import base64 as _b64
-        b64 = _b64.b64encode(python_code.encode("utf-8")).decode("ascii")
-        # Split into 70-char lines; base64 chars are all alphanumeric / + / = so
-        # no BAT special-character escaping is needed
-        chunks = [b64[i:i+70] for i in range(0, len(b64), 70)]
-        # First chunk uses > (create), subsequent use >> (append)
-        echo_lines = "\r\n".join(
-            ("echo %s> \"%%_B%%\"" % c if i == 0
-             else "echo %s>> \"%%_B%%\"" % c)
-            for i, c in enumerate(chunks)
-        )
-        return (
-            "@echo off\r\n"
-            ":: ForensicPro Remote Agent Launcher  [Batch Script]\r\n"
-            ":: Generated by ForensicPro v%s  |  Case: %s\r\n"
-            ":: Deploy on Windows target (run as Administrator):\r\n"
-            "::   cmd /c %s.bat\r\n"
-            "setlocal\r\n"
-            "set \"_B=%%TEMP%%\\fpa_%s.b64\"\r\n"
-            "set \"_P=%%TEMP%%\\fpa_%s.py\"\r\n"
-            "%s\r\n"
-            "powershell -NoProfile -Command \"$b=[IO.File]::"
-            "ReadAllText('%%_B%%') -replace '\\s';"
-            "[IO.File]::WriteAllBytes('%%_P%%',[Convert]::"
-            "FromBase64String($b))\"\r\n"
-            "del \"%%_B%%\" 2>nul\r\n"
-            "python \"%%_P%%\"\r\n"
-            "del \"%%_P%%\" 2>nul\r\n"
-            "endlocal\r\n"
-        ) % (version, case_id, case_id, case_id, case_id, echo_lines)
-
-    def _make_ps1_wrapper(self, python_code, case_id, version):
-        """
-        Embed Python source in a PowerShell here-string launcher.
-        @'...'@ is fully literal (no variable / command expansion).
-        Deploy on Windows (run as Administrator):\n
-          powershell -ExecutionPolicy Bypass -File <script>
-        """
-        return (
-            "# ForensicPro Remote Agent Launcher  [PowerShell Script]\n"
-            "# Generated by ForensicPro v%s  |  Case: %s\n"
-            "# Deploy on Windows target (run as Administrator):\n"
-            "#   powershell -ExecutionPolicy Bypass -File <script>\n"
-            "$code = @'\n"
-            "%s\n"
-            "'@\n"
-            "$tmp = Join-Path $env:TEMP 'forensic_agent_%s.py'\n"
-            "[IO.File]::WriteAllText($tmp, $code, [Text.Encoding]::UTF8)\n"
-            "& python $tmp @args\n"
-            "Remove-Item $tmp -Force -ErrorAction SilentlyContinue\n"
-        ) % (version, case_id, python_code, case_id)
-
-    def _compile_exe(self, dest_path, case_id):
-        """
-        Compile the Python agent to a standalone Windows .exe via PyInstaller.
-        Runs in a background thread; shows an info or error dialog when done.
-        Requires:  pip install pyinstaller
-        """
-        code_snapshot = self._code
-
-        def _run():
-            import tempfile, subprocess as _sp, shutil as _sh
-            tmp_dir = tempfile.mkdtemp(prefix="forensicpro_build_")
-            py_src  = os.path.join(tmp_dir, "forensic_agent_%s.py" % case_id)
-            try:
-                with open(py_src, "w", encoding="utf-8") as f:
-                    f.write(code_snapshot)
-                res = _sp.run(
-                    [sys.executable, "-m", "PyInstaller",
-                     "--onefile", "--clean", "--noconfirm",
-                     "--name", "forensic_agent_%s" % case_id,
-                     "--distpath", tmp_dir,
-                     py_src],
-                    capture_output=True, text=True, timeout=300)
-                exe_built = os.path.join(tmp_dir, "forensic_agent_%s.exe" % case_id)
-                if res.returncode == 0 and os.path.isfile(exe_built):
-                    _sh.copy2(exe_built, dest_path)
-                    try:
-                        _sh.copy2(dest_path,
-                            "/mnt/user-data/outputs/" + os.path.basename(dest_path))
-                    except Exception:
-                        pass
-                    QMessageBox.information(None, "EXE Built",
-                        "Agent compiled successfully:\n" + dest_path)
-                else:
-                    QMessageBox.critical(None, "PyInstaller Error",
-                        "Build failed (exit %d):\n%s" % (
-                            res.returncode,
-                            (res.stdout + "\n" + res.stderr)[-1500:]))
-            except FileNotFoundError:
-                QMessageBox.critical(None, "Missing Dependency",
-                    "PyInstaller not found.\n"
-                    "Install it first:\n  pip install pyinstaller")
-            except Exception as ex:
-                QMessageBox.critical(None, "EXE Compile Error", str(ex))
-            finally:
-                try:
-                    _sh.rmtree(tmp_dir, ignore_errors=True)
-                except Exception:
-                    pass
-
-        QMessageBox.information(self, "Building EXE…",
-            "PyInstaller is compiling the agent.\n"
-            "This may take 30–120 seconds.\n"
-            "A dialog will appear when the build completes.")
-        threading.Thread(target=_run, daemon=True).start()
-
-    def _deploy_ssh(self):
-        target = self.f_ssh_target.text().strip()
-        if not target:
-            QMessageBox.warning(self,"SSH","Enter SSH target (user@host).")
-            return
-        if not self._code:
-            QMessageBox.warning(self,"Generate","Generate the agent first.")
-            return
-        try:
-            import paramiko
-        except ImportError:
-            QMessageBox.critical(self,"Missing","Install paramiko:\n  pip install paramiko")
-            return
-
-        def run():
-            try:
-                user, host = (target.split("@",1) if "@" in target else ("root", target))
-                client  = paramiko.SSHClient()
-                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                passwd   = self.f_ssh_pass.text() or None
-                key_path = None
-                if passwd and os.path.isfile(passwd):
-                    key_path = passwd; passwd = None
-                kw = dict(username=user, timeout=15)
-                if key_path: kw["key_filename"] = key_path
-                else:        kw["password"]     = passwd
-                client.connect(host, **kw)
-                sftp    = client.open_sftp()
-                case_id = self.f_case_id.text() or "FC001"
-                rpath   = "/tmp/forensic_agent_%s.py" % case_id
-                with sftp.open(rpath,"w") as rf:
-                    rf.write(self._code)
-                sftp.chmod(rpath, 0o755)
-                _, out, _ = client.exec_command("nohup python3 %s &" % rpath)
-                stdout_data = out.read(4096).decode(errors="replace")
-                client.close()
-                QMessageBox.information(None,"SSH Deployed",
-                    "Agent deployed to %s\nRemote path: %s\n\nOutput:\n%s" % (
-                        target, rpath, stdout_data[:500]))
-            except Exception as e:
-                QMessageBox.critical(None,"SSH Error",str(e))
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def _deploy_smb(self):
-        smb_host  = self.f_smb_host.text().strip()
-        smb_user  = self.f_smb_user.text().strip()
-        smb_pass  = self.f_smb_pass.text()
-        smb_rpath = self.f_smb_rpath.text().strip() or "C$\\Temp"
-
-        if not smb_host:
-            QMessageBox.warning(self,"SMB","Enter SMB host (IP or hostname).")
-            return
-        if not self._code:
-            QMessageBox.warning(self,"Generate","Generate the agent first.")
-            return
-
-        case_id    = self.f_case_id.text() or "FC001"
-        agent_name = "forensic_agent_%s.py" % case_id
-
-        def _parse_smb():
-            host  = smb_host.lstrip("\\").split("\\")[0].split("/")[0]
-            parts = smb_rpath.split("\\")
-            share = parts[0] if parts else "C$"
-            sub   = "\\".join(parts[1:]) if len(parts)>1 else "Temp"
-            domain = smb_user.split("\\")[0] if "\\" in smb_user else ""
-            user   = smb_user.split("\\")[-1]
-            return host, share, sub, user, domain
-
-        def run():
-            host, share, sub, user, domain = _parse_smb()
-            success  = False
-            last_err = ""
-
-            # Method A: impacket
-            try:
-                import impacket.smbconnection as _smbc
-                import io as _io
-                conn = _smbc.SMBConnection(host, host, sess_port=445, timeout=15)
-                conn.login(user, smb_pass, domain)
-                remote_rel = (sub + "\\" + agent_name).lstrip("\\")
-                data = self._code.encode("utf-8")
-                conn.putFile(share, remote_rel, _io.BytesIO(data).read)
-                conn.logoff()
-                success = True
-                last_err = ("Agent deployed via impacket SMB\n"
-                            "Host: %s  Share: %s  Path: %s\\%s" % (
-                                host, share, sub, agent_name))
-            except ImportError:
-                last_err = "impacket not installed"
-            except Exception as e:
-                last_err = "impacket: " + str(e)
-
-            # Method B: smbclient CLI
-            if not success:
-                try:
-                    import tempfile, subprocess as _sp
-                    tmp = tempfile.NamedTemporaryFile(
-                        suffix=".py", delete=False, mode="w", encoding="utf-8")
-                    tmp.write(self._code); tmp.close()
-                    smb_remote = "/" + sub.replace("\\","/") + "/" + agent_name
-                    cmd = ["smbclient",
-                           "//%s/%s" % (host, share),
-                           "-U", "%s%%%s" % (smb_user, smb_pass),
-                           "-c", 'put "%s" "%s"' % (tmp.name, smb_remote)]
-                    r = _sp.run(cmd, capture_output=True, text=True, timeout=20)
-                    os.unlink(tmp.name)
-                    if r.returncode == 0:
-                        success = True
-                        last_err = ("Agent deployed via smbclient\n"
-                                    "\\\\%s\\%s\\%s\\%s" % (
-                                        host, share, sub, agent_name))
-                    else:
-                        last_err = "smbclient: " + r.stderr[:200]
-                except FileNotFoundError:
-                    last_err = "smbclient not found (apt install samba-client)"
-                except Exception as e:
-                    last_err = "smbclient: " + str(e)
-
-            # Method C: Windows UNC direct copy
-            if not success and platform.system() == "Windows":
-                try:
-                    unc = "\\\\%s\\%s\\%s\\%s" % (host, share, sub, agent_name)
-                    with open(unc,"w",encoding="utf-8") as f:
-                        f.write(self._code)
-                    success  = True
-                    last_err = "Agent copied via UNC:\n" + unc
-                except Exception as e:
-                    last_err = "UNC: " + str(e)
-
-            if success:
-                QMessageBox.information(None,"SMB Deployed", last_err)
+            if platform.system() == "Windows":
+                os.startfile(path)             # noqa
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", path])
             else:
-                QMessageBox.critical(None,"SMB Failed",
-                    "All SMB methods failed.\nLast error: " + last_err +
-                    "\n\nInstall one of:\n"
-                    "  pip install impacket\n"
-                    "  apt install samba-client")
-
-        threading.Thread(target=run, daemon=True).start()
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            self._msg.emit("Open Folder", str(e), True)
 
     def _import_results(self):
         path, _ = QFileDialog.getOpenFileName(
-            self,"Import Agent Results","","JSON/ZIP (*.json *.zip);;All (*)")
-        if not path: return
+            self, "Import Triage Results", "", "JSON/ZIP (*.json *.zip);;All (*)")
+        if not path:
+            return
         try:
             if path.endswith(".zip"):
                 with zipfile.ZipFile(path) as z:
                     names = [n for n in z.namelist() if n.endswith(".json")]
-                    if not names: raise ValueError("No JSON in archive")
+                    if not names:
+                        raise ValueError("No JSON in archive")
                     data = json.loads(z.read(names[0]))
             else:
-                with open(path) as f: data = json.load(f)
+                with open(path) as f:
+                    data = json.load(f)
+            self._log("[+] Imported results from %s" % os.path.basename(path))
             return data
         except Exception as e:
-            QMessageBox.critical(self,"Import Error",str(e))
+            self._msg.emit("Import Error", str(e), True)
             return None
 
 
@@ -6043,7 +7804,6 @@ class EmailViewerTab(QWidget):
         # ── Toolbar ──────────────────────────────────────────────────
         tb = QWidget()
         tb.setStyleSheet(f"background:{C['bg3']};border-bottom:1px solid {C['border']};")
-        tb.setMaximumHeight(50)
         tbl = QHBoxLayout(tb)
         tbl.setContentsMargins(8,4,8,4); tbl.setSpacing(6)
         open_btn = QPushButton("📂 Open Email File…")
@@ -7010,62 +8770,60 @@ TAG_TO_TAB = {
 
 
 class BookmarkTab(QWidget):
-    """Bookmark manager — sidebar list + table per category."""
+    """
+    Bookmark manager — sidebar with category list, main table, detail panel.
+    Completely avoids QTabWidget (which caused signal-during-sort crashes).
+    """
     navigate_to = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
-        self._tables  = {}   # idx -> QTableWidget
-        self._details = {}   # idx -> QTextEdit
-        self._cur_idx = 0
-        self._inserting = False   # re-entrancy guard
+        self._tables     = {}   # cat_idx -> QTableWidget
+        self._details    = {}   # cat_idx -> QTextEdit
+        self._cur_idx    = 0
         self._setup()
 
     def _setup(self):
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setContentsMargins(0,0,0,0)
         lay.setSpacing(0)
 
-        # toolbar
+        # ── Top toolbar ───────────────────────────────────────────────
         tb = QWidget()
         tb.setStyleSheet(f"background:{C['bg3']};border-bottom:1px solid {C['border']};")
-        tb.setMaximumHeight(50)
         tbl = QHBoxLayout(tb)
-        tbl.setContentsMargins(8, 4, 8, 4)
-        tbl.setSpacing(6)
-        title = QLabel("  BOOKMARKS")
+        tbl.setContentsMargins(8,4,8,4); tbl.setSpacing(6)
+        title = QLabel("🔖  BOOKMARKS")
         title.setStyleSheet(f"color:{C['accent']};font-weight:bold;font-size:10pt;")
         tbl.addWidget(title)
         tbl.addStretch()
-        for label, slot in [("Export All...", self._export_all),
-                             ("Clear Category", self._clear_current),
-                             ("Clear All", self._clear_all)]:
+        for label, slot in [("💾 Export All…", self._export_all),
+                             ("🗑 Clear Category", self._clear_current),
+                             ("🗑 Clear All",      self._clear_all)]:
             btn = QPushButton(label)
-            btn.setFixedHeight(26)
-            btn.clicked.connect(slot)
+            btn.setFixedHeight(26); btn.clicked.connect(slot)
             tbl.addWidget(btn)
         self.bm_count = QLabel("0 bookmarks")
         self.bm_count.setStyleSheet(f"color:{C['fg2']};font-size:9pt;padding:0 8px;")
         tbl.addWidget(self.bm_count)
         lay.addWidget(tb)
 
-        # body: sidebar + stacked
-        body = QSplitter(Qt.Orientation.Horizontal)
-        body.setHandleWidth(2)
+        # ── Body: sidebar + stacked content ──────────────────────────
+        body_split = QSplitter(Qt.Orientation.Horizontal)
+        body_split.setHandleWidth(2)
 
-        # sidebar
+        # LEFT sidebar — category list
         sidebar = QWidget()
-        sidebar.setMinimumWidth(160)
-        sidebar.setMaximumWidth(220)
+        sidebar.setMinimumWidth(160); sidebar.setMaximumWidth(220)
         sidebar.setStyleSheet(f"background:{C['sidebar']};")
         sl = QVBoxLayout(sidebar)
-        sl.setContentsMargins(0, 0, 0, 0)
-        sl.setSpacing(0)
+        sl.setContentsMargins(0,0,0,0); sl.setSpacing(0)
         sh = QLabel("  CATEGORIES")
-        sh.setStyleSheet(
-            f"background:{C['bg3']};color:{C['fg2']};font-size:8pt;"
-            f"font-weight:bold;padding:5px 8px;border-bottom:1px solid {C['border']};")
+        sh.setStyleSheet(f"background:{C['bg3']};color:{C['fg2']};font-size:8pt;"
+                         f"font-weight:bold;padding:5px 8px;"
+                         f"border-bottom:1px solid {C['border']};")
         sl.addWidget(sh)
+
         self.cat_list = QListWidget()
         self.cat_list.setStyleSheet(
             f"QListWidget{{background:{C['sidebar']};border:none;outline:none;}}"
@@ -7074,25 +8832,30 @@ class BookmarkTab(QWidget):
             f"QListWidget::item:selected{{background:{C['sel']};color:{C['accent']};"
             f"border-left:3px solid {C['accent']};}}"
             f"QListWidget::item:hover:!selected{{background:{C['bg3']};}}")
+        self.cat_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.cat_list.currentRowChanged.connect(self._on_cat_select)
+
+        # Populate sidebar items
         for label, col, desc in BOOKMARK_TABS_DEF:
             item = QListWidgetItem(label)
             item.setForeground(QBrush(QColor(col)))
             item.setToolTip(desc)
+            # Count badge — updated dynamically
+            item.setData(Qt.ItemDataRole.UserRole, 0)
             self.cat_list.addItem(item)
-        # Connect AFTER all items added
-        self.cat_list.currentRowChanged.connect(self._on_cat_select)
-        sl.addWidget(self.cat_list)
-        body.addWidget(sidebar)
 
-        # stacked pages
+        sl.addWidget(self.cat_list)
+        body_split.addWidget(sidebar)
+
+        # RIGHT: stacked widget (one page per category)
         self._stack = QStackedWidget()
+
         COLS = ["Artifact", "Tag", "Timestamp", "Summary", "Notes"]
         for idx, (tab_label, col, desc) in enumerate(BOOKMARK_TABS_DEF):
             page = QWidget()
             page.setStyleSheet(f"background:{C['bg']};")
             pl = QVBoxLayout(page)
-            pl.setContentsMargins(0, 0, 0, 0)
-            pl.setSpacing(0)
+            pl.setContentsMargins(0,0,0,0); pl.setSpacing(0)
 
             desc_bar = QLabel(f"  {desc}")
             desc_bar.setStyleSheet(
@@ -7103,13 +8866,10 @@ class BookmarkTab(QWidget):
             vs = QSplitter(Qt.Orientation.Vertical)
             vs.setHandleWidth(3)
 
-            # Table — NO signals connected here
             tbl_w = QTableWidget(0, len(COLS))
             tbl_w.setHorizontalHeaderLabels(COLS)
-            tbl_w.horizontalHeader().setSectionResizeMode(
-                3, QHeaderView.ResizeMode.Stretch)
-            tbl_w.horizontalHeader().setSectionResizeMode(
-                4, QHeaderView.ResizeMode.Stretch)
+            tbl_w.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+            tbl_w.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
             for ci in (0, 1, 2):
                 tbl_w.horizontalHeader().setSectionResizeMode(
                     ci, QHeaderView.ResizeMode.ResizeToContents)
@@ -7117,22 +8877,17 @@ class BookmarkTab(QWidget):
             tbl_w.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             tbl_w.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
             tbl_w.setAlternatingRowColors(True)
-            tbl_w.setSortingEnabled(False)   # NEVER enable sorting on bookmark tables
             tbl_w.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             tbl_w.customContextMenuRequested.connect(
                 lambda pos, t=tbl_w, i=idx: self._bm_ctx(pos, t, i))
-            # Use clicked only — never itemSelectionChanged/currentCellChanged
-            tbl_w.clicked.connect(
-                lambda _mi, t=tbl_w, i=idx: self._on_row_select(t, i))
+            # Store detail ref on table; connect selection AFTER setup
             vs.addWidget(tbl_w)
             self._tables[idx] = tbl_w
 
-            # Detail panel
-            det_w = QWidget()
-            det_w.setStyleSheet(f"background:{C['bg2']};")
-            dl = QVBoxLayout(det_w)
-            dl.setContentsMargins(0, 0, 0, 0)
-            dl.setSpacing(0)
+            detail_w = QWidget()
+            detail_w.setStyleSheet(f"background:{C['bg2']};")
+            dl = QVBoxLayout(detail_w)
+            dl.setContentsMargins(0,0,0,0); dl.setSpacing(0)
             dh = QLabel("  ITEM DETAIL")
             dh.setStyleSheet(
                 f"background:{C['bg3']};color:{C['fg2']};font-size:8pt;"
@@ -7147,99 +8902,108 @@ class BookmarkTab(QWidget):
                 f"font-size:9pt;border:none;padding:6px;")
             dl.addWidget(det)
             self._details[idx] = det
-            vs.addWidget(det_w)
+            tbl_w._detail_ref  = det
+            vs.addWidget(detail_w)
             vs.setSizes([300, 160])
             pl.addWidget(vs)
             self._stack.addWidget(page)
 
-        body.addWidget(self._stack)
-        body.setSizes([190, 900])
-        lay.addWidget(body)
+            # Use clicked instead of itemSelectionChanged to avoid
+            # firing during programmatic operations (sort, blockSignals, etc.)
+            tbl_w.clicked.connect(
+                lambda idx_model, t=tbl_w, i=idx:
+                    self._on_row_select(t, i))
 
+        body_split.addWidget(self._stack)
+        body_split.setSizes([190, 900])
+        lay.addWidget(body_split)
+
+        # Select first category
         self.cat_list.setCurrentRow(0)
 
     def _on_cat_select(self, idx):
-        if idx < 0:
-            return
+        if idx < 0: return
         self._cur_idx = idx
         self._stack.setCurrentIndex(idx)
         self._update_count()
 
     def _on_row_select(self, tbl, idx):
-        if self._inserting:
-            return
         try:
+            rows = tbl.selectedItems()
+            if not rows: return
             row = tbl.currentRow()
-            if row < 0 or row >= tbl.rowCount():
-                return
-            item0 = tbl.item(row, 0)
-            if not item0:
-                return
-            rd       = item0.data(Qt.ItemDataRole.UserRole) or {}
+            if row < 0 or row >= tbl.rowCount(): return
+            art_item = tbl.item(row, 0)
+            if not art_item: return
+            rd = art_item.data(Qt.ItemDataRole.UserRole) or {}
             tag_item = tbl.item(row, 1)
             ts_item  = tbl.item(row, 2)
             det      = self._details.get(idx)
-            if not det:
-                return
+            if not det: return
 
-            def e(s):
-                return (str(s).replace("&", "&amp;")
-                               .replace("<", "&lt;").replace(">", "&gt;"))
+            def _e(s):
+                return (str(s).replace("&","&amp;")
+                               .replace("<","&lt;").replace(">","&gt;"))
 
-            parts = [f"<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"]
-            parts.append(
-                f"<p><b style='color:{C['accent']}'>{e(item0.text())}</b>"
+            html  = ["<div style='font-family:Segoe UI,Arial;font-size:9pt;'>"]
+            html.append(
+                f"<p><b style='color:{C['accent']}'>{_e(art_item.text())}</b>"
                 f"&nbsp;<span style='color:{C['orange']}'>"
-                f"{e(tag_item.text() if tag_item else '')}</span>"
+                f"{_e(tag_item.text() if tag_item else '')}</span>"
                 f"&nbsp;&nbsp;<span style='color:{C['fg2']};font-size:8pt;'>"
-                f"{e(ts_item.text() if ts_item else '')}</span></p>"
+                f"{_e(ts_item.text() if ts_item else '')}</span></p>"
                 f"<hr style='border-color:{C['border']};margin:4px 0;'>")
             for k, v in rd.items():
-                parts.append(
+                html.append(
                     f"<div style='margin:2px 0;'>"
                     f"<span style='color:{C['fg2']};min-width:130px;"
-                    f"display:inline-block;font-size:8pt;'>{e(k)}:</span>"
-                    f"<span style='color:{C['fg']};'>&nbsp;{e(str(v)[:500])}</span>"
-                    f"</div>")
-            parts.append("</div>")
-            det.setHtml("".join(parts))
-        except Exception as ex:
-            print(f"[_on_row_select] {ex}")
+                    f"display:inline-block;font-size:8pt;'>{_e(k)}:</span>"
+                    f"<span style='color:{C['fg']};'>&nbsp;{_e(str(v)[:500])}"
+                    f"</span></div>")
+            html.append("</div>")
+            det.setHtml("".join(html))
+        except Exception as e:
+            try:
+                det = self._details.get(idx)
+                if det: det.setPlainText(f"[Error: {e}]")
+            except Exception:
+                pass
 
-    def add_bookmark(self, artifact_name, row_data, tag):
-        """Append a row to the appropriate category table. Crash-proof."""
-        if self._inserting:
-            return   # prevent re-entrancy
+    # ── Add bookmark ──────────────────────────────────────────────────
+    def add_bookmark(self, artifact_name: str, row_data: dict, tag: str):
         try:
-            self._inserting = True
             cat_idx = TAG_TO_TAB.get(tag, 0)
             cat_idx = min(cat_idx, len(BOOKMARK_TABS_DEF) - 1)
             tbl     = self._tables.get(cat_idx)
             if tbl is None:
                 return
 
-            summary = "  |  ".join(
+            summary  = "  |  ".join(
                 f"{k}: {str(v)[:40]}" for k, v in list(row_data.items())[:4])
-            ts      = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            tag_col = (C['red']    if 'Malware'    in tag else
-                       C['orange'] if 'Suspicious' in tag else
-                       C['yellow'] if 'Key'        in tag else
-                       C['purple'] if 'IOC'        in tag else
-                       C['green']  if 'User' in tag or 'Cleared' in tag else
-                       C['accent'])
+            ts       = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            tag_col  = (C['red']    if 'Malware'   in tag else
+                        C['orange'] if 'Suspicious' in tag else
+                        C['yellow'] if 'Key'        in tag else
+                        C['purple'] if 'IOC'        in tag else
+                        C['green']  if ('User' in tag or 'Cleared' in tag) else
+                        C['accent'])
 
-            # Block table signals for the entire insertion
+            # Disable ALL signals + sorting for the ENTIRE insert sequence
             tbl.blockSignals(True)
+            tbl.setSortingEnabled(False)
+
             new_row = tbl.rowCount()
             tbl.insertRow(new_row)
-            for ci, (val, color, editable, udata) in enumerate([
+
+            cells = [
                 (str(artifact_name), C['accent'], False, dict(row_data)),
                 (str(tag),           tag_col,     False, None),
                 (str(ts),            C['fg2'],    False, None),
                 (str(summary),       C['fg'],     False, None),
                 ("",                 C['fg'],     True,  None),
-            ]):
-                cell  = QTableWidgetItem(val)
+            ]
+            for ci, (val, color, editable, udata) in enumerate(cells):
+                cell = QTableWidgetItem(val)
                 cell.setForeground(QBrush(QColor(color)))
                 flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
                 if editable:
@@ -7249,300 +9013,193 @@ class BookmarkTab(QWidget):
                 if udata is not None:
                     cell.setData(Qt.ItemDataRole.UserRole, udata)
                 tbl.setItem(new_row, ci, cell)
+
+            # Re-enable signals ONLY — never re-enable sorting on bookmark tables.
+            # setSortingEnabled(True) triggers an immediate synchronous re-sort
+            # which fires itemSelectionChanged before blockSignals(False) runs,
+            # causing a crash. Bookmark tables are append-only audit logs;
+            # sorting is not needed.
             tbl.blockSignals(False)
 
-        except Exception as e:
-            print(f"[add_bookmark insert] {e}")
-            try:
-                tbl.blockSignals(False)
-            except Exception:
-                pass
-        finally:
-            self._inserting = False
+            # Defer sidebar/stack UI updates to the next event loop tick so no
+            # signal can fire while we are still inside this call frame.
+            _ts      = ts
+            _cat_idx = cat_idx
+            _tbl     = tbl
 
-        # All UI updates AFTER _inserting is cleared — safe now
-        try:
-            self._update_count()
-            # Switch category in sidebar without signal re-entrancy
-            if self.cat_list.currentRow() != cat_idx:
-                self.cat_list.blockSignals(True)
-                self.cat_list.setCurrentRow(cat_idx)
-                self.cat_list.blockSignals(False)
-                self._stack.setCurrentIndex(cat_idx)
-                self._cur_idx = cat_idx
+            def _post_insert():
+                try:
+                    self._update_count()
+                    self.cat_list.blockSignals(True)
+                    self.cat_list.setCurrentRow(_cat_idx)
+                    self.cat_list.blockSignals(False)
+                    self._stack.blockSignals(True)
+                    self._stack.setCurrentIndex(_cat_idx)
+                    self._stack.blockSignals(False)
+                    self._cur_idx = _cat_idx
+                    # Scroll to the new row (last row, since no sorting)
+                    last = _tbl.rowCount() - 1
+                    if last >= 0:
+                        item = _tbl.item(last, 0)
+                        if item:
+                            _tbl.scrollToItem(
+                                item, QAbstractItemView.ScrollHint.EnsureVisible)
+                except Exception as ex:
+                    print(f"[_post_insert] {ex}")
+
+            QTimer.singleShot(0, _post_insert)
+
         except Exception as e:
-            print(f"[add_bookmark post] {e}")
+            import traceback
+            print(f"[BookmarkTab.add_bookmark] {e}\n{traceback.format_exc()}")
 
     def _current_table(self):
         return self._tables.get(self._cur_idx)
 
     def _safe_remove(self, tbl, row):
-        if self._inserting:
-            return
+        """Remove a bookmark row without triggering sort-related crashes."""
         try:
             tbl.blockSignals(True)
             tbl.removeRow(row)
             tbl.blockSignals(False)
             self._update_count()
         except Exception as e:
-            try:
-                tbl.blockSignals(False)
-            except Exception:
-                pass
+            try: tbl.blockSignals(False)
+            except Exception: pass
             print(f"[_safe_remove] {e}")
 
     def _update_count(self):
-        try:
-            total = sum(t.rowCount() for t in self._tables.values())
-            cur   = (self._tables[self._cur_idx].rowCount()
-                     if self._cur_idx in self._tables else 0)
-            self.bm_count.setText(f"{total} total  |  {cur} in category")
-            for i in range(self.cat_list.count()):
-                t    = self._tables.get(i)
-                cnt  = t.rowCount() if t else 0
-                base = BOOKMARK_TABS_DEF[i][0] if i < len(BOOKMARK_TABS_DEF) else ""
-                item = self.cat_list.item(i)
-                if item:
-                    item.setText(f"{base}  ({cnt})" if cnt else base)
-        except Exception as e:
-            print(f"[_update_count] {e}")
+        total = sum(t.rowCount() for t in self._tables.values())
+        cur   = (self._tables[self._cur_idx].rowCount()
+                 if self._cur_idx in self._tables else 0)
+        self.bm_count.setText(f"{total} total  |  {cur} in category")
+        # Update sidebar badges
+        for i in range(self.cat_list.count()):
+            n    = self._tables.get(i, {})
+            cnt  = n.rowCount() if hasattr(n, 'rowCount') else 0
+            base = BOOKMARK_TABS_DEF[i][0] if i < len(BOOKMARK_TABS_DEF) else ""
+            item = self.cat_list.item(i)
+            if item:
+                item.setText(f"{base}  ({cnt})" if cnt else base)
 
     def _bm_ctx(self, pos, tbl, idx):
-        if self._inserting:
-            return
         row = tbl.rowAt(pos.y())
-        if row < 0:
-            return
+        if row < 0: return
         item0 = tbl.item(row, 0)
         rd    = item0.data(Qt.ItemDataRole.UserRole) if item0 else {}
         art   = item0.text() if item0 else ""
         menu  = QMenu(self)
-        menu.addAction("Go to Artifact in Results",
+        menu.addAction("🔍 Go to Artifact in Results",
             lambda: self.navigate_to.emit(art))
-        menu.addAction("Copy Summary",
+        menu.addAction("📋 Copy Summary",
             lambda: QApplication.clipboard().setText(
-                tbl.item(row, 3).text() if tbl.item(row, 3) else ""))
-        menu.addAction("Copy as JSON",
-            lambda: QApplication.clipboard().setText(json.dumps(rd, default=str)))
+                tbl.item(row,3).text() if tbl.item(row,3) else ""))
+        menu.addAction("📋 Copy as JSON",
+            lambda: QApplication.clipboard().setText(
+                json.dumps(rd, default=str)))
         menu.addSeparator()
-        move_m = menu.addMenu("Move to Category...")
+        move_m = menu.addMenu("Move to Category…")
         for i, (lbl, _, _d) in enumerate(BOOKMARK_TABS_DEF):
             if i != idx:
                 move_m.addAction(lbl,
                     lambda _, ti=i, r=row, t=tbl: self._move_row(t, r, ti))
         menu.addSeparator()
-        menu.addAction("Remove", lambda: self._safe_remove(tbl, row))
+        menu.addAction("🗑 Remove", lambda: self._safe_remove(tbl, row))
         menu.exec(tbl.mapToGlobal(pos))
 
     def _move_row(self, src_tbl, row, dest_idx):
         item0 = src_tbl.item(row, 0)
-        if not item0:
-            return
+        if not item0: return
         rd  = item0.data(Qt.ItemDataRole.UserRole) or {}
         art = item0.text()
-        self._safe_remove(src_tbl, row)
         tag = BOOKMARK_TABS_DEF[dest_idx][0].split()[-1]
+        src_tbl.removeRow(row)
         self.add_bookmark(art, rd, tag)
 
     def _clear_current(self):
         tbl = self._current_table()
-        if not tbl or tbl.rowCount() == 0:
-            return
+        if not tbl or tbl.rowCount() == 0: return
         if QMessageBox.question(
                 self, "Clear Category",
-                f"Remove all {tbl.rowCount()} bookmark(s)?",
+                f"Remove all {tbl.rowCount()} bookmark(s) from this category?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         ) == QMessageBox.StandardButton.Yes:
-            tbl.blockSignals(True)
             tbl.setRowCount(0)
-            tbl.blockSignals(False)
             self._update_count()
 
     def _clear_all(self):
         total = sum(t.rowCount() for t in self._tables.values())
-        if total == 0:
-            return
+        if total == 0: return
         if QMessageBox.question(
                 self, "Clear All",
                 f"Remove all {total} bookmarks?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         ) == QMessageBox.StandardButton.Yes:
-            for t in self._tables.values():
-                t.blockSignals(True)
-                t.setRowCount(0)
-                t.blockSignals(False)
+            for t in self._tables.values(): t.setRowCount(0)
             self._update_count()
 
     def _export_all(self):
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Bookmarks", "bookmarks",
             "JSON (*.json);;CSV (*.csv);;HTML (*.html)")
-        if not path:
-            return
+        if not path: return
         all_bm = []
         for ti, (tab_label, _, _d) in enumerate(BOOKMARK_TABS_DEF):
             tbl = self._tables.get(ti)
-            if not tbl:
-                continue
+            if not tbl: continue
             for r in range(tbl.rowCount()):
-                i0 = tbl.item(r, 0)
+                item0 = tbl.item(r, 0)
+                rd    = item0.data(Qt.ItemDataRole.UserRole) if item0 else {}
                 all_bm.append({
                     "category":  tab_label,
-                    "artifact":  i0.text() if i0 else "",
-                    "tag":       tbl.item(r, 1).text() if tbl.item(r, 1) else "",
-                    "timestamp": tbl.item(r, 2).text() if tbl.item(r, 2) else "",
-                    "notes":     tbl.item(r, 4).text() if tbl.item(r, 4) else "",
-                    "data":      i0.data(Qt.ItemDataRole.UserRole) if i0 else {},
+                    "artifact":  item0.text() if item0 else "",
+                    "tag":       tbl.item(r,1).text() if tbl.item(r,1) else "",
+                    "timestamp": tbl.item(r,2).text() if tbl.item(r,2) else "",
+                    "notes":     tbl.item(r,4).text() if tbl.item(r,4) else "",
+                    "data":      rd,
                 })
         if path.endswith(".json"):
-            with open(path, "w") as f:
-                json.dump(all_bm, f, indent=2, default=str)
+            with open(path,"w") as f: json.dump(all_bm, f, indent=2, default=str)
         elif path.endswith(".csv"):
             import csv as _csv
-            with open(path, "w", newline="") as f:
+            with open(path,"w",newline="") as f:
                 w = _csv.writer(f)
                 w.writerow(["Category","Artifact","Tag","Timestamp","Notes","Summary"])
                 for bm in all_bm:
                     summary = " | ".join(
-                        f"{k}: {v}" for k, v in list(bm["data"].items())[:4])
-                    w.writerow([bm["category"], bm["artifact"], bm["tag"],
-                                bm["timestamp"], bm["notes"], summary])
+                        f"{k}: {v}" for k,v in list(bm["data"].items())[:4])
+                    w.writerow([bm["category"],bm["artifact"],bm["tag"],
+                                bm["timestamp"],bm["notes"],summary])
         else:
-            now  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            rows = ""
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            rows_html = ""
             for bm in all_bm:
-                s = " | ".join(f"{k}: {v}" for k, v in list(bm["data"].items())[:4])
-                rows += (f"<tr><td>{bm['category']}</td><td>{bm['artifact']}</td>"
-                         f"<td>{bm['tag']}</td><td>{bm['timestamp']}</td>"
-                         f"<td>{s}</td><td>{bm['notes']}</td></tr>")
+                summary = " | ".join(f"{k}: {v}" for k,v in list(bm["data"].items())[:4])
+                rows_html += (f"<tr><td>{bm['category']}</td>"
+                              f"<td>{bm['artifact']}</td>"
+                              f"<td>{bm['tag']}</td>"
+                              f"<td>{bm['timestamp']}</td>"
+                              f"<td>{summary}</td>"
+                              f"<td>{bm['notes']}</td></tr>")
             html = (f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
                     f"<title>Bookmarks</title><style>"
-                    f"body{{background:#0d1117;color:#e6edf3;"
-                    f"font-family:'Segoe UI',sans-serif;margin:32px}}"
-                    f"h1{{color:#58a6ff}}"
-                    f"table{{border-collapse:collapse;width:100%}}"
-                    f"th{{background:#21262d;color:#8b949e;"
-                    f"padding:6px 10px;text-align:left}}"
+                    f"body{{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;margin:32px}}"
+                    f"h1{{color:#58a6ff}}table{{border-collapse:collapse;width:100%}}"
+                    f"th{{background:#21262d;color:#8b949e;padding:6px 10px;text-align:left}}"
                     f"td{{padding:5px 10px;border-bottom:1px solid #21262d}}"
-                    f"tr:nth-child(even){{background:#1a2030}}"
-                    f"</style></head><body>"
+                    f"tr:nth-child(even){{background:#1a2030}}</style></head><body>"
                     f"<h1>ForensicPro Bookmarks — {now}</h1>"
                     f"<table><tr><th>Category</th><th>Artifact</th><th>Tag</th>"
                     f"<th>Timestamp</th><th>Summary</th><th>Notes</th></tr>"
-                    f"{rows}</table></body></html>")
-            with open(path, "w") as f:
-                f.write(html)
-        QMessageBox.information(self, "Exported",
+                    f"{rows_html}</table></body></html>")
+            with open(path,"w") as f: f.write(html)
+        QMessageBox.information(self,"Exported",
             f"Exported {len(all_bm)} bookmark(s) to:\n{path}")
 
 
 # ══════════════════════════════════════════════════════════════
 #  MAIN WINDOW
 # ══════════════════════════════════════════════════════════════
-
-
-# ══════════════════════════════════════════════════════════════
-#  CASE DIALOG  (New Case / Edit Case Info)
-# ══════════════════════════════════════════════════════════════
-class CaseDialog(QDialog):
-    """Dialog for creating or editing a forensic case.
-
-    Exposes .values() -> dict with keys:
-        name, number, examiner, notes
-    matching the structure of MainWindow.case_info.
-    """
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Case Information")
-        self.setFixedSize(480, 320)
-        self.setStyleSheet(STYLESHEET)
-        self._build(parent)
-
-    def _build(self, parent):
-        # Pre-populate from parent.case_info if available
-        existing = {}
-        if hasattr(parent, "case_info") and isinstance(parent.case_info, dict):
-            existing = parent.case_info
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 16, 20, 16)
-        lay.setSpacing(10)
-
-        # ── Title bar ──────────────────────────────────────────
-        title = QLabel("  NEW CASE")
-        title.setStyleSheet(
-            f"color:{C['accent']};font-weight:bold;font-size:11pt;"
-            f"background:{C['bg3']};padding:6px 10px;"
-            f"border-bottom:1px solid {C['border']};")
-        lay.addWidget(title)
-
-        # ── Form ───────────────────────────────────────────────
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        form.setSpacing(8)
-
-        def _le(default=""):
-            w = QLineEdit(default)
-            w.setStyleSheet(
-                f"background:{C['bg2']};color:{C['fg']};"
-                f"border:1px solid {C['border']};border-radius:3px;padding:4px 6px;")
-            return w
-
-        self._f_name     = _le(existing.get("name",     "New Case"))
-        self._f_number   = _le(existing.get("number",   "FC-2025-001"))
-        self._f_examiner = _le(existing.get("examiner", ""))
-
-        self._f_notes = QPlainTextEdit(existing.get("notes", ""))
-        self._f_notes.setFixedHeight(70)
-        self._f_notes.setStyleSheet(
-            f"background:{C['bg2']};color:{C['fg']};"
-            f"border:1px solid {C['border']};border-radius:3px;padding:4px 6px;")
-        self._f_notes.setPlaceholderText("Optional case notes…")
-
-        lbl_style = f"color:{C['fg2']};font-size:9pt;"
-        for label, widget in [
-            ("Case Name:",   self._f_name),
-            ("Case Number:", self._f_number),
-            ("Examiner:",    self._f_examiner),
-            ("Notes:",       self._f_notes),
-        ]:
-            lbl = QLabel(label)
-            lbl.setStyleSheet(lbl_style)
-            form.addRow(lbl, widget)
-
-        lay.addLayout(form)
-        lay.addStretch()
-
-        # ── Buttons ────────────────────────────────────────────
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok |
-            QDialogButtonBox.StandardButton.Cancel)
-        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Create Case")
-        btns.button(QDialogButtonBox.StandardButton.Ok).setStyleSheet(
-            f"background:{C['accent']};color:#000;font-weight:bold;"
-            f"border:none;border-radius:4px;padding:5px 18px;")
-        btns.button(QDialogButtonBox.StandardButton.Cancel).setStyleSheet(
-            f"background:{C['btn']};color:{C['fg']};"
-            f"border:1px solid {C['border']};border-radius:4px;padding:5px 18px;")
-        btns.accepted.connect(self._on_accept)
-        btns.rejected.connect(self.reject)
-        lay.addWidget(btns)
-
-    def _on_accept(self):
-        if not self._f_name.text().strip():
-            QMessageBox.warning(self, "Required", "Case Name cannot be empty.")
-            return
-        self.accept()
-
-    def values(self) -> dict:
-        """Return the filled-in case info dict."""
-        return {
-            "name":     self._f_name.text().strip()     or "New Case",
-            "number":   self._f_number.text().strip()   or "FC-001",
-            "examiner": self._f_examiner.text().strip(),
-            "notes":    self._f_notes.toPlainText().strip(),
-        }
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -7604,15 +9261,15 @@ class MainWindow(QMainWindow):
             ("Build Timeline",              self._build_timeline),
         ])
         menu("&Remote", [
-            ("Generate Agent…",     lambda: self.tabs.setCurrentIndex(4)),
-            ("Connect via SSH…",    self._ssh_connect),
+            ("Add Remote Target…",        self._ssh_connect),
+            ("Remote Triage (Native)…",   lambda: self.tabs.setCurrentIndex(4)),
         ])
         menu("&View", [
             ("Evidence Browser",  lambda: self.tabs.setCurrentIndex(0)),
             ("Artifact Selection",lambda: self.tabs.setCurrentIndex(1)),
             ("Analysis Results",  lambda: self.tabs.setCurrentIndex(2)),
             ("Timeline",          lambda: self.tabs.setCurrentIndex(3)),
-            ("Remote Agent",      lambda: self.tabs.setCurrentIndex(4)),
+            ("Remote Triage",     lambda: self.tabs.setCurrentIndex(4)),
             ("Email Viewer",      lambda: self.tabs.setCurrentIndex(5)),
             ("Bookmarks",         lambda: self.tabs.setCurrentIndex(6)),
         ])
@@ -7649,7 +9306,7 @@ class MainWindow(QMainWindow):
         tbtn("🔍 Search",           self._keyword_search)
         tbtn("📊 Export Report",    self._export_report)
         tb.addSeparator()
-        tbtn("⚡ Remote Agent",    lambda: self.tabs.setCurrentIndex(4))
+        tbtn("⚡ Remote Triage",   lambda: self.tabs.setCurrentIndex(4))
         tbtn("🔐 Verify Hashes",   self._verify_all)
         tb.addSeparator()
 
@@ -7691,9 +9348,11 @@ class MainWindow(QMainWindow):
         self.timeline_tab = TimelineTab()
         self.tabs.addTab(self.timeline_tab, "📅  Timeline")
 
-        # Tab 4: Remote Agent
+        # Tab 4: Remote Triage (native, agentless)
         self.agent_tab = AgentTab(self.art_tab)
-        self.tabs.addTab(self.agent_tab, "⚡  Remote Agent")
+        self.agent_tab.triage_requested.connect(self._run_collection)
+        self.agent_tab.target_added.connect(self._on_remote_target_added)
+        self.tabs.addTab(self.agent_tab, "⚡  Remote Triage")
 
         # Tab 5: Email Viewer
         self.email_tab = EmailViewerTab()
@@ -7828,6 +9487,15 @@ class MainWindow(QMainWindow):
         self._evidence_items_cache = items
         self.art_tab.refresh_evidence_list(items)
 
+    def _on_remote_target_added(self, cfg):
+        """Add a remote target (from the Remote Triage tab) to the evidence tree."""
+        try:
+            self.browser.add_remote_target(cfg.get("host", ""))
+            self._sync_evidence_cache()
+            self.set_status("Remote target ready: %s" % cfg.get("host", ""))
+        except Exception:
+            pass
+
     def _refresh_view(self):
         self.browser._load_dir(self.browser.current_dir)
 
@@ -7884,11 +9552,15 @@ class MainWindow(QMainWindow):
 
     def _on_bookmark(self, artifact_name: str, row_data: dict, tag: str):
         """Receive bookmark signal from ResultsTab and add to BookmarkTab."""
-        self.bookmark_tab.add_bookmark(artifact_name, row_data, tag)
-        # Brief flash on the bookmark tab label
-        self.tabs.setTabText(6, "🔖  Bookmarks ✦")
-        QTimer.singleShot(1500, lambda: self.tabs.setTabText(6, "🔖  Bookmarks"))
-        self.set_status(f"  Bookmarked: {tag}  ←  {artifact_name}")
+        try:
+            self.bookmark_tab.add_bookmark(artifact_name, row_data, tag)
+            # Brief flash on the bookmark tab label
+            self.tabs.setTabText(6, "🔖  Bookmarks ✦")
+            QTimer.singleShot(1500, lambda: self.tabs.setTabText(6, "🔖  Bookmarks"))
+            self.set_status(f"  Bookmarked: {tag}  ←  {artifact_name}")
+        except Exception as e:
+            import traceback
+            print(f"[_on_bookmark] {e}\n{traceback.format_exc()}")
 
     def _navigate_to_artifact(self, artifact_name: str):
         """Jump to Results tab and highlight the given artifact."""
@@ -8267,26 +9939,52 @@ class MainWindow(QMainWindow):
 
     # ── SSH connect ───────────────────────────
     def _ssh_connect(self):
+        """Add a remote Windows target for native (agentless) triage."""
         dlg = QDialog(self)
-        dlg.setWindowTitle("SSH / Remote Target")
-        dlg.setFixedSize(380,200)
+        dlg.setWindowTitle("Add Remote Windows Target  (Native Triage)")
+        dlg.setFixedSize(440, 300)
         dlg.setStyleSheet(STYLESHEET)
         lay = QFormLayout(dlg)
-        f_host = QLineEdit(); f_user = QLineEdit("root"); f_pass = QLineEdit()
-        f_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        lay.addRow("Host:",     f_host)
-        lay.addRow("Username:", f_user)
-        lay.addRow("Password:", f_pass)
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        f_host = QLineEdit()
+        f_host.setPlaceholderText("hostname or IP (admin share over SMB)")
+        f_user = QLineEdit()
+        f_user.setPlaceholderText("DOMAIN\\user  or  user")
+        f_pass = QLineEdit(); f_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        f_case = QLineEdit()
+        f_case.setPlaceholderText("Case folder for collected evidence (optional)")
+        lay.addRow("Host:",        f_host)
+        lay.addRow("Username:",    f_user)
+        lay.addRow("Password:",    f_pass)
+        lay.addRow("Case Folder:", f_case)
+        note = QLabel("Uses only native signed Windows tools (net/reg/wevtutil/\n"
+                      "schtasks/tasklist/sc/PowerShell). No SSH or impacket.")
+        note.setStyleSheet(f"color:{C['fg2']};font-size:8pt;")
+        lay.addRow(note)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(dlg.accept); btns.rejected.connect(dlg.reject)
         lay.addRow(btns)
-        if dlg.exec():
-            target = f"{f_user.text()}@{f_host.text()}"
-            self.browser.add_remote_target(target)
-            self.agent_tab.f_ssh_target.setText(target)
-            self.agent_tab.f_ssh_pass.setText(f_pass.text())
-            self.tabs.setCurrentIndex(4)
-            self.set_status(f"Remote target: {target}")
+        if not dlg.exec():
+            return
+        host = f_host.text().strip()
+        if not host:
+            QMessageBox.warning(self, "Remote Target", "Enter a host name or IP.")
+            return
+        user = f_user.text().strip()
+        domain = ""
+        if "\\" in user:
+            domain, user = user.split("\\", 1)
+        cfg = register_remote_target(host, user=user, password=f_pass.text(),
+                                     domain=domain, case_dir=f_case.text().strip())
+        self.browser.add_remote_target(host)
+        self._sync_evidence_cache()
+        # Mirror into the Remote Triage tab for one-click collection.
+        try:
+            self.agent_tab.load_target(cfg)
+        except Exception:
+            pass
+        self.tabs.setCurrentIndex(1)   # jump to Artifact Selection
+        self.set_status(f"Remote target ready: {host}  (case folder: {cfg['case_dir']})")
 
     # ── About ────────────────────────────────
     def _about(self):
@@ -8300,11 +9998,11 @@ class MainWindow(QMainWindow):
             "<li>Multi-format image support (E01, DD, RAW, VMDK…)</li>"
             "<li>Content viewer: Text | Hex | Image | Metadata | Strings</li>"
             "<li>60+ artifact categories with live collection</li>"
-            "<li>Remote agent generation & SSH deployment</li>"
+            "<li>Native agentless remote triage (no SSH / impacket)</li>"
             "<li>Timeline analysis & keyword search</li>"
             "<li>HTML / JSON / CSV export</li>"
             "</ul>"
-            f"<p style='color:#8b949e'>Python {sys.version.split()[0]} | PyQt6 | psutil | paramiko</p>"
+            f"<p style='color:#8b949e'>Python {sys.version.split()[0]} | PyQt6 | psutil | native Windows tools</p>"
         )
 
 

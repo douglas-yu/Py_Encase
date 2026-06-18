@@ -1,0 +1,14 @@
+libpff-python-windows
+pyqt6
+psutil
+pytsk3
+libewf-python
+
+python-registry   # Shellbags offline hive parsing
+olefile            # Jump List LNK target extraction
+pylnk3             # LNK / Shortcut file parsing
+extract-msg        # Outlook .msg file parsing
+libpff-python      # PST/OST email extraction
+mft                # $MFT raw parsing
+
+
